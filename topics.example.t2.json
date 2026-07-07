@@ -1,0 +1,28 @@
+{
+  "_comment": "バケット t2-ft-original-data の mcap (/t2/* トピック, ros2idl) 用の設定例。fields を空リストにするとメッセージ全体をフラット展開して全列出力する。フィールド名が分かったら fields に列挙して絞り込む。実際のトピック名・フィールド名は --list-topics と、fields: [] での出力で確認できる。",
+
+  "/t2/localization_compositor/pose": {
+    "suffix": "pose",
+    "fields": [
+      "pose.position.x",
+      "pose.position.y",
+      "pose.position.z"
+    ]
+  },
+  "/t2/odometry/ego": {
+    "suffix": "odometry",
+    "fields": []
+  },
+  "/t2/control/debug": {
+    "suffix": "control",
+    "fields": []
+  },
+  "/t2/main_mabx_reader/debug/can": {
+    "suffix": "can",
+    "fields": []
+  },
+  "/t2/system_state_manager/state": {
+    "suffix": "state",
+    "fields": []
+  }
+}

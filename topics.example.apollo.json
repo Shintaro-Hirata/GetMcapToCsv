@@ -1,0 +1,22 @@
+{
+  "_comment": "参考にした extract.py と同じ /apollo/* トピック (protobuf) 用の設定。Apollo 系の mcap をローカル処理する場合に使用する。",
+
+  "/apollo/canbus/chassis": {
+    "suffix": "chassis",
+    "fields": [
+      "speed_mps",
+      "brake_percentage",
+      "throttle_percentage",
+      "steering_percentage",
+      "steering_torque_nm"
+    ]
+  },
+  "/apollo/control": {
+    "suffix": "control",
+    "fields": [
+      "debug.simple_lateral_debug.lateral_error",
+      "debug.simple_lateral_debug.heading_error",
+      "debug.simple_lateral_debug.steer_angle"
+    ]
+  }
+}

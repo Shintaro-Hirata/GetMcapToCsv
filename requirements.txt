@@ -1,0 +1,11 @@
+# mcap 読み込み
+mcap>=1.3.0
+# /apollo/* トピック (protobuf) のデコード
+mcap-protobuf-support>=0.5.3
+# GCS バケットへのアクセス
+google-cloud-storage>=2.14.0
+
+# /t2/* トピック (ros2idl) のデコード用 社内パッケージ (zero-plotter リポジトリ内)。
+# private リポジトリのため git の GitHub 認証が必要。うまく入らない場合は README.md の
+# 「mcap-ros2idl-support のインストール」を参照。
+mcap-ros2idl-support @ git+https://github.com/t2-auto/zero-plotter.git#subdirectory=mcap-ros2idl-support
