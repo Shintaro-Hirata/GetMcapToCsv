@@ -375,8 +375,12 @@ def load_topic_config(path):
 
 
 def extract_rows(sources, topic_config, start_ns, end_ns, factories):
-    """全ソースから対象トピックの行データを収集する。"""
-    per_topic = {t: [] for t in topic_config}
+    """全ソースから対象トピックの行データを収集する。
+
+    topic_config が None のときは mcap に含まれる全トピックを対象にする。
+    """
+    all_topics = topic_config is None
+    per_topic = {} if all_topics else {t: [] for t in topic_config}
     decode_errors = defaultdict(int)
 
     for src in sources:
@@ -386,7 +390,7 @@ def extract_rows(sources, topic_config, start_ns, end_ns, factories):
             with src.open() as f:
                 reader = make_reader(f, decoder_factories=factories)
                 it = reader.iter_decoded_messages(
-                    topics=list(topic_config.keys()),
+                    topics=None if all_topics else list(topic_config.keys()),
                     start_time=start_ns,
                     end_time=end_ns,
                     log_time_order=True,
@@ -399,7 +403,13 @@ def extract_rows(sources, topic_config, start_ns, end_ns, factories):
                     except Exception as e:  # 個別メッセージのデコード失敗は数えて続行
                         decode_errors[str(e)[:120]] += 1
                         continue
-                    fields = topic_config[channel.topic]["fields"]
+                    topic = channel.topic
+                    if all_topics:
+                        fields = []
+                        if topic not in per_topic:
+                            per_topic[topic] = []
+                    else:
+                        fields = topic_config[topic]["fields"]
                     r = {"t_ns": message.log_time}
                     if fields:
                         for fld in fields:
@@ -407,7 +417,7 @@ def extract_rows(sources, topic_config, start_ns, end_ns, factories):
                     else:  # フィールド未指定ならメッセージ全体をフラット展開
                         for k, v in flatten(decoded).items():
                             r[k] = v
-                    per_topic[channel.topic].append(r)
+                    per_topic[topic].append(r)
                     count += 1
         except Exception as e:
             print(f"[warn] 読み込み失敗 ({src.name}): {e}")
@@ -419,9 +429,8 @@ def extract_rows(sources, topic_config, start_ns, end_ns, factories):
     return per_topic
 
 
-def topic_columns(topic_config, rows, topic):
-    """トピックの出力列名を決める。"""
-    fields = topic_config[topic]["fields"]
+def topic_columns(fields, rows):
+    """トピックの出力列名を決める。fields が空ならデータ中の全キーを列にする。"""
     if fields:
         return [f.split(".")[-1] for f in fields]
     cols = OrderedDict()
@@ -433,7 +442,12 @@ def topic_columns(topic_config, rows, topic):
 
 
 def write_csvs(per_topic, topic_config, outdir, base):
-    """トピック別 CSV と全トピック結合 CSV を書き出す。"""
+    """トピック別 CSV と (トピック指定時のみ) 全トピック結合 CSV を書き出す。
+
+    topic_config が None のときは全トピックモード。トピックごとに CSV を 1 本ずつ
+    出力し、列数が膨大になる結合 CSV は作らない。
+    """
+    all_topics = topic_config is None
     all_t = [r["t_ns"] for rows in per_topic.values() for r in rows]
     if not all_t:
         print("[warn] 対象トピックのメッセージが 1 件も見つかりませんでした。")
@@ -446,17 +460,30 @@ def write_csvs(per_topic, topic_config, outdir, base):
     def time_cols(t_ns):
         return [fmt_jst(t_ns), round((t_ns - t0) / 1e9, 3), t_ns]
 
+    def suffix_of(topic):
+        if not all_topics and topic in topic_config:
+            return topic_config[topic]["suffix"]
+        return topic.strip("/").replace("/", "_")
+
+    def fields_of(topic):
+        if all_topics:
+            return []
+        return topic_config[topic]["fields"]
+
+    # 出力順: トピック指定時は設定順、全トピック時は名前順
+    topics = sorted(per_topic.keys()) if all_topics else list(topic_config.keys())
+
     # (1) トピック別 CSV
     merged_cols = OrderedDict()
-    for topic, cfg in topic_config.items():
+    for topic in topics:
         rows = sorted(per_topic.get(topic, []), key=lambda r: r["t_ns"])
         if not rows:
             print(f"[info] メッセージなし: {topic}")
             continue
-        cols = topic_columns(topic_config, rows, topic)
+        cols = topic_columns(fields_of(topic), rows)
         for c in cols:
             merged_cols[c] = True
-        out = os.path.join(outdir, f"{base}_{cfg['suffix']}.csv")
+        out = os.path.join(outdir, f"{base}_{suffix_of(topic)}.csv")
         with open(out, "w", newline="", encoding="utf-8-sig") as g:
             w = csv.writer(g)
             w.writerow(["time_jst", "t_sec", "t_ns"] + cols)
@@ -465,9 +492,15 @@ def write_csvs(per_topic, topic_config, outdir, base):
         print(f"[ok] wrote {out}  ({len(rows)} rows)")
         written.append(out)
 
+    # 全トピックモードは結合 CSV を作らない (列数が膨大になり実用的でないため)
+    if all_topics:
+        print(f"[info] 全トピックモードのため結合 CSV (_all.csv) は作成しません "
+              f"(トピック別 CSV を {len(written)} 本出力)。")
+        return written
+
     # (2) 全トピック結合 CSV (時刻順 / 値が無い列は空欄)
     all_cols = list(merged_cols.keys())
-    suffix_by_topic = {t: c["suffix"] for t, c in topic_config.items()}
+    suffix_by_topic = {t: suffix_of(t) for t in topics}
     all_rows = sorted(
         [(topic, r) for topic, rows in per_topic.items() for r in rows],
         key=lambda x: x[1]["t_ns"],
@@ -528,6 +561,9 @@ def main():
     parser.add_argument("--end", help="抽出終了時刻 JST (例: \"2025-12-04 12:10\")")
     parser.add_argument("--topics", metavar="JSON",
                         help="トピック設定 JSON ファイル (topics.example.t2.json 参照)")
+    parser.add_argument("--all-topics", action="store_true",
+                        help="mcap に含まれる全トピックを抽出する (トピック別 CSV を各 1 本ずつ出力)。"
+                             "--topics 不要。フィールド名は全て自動展開される")
     parser.add_argument("--outdir", default="out", help="CSV 出力先ディレクトリ (default: out)")
     parser.add_argument("--bucket", default=DEFAULT_BUCKET,
                         help=f"GCS バケット名 (default: {DEFAULT_BUCKET})")
@@ -597,7 +633,12 @@ def main():
         return
 
     # --- 抽出 ---
-    topic_config = load_topic_config(args.topics)
+    if args.all_topics:
+        topic_config = None  # None = mcap に含まれる全トピックを抽出
+        if args.topics:
+            print("[info] --all-topics 指定のため --topics は無視します。")
+    else:
+        topic_config = load_topic_config(args.topics)
     factories = build_decoder_factories()
     if not factories:
         raise SystemExit("[error] 使えるデコーダがありません。"

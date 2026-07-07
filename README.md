@@ -78,7 +78,27 @@ python get_mcap_to_csv.py --vehicle GIGA07 --start "2025-12-04 12:00" --end "202
 python get_mcap_to_csv.py --vehicle GIGA07 --start "2025-12-04 12:00" --end "2025-12-04 12:10" --list-topics
 ```
 
-### 3. CSV 抽出
+### 3-a. CSV 抽出 — とりあえず全トピック欲しい場合（設定ファイル不要）
+
+`--all-topics` を付けると、mcap に含まれる全トピックを 1 トピック 1 CSV で出力する。
+トピック名やフィールド名を調べたり設定 JSON を書く必要はない。
+
+```bash
+# ローカル mcap の全トピックを CSV 化
+python get_mcap_to_csv.py --local "録画ファイル.mcap" --all-topics --outdir out
+
+# GCS から全トピック
+python get_mcap_to_csv.py --vehicle GIGA07 --start "2025-12-04 12:00" --end "2025-12-04 12:10" \
+    --all-topics --outdir out
+```
+
+出力は `<base>_<トピック名>.csv`（トピック名の `/` は `_` に変換）。
+トピック数が多いと CSV も多数（例: 80 本前後）生成され、
+列数が膨大になる結合 CSV (`_all.csv`) はこのモードでは作らない。
+
+### 3-b. CSV 抽出 — トピック・フィールドを絞る場合
+
+必要なトピックと値だけ欲しいときは設定 JSON を指定する（`_all.csv` も生成される）。
 
 ```bash
 python get_mcap_to_csv.py --vehicle GIGA07 --start "2025-12-04 12:00" --end "2025-12-04 12:10" \
@@ -138,6 +158,7 @@ python get_mcap_to_csv.py --local "C:\data\*.mcap" --start "2025-12-04 12:00" --
 |-----------|------|
 | `--vehicle` | vehicle ID（例: `GIGA07`） |
 | `--start` / `--end` | 抽出時間帯（JST）。`"2025-12-04 12:00"` / `"2025/12/04 12:00:00"` など |
+| `--all-topics` | 全トピックを抽出（設定 JSON 不要、1 トピック 1 CSV） |
 | `--topics` | トピック設定 JSON（省略時は /apollo 用デフォルト） |
 | `--outdir` | CSV 出力先（デフォルト `out`） |
 | `--bucket` | バケット名（デフォルト `t2-ft-original-data`） |
