@@ -168,13 +168,15 @@ def gcs_client():
 
 
 def list_top_dirs(client, bucket_name, vehicle, start_dt, end_dt):
-    """時間帯にかかる可能性のあるトップレベルディレクトリ (YYYYMMDD_<vehicle>__*) を列挙。
+    """時間帯にかかる可能性のあるトップレベルディレクトリを列挙。
 
-    深夜跨ぎの走行に備えて開始日の前日から探す。
+    ディレクトリ名は「運行終了日_車両名__SSD名」(例: 20260702_GIGA09__SSD0097-FOT)。
+    日付は運行**終了**日なので、夜間走行は翌日付のディレクトリに入る。
+    そのため抽出開始日から抽出終了日+1日までを候補にする。
     """
     dates = []
-    d = (start_dt.date() - datetime.timedelta(days=1))
-    while d <= end_dt.date():
+    d = start_dt.date()
+    while d <= end_dt.date() + datetime.timedelta(days=1):
         dates.append(d)
         d += datetime.timedelta(days=1)
 
@@ -202,39 +204,51 @@ def parse_session_start(session_name):
         return None
 
 
+def list_subdirs(client, bucket_name, prefix):
+    """prefix 直下のサブディレクトリ (末尾 / 付きプレフィックス) を列挙する。"""
+    it = client.list_blobs(bucket_name, prefix=prefix, delimiter="/")
+    for _ in it:  # prefixes を得るにはページを消費する必要がある
+        pass
+    return sorted(it.prefixes)
+
+
 def list_candidate_blobs(client, bucket_name, top_dirs, subdir, start_dt, end_dt,
                          lookback_hours=24):
     """トップレベルディレクトリ配下の mcap blob を列挙する。
 
-    recording/<session>/<subdir>/*.mcap と、直下の <subdir>/*.mcap の両方を探す。
-    セッション開始時刻がディレクトリ名 (YYYYMMDD_HHMMSS_...) から分かる場合、
-    抽出終了時刻より後に始まるセッションと、抽出開始時刻より lookback_hours 以上
-    前に始まったセッションはメタデータを読まずに除外する。
+    まず recording/ 直下のセッションディレクトリ名 (YYYYMMDD_HHMMSS_...) だけを
+    一覧し、開始時刻が [抽出開始 - lookback_hours, 抽出終了] に入るセッションのみ
+    中身 (指定 subdir) を listing する。時間帯外のセッションや record_develop 以外の
+    サブディレクトリはオブジェクト一覧すら取得しない。
+    recording/ 階層がない場合は直下の <subdir>/*.mcap も探す。
     """
     earliest = start_dt - datetime.timedelta(hours=lookback_hours)
     blobs = []
-    skipped_sessions = set()
+    n_skipped = 0
     for top in top_dirs:
         found_here = []
-        for prefix in (f"{top}recording/", f"{top}{subdir}/"):
-            for blob in client.list_blobs(bucket_name, prefix=prefix):
-                if not blob.name.endswith(".mcap"):
-                    continue
-                parts = blob.name[len(top):].split("/")
-                if parts[0] == "recording":
-                    # recording/<session>/<subdir>/<file>.mcap
-                    if len(parts) < 4:
-                        continue
-                    if subdir != "*" and parts[2] != subdir:
-                        continue
-                    session_start = parse_session_start(parts[1])
-                    if session_start is not None and not (earliest <= session_start <= end_dt):
-                        skipped_sessions.add(parts[1])
-                        continue
-                found_here.append(blob)
+        for session_prefix in list_subdirs(client, bucket_name, f"{top}recording/"):
+            session_name = session_prefix[len(top) + len("recording/"):].strip("/")
+            session_start = parse_session_start(session_name)
+            if session_start is not None and not (earliest <= session_start <= end_dt):
+                n_skipped += 1
+                continue
+            if session_start is None:
+                print(f"[info] セッション名から時刻を読めないため中身を確認: {session_prefix}")
+            else:
+                print(f"[info] セッション採用: {session_prefix}  (開始 {session_start:%m/%d %H:%M})")
+            scan_prefix = session_prefix if subdir == "*" else f"{session_prefix}{subdir}/"
+            for blob in client.list_blobs(bucket_name, prefix=scan_prefix):
+                if blob.name.endswith(".mcap"):
+                    found_here.append(blob)
+        # recording/ 階層を使わない旧レイアウトへのフォールバック
+        if subdir != "*":
+            for blob in client.list_blobs(bucket_name, prefix=f"{top}{subdir}/"):
+                if blob.name.endswith(".mcap"):
+                    found_here.append(blob)
         blobs.extend(sorted(found_here, key=lambda b: b.name))
-    if skipped_sessions:
-        print(f"[info] 時間帯外のセッション {len(skipped_sessions)} 件を除外 "
+    if n_skipped:
+        print(f"[info] 時間帯外のセッション {n_skipped} 件を除外 "
               f"(開始時刻が {earliest:%m/%d %H:%M} より前または {end_dt:%m/%d %H:%M} より後)")
     return blobs
 
