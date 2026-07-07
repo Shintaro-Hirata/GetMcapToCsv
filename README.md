@@ -29,6 +29,9 @@ t2-ft-original-data/
           record_develop_0.mcap
           record_develop_1.mcap
           ...
+        record_sensor/                       # develop と同時刻で分割された sensor 系 mcap
+          record_sensor_0.mcap
+          ...
 ```
 
 トップレベルの日付は**運行終了日**なので、夜間の走行データは翌日付の
@@ -130,6 +133,22 @@ python get_mcap_to_csv.py --vehicle GIGA07 --start "2025-12-04 12:00" --end "202
 | `t_sec` | 抽出範囲先頭からの経過秒 |
 | `t_ns` | 元のタイムスタンプ（ナノ秒, epoch） |
 
+### 3-c. record_sensor も一緒に抽出する
+
+`--include-sensor` を付けると、record_develop 側の絞り込みで確定した連番
+（例: `record_develop_34〜39` → `record_sensor_34〜39`）をそのまま
+`record_sensor/` にも適用して抽出対象に加える。develop と sensor は同時刻で
+分割されているため、sensor 側の時刻メタデータ読み込みは行わない。
+
+```bash
+python get_mcap_to_csv.py --vehicle GIGA09 --start "2026-07-01 20:40" --end "2026-07-01 20:45" \
+    --all-topics --include-sensor
+```
+
+sensor 側の mcap はサイズが大きいことが多いので、処理時間・メモリに注意。
+sensor のトピックだけ欲しい場合は `--subdir record_sensor` で develop の代わりに
+sensor を絞り込み対象にする方法もある。
+
 ### 4. ローカル mcap の処理（GCS を使わない）
 
 ```bash
@@ -180,6 +199,8 @@ python get_mcap_to_csv.py --local "C:\data\*.mcap" --start "2025-12-04 12:00" --
 | `--extract-workers` | 抽出（ダウンロード + デコード）のファイル並列数（デフォルトは自動） |
 | `--exclude-topics` | 除外するトピックのパターン（ワイルドカード可、複数指定可） |
 | `--no-download` | 一括ダウンロードを禁止し常にチャンク単位の部分読み込みにする |
+| `--include-sensor` | develop で確定した連番と同じ `record_sensor` の mcap も抽出対象に加える |
+| `--sensor-subdir` | `--include-sensor` で追加するサブディレクトリ名（デフォルト `record_sensor`） |
 | `--list-only` | 対象 mcap の一覧表示のみ |
 | `--list-topics` | トピック一覧表示（メッセージ数・エンコーディング・スキーマ名） |
 | `--local` | ローカル mcap を処理（glob パターン可） |

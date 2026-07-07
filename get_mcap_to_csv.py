@@ -420,6 +420,48 @@ def filter_sources_by_time(sources, start_ns, end_ns, workers=16):
     return selected
 
 
+def find_sensor_siblings(client, bucket_name, selected_sources, sensor_subdir="record_sensor"):
+    """選ばれた record_develop ファイルと同じ連番の record_sensor ファイルを追加する。
+
+    develop と sensor は同時刻で分割されているため、develop 側の絞り込みで確定した
+    連番をそのまま流用し、sensor 側のサマリ読み込みは行わない。
+    時刻範囲も develop 側のものを引き継ぎ、ダウンロード方式の判断に使う。
+    """
+    sensor_sources = []
+    by_dir = defaultdict(list)
+    for src in selected_sources:
+        if isinstance(src, GcsMcapSource):
+            by_dir[src.session].append(src)
+    for dev_dir, srcs in sorted(by_dir.items()):
+        parent = dev_dir.rsplit("/", 1)[0]  # セッションディレクトリ
+        prefix = f"{parent}/{sensor_subdir}/"
+        wanted = {}
+        for s in srcs:
+            idx = numeric_suffix(s.name)
+            if idx is not None:
+                wanted[idx] = s
+            else:
+                print(f"[warn] 連番が読めないため {sensor_subdir} の対応付け不可: {s.name}")
+        if not wanted:
+            continue
+        found = {}
+        for blob in client.list_blobs(bucket_name, prefix=prefix):
+            if blob.name.endswith(".mcap"):
+                idx = numeric_suffix(blob.name)
+                if idx in wanted:
+                    found[idx] = blob
+        for idx in sorted(wanted):
+            if idx in found:
+                sensor_src = GcsMcapSource(found[idx])
+                sensor_src.time_range = wanted[idx].time_range
+                sensor_sources.append(sensor_src)
+                print(f"[info] sensor 追加: {sensor_src.name}  ({size_str(sensor_src.size)})")
+            else:
+                print(f"[warn] 対応する {sensor_subdir} ファイルがありません: "
+                      f"{prefix} の連番 {idx}")
+    return sensor_sources
+
+
 def size_str(n):
     if n is None:
         return "?"
@@ -847,6 +889,12 @@ def main():
                              "--exclude-topics \"/tf*\" \"/t2/positioning_driver/internal/*\"")
     parser.add_argument("--no-download", action="store_true",
                         help="一括ダウンロードせず常にチャンク単位の部分読み込みを使う")
+    parser.add_argument("--include-sensor", action="store_true",
+                        help="record_develop で確定した連番と同じ record_sensor の mcap も"
+                             "抽出対象に加える (時刻の再確認はしない)")
+    parser.add_argument("--sensor-subdir", default="record_sensor", metavar="DIR",
+                        help="--include-sensor で追加するサブディレクトリ名"
+                             " (default: record_sensor)")
     parser.add_argument("--session-lookback", type=int, default=24, metavar="HOURS",
                         help="抽出開始時刻の何時間前までに始まったセッションを対象にするか"
                              " (default: 24)")
@@ -860,6 +908,9 @@ def main():
 
     # --- 入力ソースの決定 ---
     if args.local is not None:
+        if args.include_sensor:
+            print("[info] --include-sensor は GCS モード専用のため無視します"
+                  " (--local では sensor ファイルも直接パターンで指定してください)")
         patterns = args.local or ["*.mcap"]
         paths = []
         for pat in patterns:
@@ -902,6 +953,9 @@ def main():
               f" (並列 {args.workers}, セッション単位の二分探索)...")
         sources = filter_sources_by_time([GcsMcapSource(b) for b in blobs],
                                          start_ns, end_ns, workers=args.workers)
+        if args.include_sensor and sources:
+            sources += find_sensor_siblings(client, args.bucket, sources,
+                                            args.sensor_subdir)
 
     if not sources:
         raise SystemExit("[error] 指定時間帯に重なる mcap がありません。")
