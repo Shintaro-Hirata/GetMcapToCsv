@@ -42,9 +42,13 @@ import glob
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
+import time
 from collections import OrderedDict, defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from fnmatch import fnmatch
 
 from mcap.reader import make_reader  # make_reader
 
@@ -83,7 +87,7 @@ FLATTEN_MAX_LIST = 8
 # ------------------------------------------------------------------
 # デコーダ (入っているものを全部使う)
 # ------------------------------------------------------------------
-def build_decoder_factories():
+def build_decoder_factories(quiet=False):
     """利用可能な mcap デコーダファクトリを集める。"""
     factories = []
     names = []
@@ -93,16 +97,18 @@ def build_decoder_factories():
         factories.append(Ros2DecodeFactory())
         names.append("ros2idl (mcap-ros2idl-support)")
     except ImportError:
-        print("[warn] mcap-ros2idl-support が見つかりません。"
-              " /t2/* トピック (ros2idl) はデコードできません。README.md を参照。")
+        if not quiet:
+            print("[warn] mcap-ros2idl-support が見つかりません。"
+                  " /t2/* トピック (ros2idl) はデコードできません。README.md を参照。")
 
     try:
         from mcap_protobuf.decoder import DecoderFactory as PbDecoderFactory  # protobuf 用
         factories.append(PbDecoderFactory())
         names.append("protobuf (mcap-protobuf-support)")
     except ImportError:
-        print("[warn] mcap-protobuf-support が見つかりません。"
-              " /apollo/* トピック (protobuf) はデコードできません。")
+        if not quiet:
+            print("[warn] mcap-protobuf-support が見つかりません。"
+                  " /apollo/* トピック (protobuf) はデコードできません。")
 
     try:
         from mcap_ros2.decoder import DecoderFactory as Ros2MsgDecoderFactory  # ros2msg 用
@@ -111,7 +117,7 @@ def build_decoder_factories():
     except ImportError:
         pass  # 任意
 
-    if factories:
+    if factories and not quiet:
         print(f"[info] decoders: {', '.join(names)}")
     return factories
 
@@ -262,6 +268,7 @@ class GcsMcapSource:
         self.size = blob.size
         # 同じディレクトリ = 同じ録画セッション。連番二分探索のグループ単位に使う
         self.session = blob.name.rsplit("/", 1)[0]
+        self.time_range = None  # 絞り込み時に判明したメッセージ時刻範囲 (不明なら None)
 
     def open(self, chunk_size=16 * 1024 * 1024):
         return self.blob.open("rb", chunk_size=chunk_size)
@@ -273,6 +280,7 @@ class LocalMcapSource:
         self.name = path
         self.size = os.path.getsize(path)
         self.session = None  # ローカルは連番の保証がないので個別チェック
+        self.time_range = None
 
     def open(self, chunk_size=None):
         return open(self.path, "rb")
@@ -398,6 +406,7 @@ def filter_sources_by_time(sources, start_ns, end_ns, workers=16):
                 continue
             total_reads += reads
             for src, rng in picked:
+                src.time_range = rng  # 抽出フェーズでダウンロード方式の判断に使う
                 if rng is not None:
                     print(f"[info] 対象: {src.name}  "
                           f"({fmt_jst(rng[0])} - {fmt_jst(rng[1])}, {size_str(src.size)})")
@@ -503,55 +512,184 @@ def load_topic_config(path):
     return config
 
 
-def extract_rows(sources, topic_config, start_ns, end_ns, factories):
-    """全ソースから対象トピックの行データを収集する。
+def _match_any(topic, patterns):
+    return any(fnmatch(topic, p) for p in patterns)
+
+
+def _collect_rows(reader, topic_config, exclude_pats, start_ns, end_ns):
+    """開いた mcap reader から行データを収集する。
+
+    topic_config が None のときは全トピック対象。exclude_pats に一致するトピックは
+    デコード自体をスキップする (対象トピックのリストを先に確定して reader に渡す)。
+    """
+    all_topics = topic_config is None
+    if all_topics:
+        topics_arg = None
+        if exclude_pats:
+            summary = reader.get_summary()
+            if summary is not None:
+                chans = sorted({ch.topic for ch in summary.channels.values()})
+                topics_arg = [t for t in chans if not _match_any(t, exclude_pats)]
+    else:
+        topics_arg = [t for t in topic_config if not _match_any(t, exclude_pats)]
+
+    per_topic = {} if all_topics else {t: [] for t in topic_config}
+    decode_errors = defaultdict(int)
+    count = 0
+    it = reader.iter_decoded_messages(
+        topics=topics_arg,
+        start_time=start_ns,
+        end_time=end_ns,
+        log_time_order=True,
+    )
+    while True:
+        try:
+            schema, channel, message, decoded = next(it)
+        except StopIteration:
+            break
+        except Exception as e:  # 個別メッセージのデコード失敗は数えて続行
+            decode_errors[str(e)[:120]] += 1
+            continue
+        topic = channel.topic
+        if exclude_pats and _match_any(topic, exclude_pats):
+            continue  # サマリが読めず topics_arg で絞れなかった場合の保険
+        if all_topics:
+            fields = []
+            if topic not in per_topic:
+                per_topic[topic] = []
+        else:
+            fields = topic_config[topic]["fields"]
+        r = {"t_ns": message.log_time}
+        if fields:
+            for fld in fields:
+                r[fld.split(".")[-1]] = dig(decoded, fld)
+        else:  # フィールド未指定ならメッセージ全体をフラット展開
+            for k, v in flatten(decoded).items():
+                r[k] = v
+        per_topic[topic].append(r)
+        count += 1
+    return per_topic, dict(decode_errors), count
+
+
+def _extract_worker(job):
+    """1 ファイル分のダウンロード + デコードを行うワーカー (別プロセスで実行可)。
+
+    戻り値: (表示名, per_topic, decode_errors, 行数, 秒数)
+    """
+    t0 = time.monotonic()
+    factories = build_decoder_factories(quiet=True)
+    tmpdir = None
+    try:
+        if job["kind"] == "gcs":
+            from google.cloud import storage  # storage.Client
+            blob = storage.Client().bucket(job["bucket"]).blob(job["blob_name"])
+            if job["download"]:
+                # 時間帯がファイルの大半を占めるなら一括ダウンロードの方が速い
+                tmpdir = tempfile.mkdtemp(prefix="getmcap_")
+                local = os.path.join(tmpdir, "part.mcap")
+                blob.download_to_filename(local)
+                f = open(local, "rb")
+            else:
+                f = blob.open("rb", chunk_size=16 * 1024 * 1024)
+        else:
+            f = open(job["path"], "rb")
+        with f:
+            reader = make_reader(f, decoder_factories=factories)
+            per_topic, errors, count = _collect_rows(
+                reader, job["topic_config"], job["exclude"],
+                job["start_ns"], job["end_ns"])
+        return job["name"], per_topic, errors, count, time.monotonic() - t0
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _window_coverage(src, start_ns, end_ns):
+    """抽出時間帯がファイルの時刻範囲をどれだけ覆うか (0.0-1.0)。不明なら 1.0。"""
+    rng = getattr(src, "time_range", None)
+    if rng is None or rng[1] <= rng[0]:
+        return 1.0  # 二分探索の内側 (= 全体が時間帯内) など
+    overlap = min(rng[1], end_ns or rng[1]) - max(rng[0], start_ns or rng[0])
+    return max(0.0, overlap / (rng[1] - rng[0]))
+
+
+def build_extract_jobs(sources, topic_config, exclude_pats, start_ns, end_ns,
+                       no_download=False):
+    jobs = []
+    for src in sources:
+        job = {
+            "name": src.name,
+            "topic_config": topic_config,
+            "exclude": exclude_pats or [],
+            "start_ns": start_ns,
+            "end_ns": end_ns,
+        }
+        if isinstance(src, GcsMcapSource):
+            job["kind"] = "gcs"
+            job["bucket"] = src.blob.bucket.name
+            job["blob_name"] = src.blob.name
+            # 時間帯がファイルの半分以上を覆うなら一括ダウンロード、
+            # 一部だけならチャンクインデックスによる部分読み込み
+            job["download"] = (not no_download
+                               and _window_coverage(src, start_ns, end_ns) >= 0.5)
+        else:
+            job["kind"] = "local"
+            job["path"] = src.path
+            job["download"] = False
+        jobs.append(job)
+    return jobs
+
+
+def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
+                 workers=None, no_download=False):
+    """全ソースから対象トピックの行データを収集する (ファイル単位で並列)。
 
     topic_config が None のときは mcap に含まれる全トピックを対象にする。
     """
+    jobs = build_extract_jobs(sources, topic_config, exclude_pats,
+                              start_ns, end_ns, no_download)
+    if workers is None:
+        workers = min(len(jobs), max(1, (os.cpu_count() or 4) - 1), 8)
+    workers = max(1, workers)
+
+    n_dl = sum(1 for j in jobs if j.get("download"))
+    print(f"[info] {len(jobs)} ファイルを読み込み (並列 {workers}, "
+          f"一括ダウンロード {n_dl} 件 / 部分読み込み {len(jobs) - n_dl} 件)")
+
     all_topics = topic_config is None
     per_topic = {} if all_topics else {t: [] for t in topic_config}
     decode_errors = defaultdict(int)
 
-    for src in sources:
-        print(f"[info] 読み込み中: {src.name}")
-        count = 0
+    def merge(result):
+        name, part, errors, count, sec = result
+        for topic, rows in part.items():
+            per_topic.setdefault(topic, []).extend(rows)
+        for err, n in errors.items():
+            decode_errors[err] += n
+        print(f"[info]   {name.rsplit('/', 1)[-1]}: {count} 行 ({sec:.1f} 秒)")
+
+    if workers == 1 or len(jobs) == 1:
+        for job in jobs:
+            try:
+                merge(_extract_worker(job))
+            except Exception as e:
+                print(f"[warn] 読み込み失敗 ({job['name']}): {e}")
+    else:
         try:
-            with src.open() as f:
-                reader = make_reader(f, decoder_factories=factories)
-                it = reader.iter_decoded_messages(
-                    topics=None if all_topics else list(topic_config.keys()),
-                    start_time=start_ns,
-                    end_time=end_ns,
-                    log_time_order=True,
-                )
-                while True:
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(_extract_worker, job): job for job in jobs}
+                for fut in as_completed(futures):
                     try:
-                        schema, channel, message, decoded = next(it)
-                    except StopIteration:
-                        break
-                    except Exception as e:  # 個別メッセージのデコード失敗は数えて続行
-                        decode_errors[str(e)[:120]] += 1
-                        continue
-                    topic = channel.topic
-                    if all_topics:
-                        fields = []
-                        if topic not in per_topic:
-                            per_topic[topic] = []
-                    else:
-                        fields = topic_config[topic]["fields"]
-                    r = {"t_ns": message.log_time}
-                    if fields:
-                        for fld in fields:
-                            r[fld.split(".")[-1]] = dig(decoded, fld)
-                    else:  # フィールド未指定ならメッセージ全体をフラット展開
-                        for k, v in flatten(decoded).items():
-                            r[k] = v
-                    per_topic[topic].append(r)
-                    count += 1
-        except Exception as e:
-            print(f"[warn] 読み込み失敗 ({src.name}): {e}")
-            continue
-        print(f"[info]   {count} 行取得")
+                        merge(fut.result())
+                    except Exception as e:
+                        print(f"[warn] 読み込み失敗 ({futures[fut]['name']}): {e}")
+        except (OSError, RuntimeError) as e:  # プロセス起動に失敗したら直列で実行
+            print(f"[warn] 並列実行に失敗したため直列で処理します: {e}")
+            for job in jobs:
+                try:
+                    merge(_extract_worker(job))
+                except Exception as e2:
+                    print(f"[warn] 読み込み失敗 ({job['name']}): {e2}")
 
     for err, n in decode_errors.items():
         print(f"[warn] デコード失敗 {n} 件: {err}")
@@ -701,6 +839,14 @@ def main():
                              f" (default: {DEFAULT_SUBDIR}, \"*\" で全て)")
     parser.add_argument("--workers", type=int, default=16,
                         help="時刻メタデータ読み込みの並列数 (default: 16)")
+    parser.add_argument("--extract-workers", type=int, default=None, metavar="N",
+                        help="抽出 (ダウンロード + デコード) のファイル並列数"
+                             " (default: CPU コア数と対象ファイル数から自動)")
+    parser.add_argument("--exclude-topics", nargs="*", default=[], metavar="PATTERN",
+                        help="除外するトピック (ワイルドカード可)。例: "
+                             "--exclude-topics \"/tf*\" \"/t2/positioning_driver/internal/*\"")
+    parser.add_argument("--no-download", action="store_true",
+                        help="一括ダウンロードせず常にチャンク単位の部分読み込みを使う")
     parser.add_argument("--session-lookback", type=int, default=24, metavar="HOURS",
                         help="抽出開始時刻の何時間前までに始まったセッションを対象にするか"
                              " (default: 24)")
@@ -777,11 +923,14 @@ def main():
             print("[info] --all-topics 指定のため --topics は無視します。")
     else:
         topic_config = load_topic_config(args.topics)
-    factories = build_decoder_factories()
+    factories = build_decoder_factories()  # 利用可能デコーダの表示と事前チェック
     if not factories:
         raise SystemExit("[error] 使えるデコーダがありません。"
                          " `pip install -r requirements.txt` を実行してください。")
-    per_topic = extract_rows(sources, topic_config, start_ns, end_ns, factories)
+    per_topic = extract_rows(sources, topic_config, start_ns, end_ns,
+                             exclude_pats=args.exclude_topics,
+                             workers=args.extract_workers,
+                             no_download=args.no_download)
     write_csvs(per_topic, topic_config, args.outdir, base)
 
 
