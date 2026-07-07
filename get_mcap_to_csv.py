@@ -44,6 +44,7 @@ import os
 import re
 import sys
 from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from mcap.reader import make_reader  # make_reader
 
@@ -201,13 +202,18 @@ def parse_session_start(session_name):
         return None
 
 
-def list_candidate_blobs(client, bucket_name, top_dirs, subdir, end_dt):
+def list_candidate_blobs(client, bucket_name, top_dirs, subdir, start_dt, end_dt,
+                         lookback_hours=24):
     """トップレベルディレクトリ配下の mcap blob を列挙する。
 
     recording/<session>/<subdir>/*.mcap と、直下の <subdir>/*.mcap の両方を探す。
-    セッション開始時刻が抽出終了時刻より後のセッションは除外する。
+    セッション開始時刻がディレクトリ名 (YYYYMMDD_HHMMSS_...) から分かる場合、
+    抽出終了時刻より後に始まるセッションと、抽出開始時刻より lookback_hours 以上
+    前に始まったセッションはメタデータを読まずに除外する。
     """
+    earliest = start_dt - datetime.timedelta(hours=lookback_hours)
     blobs = []
+    skipped_sessions = set()
     for top in top_dirs:
         found_here = []
         for prefix in (f"{top}recording/", f"{top}{subdir}/"):
@@ -222,10 +228,14 @@ def list_candidate_blobs(client, bucket_name, top_dirs, subdir, end_dt):
                     if subdir != "*" and parts[2] != subdir:
                         continue
                     session_start = parse_session_start(parts[1])
-                    if session_start is not None and session_start > end_dt:
+                    if session_start is not None and not (earliest <= session_start <= end_dt):
+                        skipped_sessions.add(parts[1])
                         continue
                 found_here.append(blob)
         blobs.extend(sorted(found_here, key=lambda b: b.name))
+    if skipped_sessions:
+        print(f"[info] 時間帯外のセッション {len(skipped_sessions)} 件を除外 "
+              f"(開始時刻が {earliest:%m/%d %H:%M} より前または {end_dt:%m/%d %H:%M} より後)")
     return blobs
 
 
@@ -236,6 +246,8 @@ class GcsMcapSource:
         self.blob = blob
         self.name = f"gs://{blob.bucket.name}/{blob.name}"
         self.size = blob.size
+        # 同じディレクトリ = 同じ録画セッション。連番二分探索のグループ単位に使う
+        self.session = blob.name.rsplit("/", 1)[0]
 
     def open(self, chunk_size=16 * 1024 * 1024):
         return self.blob.open("rb", chunk_size=chunk_size)
@@ -246,6 +258,7 @@ class LocalMcapSource:
         self.path = path
         self.name = path
         self.size = os.path.getsize(path)
+        self.session = None  # ローカルは連番の保証がないので個別チェック
 
     def open(self, chunk_size=None):
         return open(self.path, "rb")
@@ -254,7 +267,7 @@ class LocalMcapSource:
 def read_time_range(source):
     """mcap のサマリだけを読んでメッセージの (start_ns, end_ns) を返す。無ければ None。"""
     try:
-        with source.open(chunk_size=1024 * 1024) as f:
+        with source.open(chunk_size=256 * 1024) as f:
             reader = make_reader(f)
             summary = reader.get_summary()
             stats = summary.statistics if summary else None
@@ -265,20 +278,122 @@ def read_time_range(source):
     return None
 
 
-def filter_sources_by_time(sources, start_ns, end_ns):
-    """時間帯と重なるファイルだけに絞る。サマリが読めないものは残す。"""
+_NUMBER_SUFFIX = re.compile(r"_(\d+)\.mcap$")
+
+
+def numeric_suffix(name):
+    """record_develop_16.mcap のような連番付きファイル名から番号を取り出す。"""
+    m = _NUMBER_SUFFIX.search(name)
+    return int(m.group(1)) if m else None
+
+
+def _overlaps(rng, start_ns, end_ns):
+    """時刻範囲が重なるか。サマリが読めなかったファイル (None) は念のため対象扱い。"""
+    if rng is None:
+        return True
+    return rng[0] <= end_ns and rng[1] >= start_ns
+
+
+def _scan_group(files, start_ns, end_ns, cache):
+    """グループ内の全ファイルのサマリを読んで重なるものを返す。"""
     selected = []
+    for i, src in enumerate(files):
+        if i not in cache:
+            cache[i] = read_time_range(src)
+        if _overlaps(cache[i], start_ns, end_ns):
+            selected.append((src, cache[i]))
+    return selected
+
+
+def _bisect_group(files, start_ns, end_ns, cache):
+    """連番順 = 時刻順のグループから、二分探索で重なる範囲 [left, right] を求める。
+
+    サマリを読めないファイルに当たった場合は全件スキャンにフォールバックする。
+    """
+    def rng(i):
+        if i not in cache:
+            cache[i] = read_time_range(files[i])
+        if cache[i] is None:
+            raise LookupError(i)
+        return cache[i]
+
+    n = len(files)
+    try:
+        # 左端: end_time >= start_ns となる最初のファイル
+        lo, hi, left = 0, n - 1, n
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if rng(mid)[1] >= start_ns:
+                left, hi = mid, mid - 1
+            else:
+                lo = mid + 1
+        if left == n:
+            return []
+        # 右端: start_time <= end_ns となる最後のファイル
+        lo, hi, right = left, n - 1, left - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if rng(mid)[0] <= end_ns:
+                right, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+        # 境界の内側は読まずに時刻連続性を信頼して選択する
+        return [(files[i], cache.get(i)) for i in range(left, right + 1)]
+    except LookupError:
+        return _scan_group(files, start_ns, end_ns, cache)
+
+
+def _select_in_group(files, start_ns, end_ns):
+    """1 グループ (= 1 セッションディレクトリ) から対象ファイルを選ぶ。
+
+    戻り値: (選ばれた (source, 時刻範囲 or None) のリスト, サマリ読み込み回数)
+    """
+    cache = {}
+    nums = [numeric_suffix(f.name) for f in files]
+    sequential = (len(files) >= 4 and all(x is not None for x in nums)
+                  and len(set(nums)) == len(nums))
+    if sequential:
+        files = [f for _, f in sorted(zip(nums, files), key=lambda p: p[0])]
+        selected = _bisect_group(files, start_ns, end_ns, cache)
+    else:
+        selected = _scan_group(files, start_ns, end_ns, cache)
+    return selected, len(cache)
+
+
+def filter_sources_by_time(sources, start_ns, end_ns, workers=16):
+    """時間帯と重なるファイルだけに絞る。
+
+    セッションディレクトリごとにグループ化し、連番ファイルは二分探索で境界のみ
+    サマリを読む。グループ間は並列で処理する。
+    """
+    groups = OrderedDict()
     for src in sources:
-        rng = read_time_range(src)
-        if rng is None:
-            print(f"[info] 時刻情報なし (念のため対象に含める): {src.name}")
-            selected.append(src)
-            continue
-        s, e = rng
-        if s <= end_ns and e >= start_ns:
-            selected.append(src)
-            print(f"[info] 対象: {src.name}  "
-                  f"({fmt_jst(s)} - {fmt_jst(e)}, {size_str(src.size)})")
+        key = src.session if src.session else src.name  # セッション不明なら単独グループ
+        groups.setdefault(key, []).append(src)
+
+    selected = []
+    total_reads = 0
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {pool.submit(_select_in_group, files, start_ns, end_ns): key
+                   for key, files in groups.items()}
+        for fut in as_completed(futures):
+            try:
+                picked, reads = fut.result()
+            except Exception as e:
+                print(f"[warn] 絞り込み失敗 ({futures[fut]}): {e}")
+                continue
+            total_reads += reads
+            for src, rng in picked:
+                if rng is not None:
+                    print(f"[info] 対象: {src.name}  "
+                          f"({fmt_jst(rng[0])} - {fmt_jst(rng[1])}, {size_str(src.size)})")
+                else:
+                    print(f"[info] 対象: {src.name}  ({size_str(src.size)})")
+            selected.extend(src for src, _ in picked)
+
+    print(f"[info] 絞り込み完了: {len(sources)} 件中 {len(selected)} 件が対象 "
+          f"(メタデータ読み込み {total_reads} 回)")
+    selected.sort(key=lambda s: s.name)
     return selected
 
 
@@ -570,6 +685,11 @@ def main():
     parser.add_argument("--subdir", default=DEFAULT_SUBDIR,
                         help=f"recording セッション内の対象サブディレクトリ"
                              f" (default: {DEFAULT_SUBDIR}, \"*\" で全て)")
+    parser.add_argument("--workers", type=int, default=16,
+                        help="時刻メタデータ読み込みの並列数 (default: 16)")
+    parser.add_argument("--session-lookback", type=int, default=24, metavar="HOURS",
+                        help="抽出開始時刻の何時間前までに始まったセッションを対象にするか"
+                             " (default: 24)")
     parser.add_argument("--list-only", action="store_true",
                         help="対象 mcap ファイルの一覧表示のみ (ダウンロード・デコードしない)")
     parser.add_argument("--list-topics", action="store_true",
@@ -612,12 +732,16 @@ def main():
                              f"(パターン: YYYYMMDD_{vehicle}__*)。日付と vehicle ID を確認してください。")
         for d in top_dirs:
             print(f"[info] 候補ディレクトリ: {d}")
-        blobs = list_candidate_blobs(client, args.bucket, top_dirs, args.subdir, end_dt)
+        blobs = list_candidate_blobs(client, args.bucket, top_dirs, args.subdir,
+                                     start_dt, end_dt, args.session_lookback)
         if not blobs:
             raise SystemExit("[error] mcap ファイルが見つかりません "
-                             f"(サブディレクトリ: {args.subdir})。--subdir \"*\" も試してください。")
-        print(f"[info] mcap 候補 {len(blobs)} 件。時刻メタデータで絞り込み中...")
-        sources = filter_sources_by_time([GcsMcapSource(b) for b in blobs], start_ns, end_ns)
+                             f"(サブディレクトリ: {args.subdir})。--subdir \"*\" や"
+                             " --session-lookback の拡大も試してください。")
+        print(f"[info] mcap 候補 {len(blobs)} 件。時刻メタデータで絞り込み中"
+              f" (並列 {args.workers}, セッション単位の二分探索)...")
+        sources = filter_sources_by_time([GcsMcapSource(b) for b in blobs],
+                                         start_ns, end_ns, workers=args.workers)
 
     if not sources:
         raise SystemExit("[error] 指定時間帯に重なる mcap がありません。")
