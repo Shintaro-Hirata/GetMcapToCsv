@@ -59,11 +59,13 @@ t2-ft-original-data/
 `start_ui.bat` をダブルクリック（またはターミナルで `streamlit run app.py`）すると
 ブラウザで操作できる UI が起動する。
 
-1. **① 検索条件** — 車両ID・日付・開始/終了時刻を入力して「候補ファイルを検索」
-   （record_sensor を含めるかは詳細オプション）
-2. **② 対象ファイル** — 見つかった mcap の一覧（時刻範囲・サイズ付き）。不要なものは外せる
+1. **① 検索条件** — 車両ID・日付・開始/終了時刻を入力して「候補ファイルを検索」。
+   `record_image` は既定で含める（ほぼ毎回使うため）、`record_sensor` はチェックで追加
+2. **② 対象ファイル** — 見つかった mcap を 1 行 1 ファイルの表で確認
+   （種類 develop/image/sensor・時間帯・サイズ付き）。チェックで選択・除外
 3. **③ トピック選択** — 「トピック一覧を取得」でデータに含まれる実トピックを取得し、
-   複数選択。`mcap_presets.json` のプリセット（切り出し君互換 等）でまとめ選択も可
+   1 行 1 トピックの表から選択。`mcap_presets.json` のプリセット（切り出し君互換 等）で
+   まとめ選択も可
 4. **④ 出力** — 出力形式と出力フォルダを指定して「抽出実行」
    - **CSV（トピック別）** … 従来どおりのCSV出力
    - **mcap（時間帯クロップ + トピック絞り込み）** … 指定時間帯・指定トピックだけを
@@ -221,6 +223,8 @@ python get_mcap_to_csv.py --local "C:\data\*.mcap" --start "2025-12-04 12:00" --
 | `--no-download` | 一括ダウンロードを禁止し常にチャンク単位の部分読み込みにする |
 | `--include-sensor` | develop で確定した連番と同じ `record_sensor` の mcap も抽出対象に加える |
 | `--sensor-subdir` | `--include-sensor` で追加するサブディレクトリ名（デフォルト `record_sensor`） |
+| `--include-image` | develop で確定した連番と同じ `record_image` の mcap も抽出対象に加える |
+| `--image-subdir` | `--include-image` で追加するサブディレクトリ名（デフォルト `record_image`） |
 | `--list-only` | 対象 mcap の一覧表示のみ |
 | `--list-topics` | トピック一覧表示（メッセージ数・エンコーディング・スキーマ名） |
 | `--local` | ローカル mcap を処理（glob パターン可） |

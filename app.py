@@ -8,9 +8,9 @@ GetMcapToCsv の Streamlit UI。
     (Windows は start_ui.bat をダブルクリックでも可)
 
 流れ:
-    1. 車両ID・時間帯を入れて「候補ファイルを検索」
-    2. 見つかったファイルを確認 (不要なら外す)
-    3. 「トピック一覧を取得」→ 欲しいトピックを選択 (プリセット可)
+    1. 車両ID・時間帯を入れて「候補ファイルを検索」(image は既定で含む / sensor は選択制)
+    2. 見つかったファイルを表で確認 (1 行 1 ファイル、チェックで選択)
+    3. 「トピック一覧を取得」→ 表から欲しいトピックを選択 (プリセット可)
     4. 出力形式 (CSV / mcap) と出力先を選んで「抽出実行」
 """
 
@@ -22,6 +22,7 @@ import os
 import subprocess
 import sys
 
+import pandas as pd
 import streamlit as st
 
 import get_mcap_to_csv as core  # find_gcs_sources, collect_topics, extract_rows, write_csvs, save_mcap_slice, download_raw_mcaps
@@ -33,8 +34,10 @@ st.title("🚚 GetMcapToCsv — 走行データ mcap 抽出ツール")
 
 ss = st.session_state
 ss.setdefault("sources", None)        # 検索で見つかった全ソース
+ss.setdefault("search_id", 0)         # 検索のたびに増やして表をリセットする
 ss.setdefault("search_log", "")
 ss.setdefault("topics_info", None)    # {topic: {schema, encoding, count}}
+ss.setdefault("topics_id", 0)
 ss.setdefault("topics_log", "")
 ss.setdefault("result_files", None)
 ss.setdefault("result_log", "")
@@ -61,6 +64,17 @@ def load_presets():
         return {}
 
 
+def source_kind(name):
+    """パスから develop / image / sensor などの種類ラベルを取り出す。"""
+    parent = name.rsplit("/", 2)
+    if len(parent) >= 2:
+        d = parent[-2]
+        if d.startswith("record_"):
+            return d[len("record_"):]
+        return d
+    return "?"
+
+
 @st.cache_resource
 def gcs_client():
     return core.gcs_client()
@@ -81,16 +95,24 @@ with col3:
 with col4:
     t_end = st.time_input("終了時刻", value=datetime.time(12, 5), step=60)
 
+icol1, icol2, _ = st.columns([1, 1, 2])
+with icol1:
+    include_image = st.checkbox("record_image も含める", value=True,
+                                help="develop と同じ連番の image ファイルも対象に加える (ほぼ毎回使うため既定でオン)")
+with icol2:
+    include_sensor = st.checkbox("record_sensor も含める", value=False,
+                                 help="develop と同じ連番の sensor ファイルも対象に加える (サイズ大)")
+
 with st.expander("詳細オプション"):
     oc1, oc2, oc3 = st.columns(3)
     with oc1:
         bucket = st.text_input("GCS バケット", value=core.DEFAULT_BUCKET)
-        include_sensor = st.checkbox("record_sensor も含める", value=False,
-                                     help="develop で確定した連番と同じ sensor ファイルも対象に加える")
+        subdir = st.text_input("基準サブディレクトリ", value=core.DEFAULT_SUBDIR)
     with oc2:
-        subdir = st.text_input("サブディレクトリ", value=core.DEFAULT_SUBDIR)
-        lookback = st.number_input("セッション遡り時間 (h)", value=24, min_value=1, max_value=96)
+        image_subdir = st.text_input("image サブディレクトリ名", value="record_image")
+        sensor_subdir = st.text_input("sensor サブディレクトリ名", value="record_sensor")
     with oc3:
+        lookback = st.number_input("セッション遡り時間 (h)", value=24, min_value=1, max_value=96)
         meta_workers = st.number_input("メタデータ並列数", value=16, min_value=1, max_value=64)
         extract_workers = st.number_input("抽出並列数 (0=自動)", value=0, min_value=0, max_value=16)
 
@@ -109,8 +131,11 @@ if st.button("🔍 ① 候補ファイルを検索", type="primary"):
             sources, log = run_captured(
                 core.find_gcs_sources, gcs_client(), bucket, vehicle,
                 start_dt, end_dt, subdir=subdir, lookback_hours=int(lookback),
-                workers=int(meta_workers), include_sensor=include_sensor)
+                workers=int(meta_workers),
+                include_sensor=include_sensor, sensor_subdir=sensor_subdir,
+                include_image=include_image, image_subdir=image_subdir)
         ss.sources = sources
+        ss.search_id += 1
         ss.search_log = log
         ss.search_params = {
             "start_ns": core.to_ns(start_dt),
@@ -129,79 +154,116 @@ if ss.search_log:
         st.code(ss.search_log)
 
 # ==================================================================
-# ② 候補ファイルの確認・選択
+# ② 候補ファイルの確認・選択 (1 行 1 ファイル)
 # ==================================================================
+selected_sources = []
 if ss.sources:
     st.header("② 対象ファイル")
-    total = sum(s.size or 0 for s in ss.sources)
-    st.caption(f"{len(ss.sources)} ファイル / 合計 {core.size_str(total)}")
 
-    labels = {}
+    src_by_name = {s.name: s for s in ss.sources}
+    file_rows = []
     for s in ss.sources:
         rng = getattr(s, "time_range", None)
-        t = (f"{core.fmt_jst(rng[0])} - {core.fmt_jst(rng[1])}" if rng else "(時間帯内)")
-        labels[s.name] = f"{s.name.rsplit('/', 1)[-1]}  [{t}, {core.size_str(s.size)}]"
-
-    selected_names = st.multiselect(
-        "抽出対象 (不要なファイルは × で外す)",
-        options=[s.name for s in ss.sources],
-        default=[s.name for s in ss.sources],
-        format_func=lambda n: labels.get(n, n))
-    selected_sources = [s for s in ss.sources if s.name in set(selected_names)]
+        file_rows.append({
+            "選択": True,
+            "種類": source_kind(s.name),
+            "ファイル名": s.name.rsplit("/", 1)[-1],
+            "時間帯 (JST)": (f"{core.fmt_jst(rng[0])} - {core.fmt_jst(rng[1])}"
+                          if rng else "(指定時間帯内)"),
+            "サイズ": core.size_str(s.size),
+            "セッション": s.name.split("/recording/")[-1].split("/")[0]
+                        if "/recording/" in s.name else "",
+            "パス": s.name,
+        })
+    edited_files = st.data_editor(
+        pd.DataFrame(file_rows),
+        column_config={
+            "選択": st.column_config.CheckboxColumn("選択", width="small"),
+            "パス": None,  # フルパスは非表示 (選択サマリで確認可能)
+        },
+        disabled=["種類", "ファイル名", "時間帯 (JST)", "サイズ", "セッション"],
+        hide_index=True,
+        use_container_width=True,
+        key=f"file_editor_{ss.search_id}",
+    )
+    picked = edited_files[edited_files["選択"]]
+    selected_sources = [src_by_name[p] for p in picked["パス"] if p in src_by_name]
+    sel_size = sum(s.size or 0 for s in selected_sources)
+    st.caption(f"✅ 選択中: {len(selected_sources)} / {len(ss.sources)} ファイル "
+               f"(合計 {core.size_str(sel_size)})")
+    with st.expander("選択中のファイルを確認 (フルパス)"):
+        for s in selected_sources:
+            st.text(s.name)
 
     # ==============================================================
-    # ③ トピック選択
+    # ③ トピック選択 (1 行 1 トピック)
     # ==============================================================
     st.header("③ トピック選択")
-    tcol1, tcol2 = st.columns([1, 3])
+    tcol1, tcol2, tcol3 = st.columns([1, 2, 1])
     with tcol1:
         if st.button("📋 トピック一覧を取得"):
             with st.spinner("トピック一覧を取得中..."):
                 info, log = run_captured(core.collect_topics, selected_sources)
             ss.topics_info = info
+            ss.topics_id += 1
             ss.topics_log = log
             if not info:
                 st.warning("トピックが取得できませんでした。")
 
-    all_topic_names = list(ss.topics_info.keys()) if ss.topics_info else []
     presets = load_presets()
+    selected_topics = []
 
     if ss.topics_info:
+        all_topic_names = list(ss.topics_info.keys())
         with tcol2:
-            pcol1, pcol2 = st.columns([2, 1])
-            with pcol1:
-                preset_name = st.selectbox(
-                    "プリセット (選ぶと下の選択に反映)",
-                    ["(手動選択)"] + list(presets.keys()))
-            with pcol2:
-                st.write("")
-                use_all = st.checkbox("全トピック", value=False)
+            preset_name = st.selectbox(
+                "プリセット (選ぶと下の表の選択に反映)",
+                ["(手動選択)"] + list(presets.keys()))
+        with tcol3:
+            st.write("")
+            use_all = st.checkbox("全トピック選択", value=False)
 
         if use_all:
-            default_topics = all_topic_names
+            default_set = set(all_topic_names)
         elif preset_name != "(手動選択)":
             wanted = presets[preset_name]
-            default_topics = [t for t in all_topic_names
-                              if any(core.fnmatch(t, p) for p in wanted)]
+            default_set = {t for t in all_topic_names
+                           if any(core.fnmatch(t, p) for p in wanted)}
             missing = [p for p in wanted
                        if not any(core.fnmatch(t, p) for t in all_topic_names)]
             if missing:
                 st.caption(f"⚠ プリセット中でデータに存在しないもの: {', '.join(missing)}")
         else:
-            default_topics = []
+            default_set = set()
 
-        def topic_label(t):
-            m = ss.topics_info[t]
-            return f"{t}  ({m['count']} msgs, {m['encoding']})"
-
-        selected_topics = st.multiselect(
-            f"抽出するトピック ({len(all_topic_names)} 個から選択)",
-            options=all_topic_names,
-            default=default_topics,
-            format_func=topic_label)
+        topic_rows = [{
+            "選択": t in default_set,
+            "トピック": t,
+            "メッセージ数": ss.topics_info[t]["count"],
+            "エンコード": ss.topics_info[t]["encoding"],
+            "スキーマ": ss.topics_info[t]["schema"],
+        } for t in all_topic_names]
+        edited_topics = st.data_editor(
+            pd.DataFrame(topic_rows),
+            column_config={
+                "選択": st.column_config.CheckboxColumn("選択", width="small"),
+                "トピック": st.column_config.TextColumn("トピック", width="large"),
+            },
+            disabled=["トピック", "メッセージ数", "エンコード", "スキーマ"],
+            hide_index=True,
+            use_container_width=True,
+            height=420,
+            key=f"topic_editor_{ss.topics_id}_{preset_name}_{use_all}",
+        )
+        selected_topics = list(edited_topics[edited_topics["選択"]]["トピック"])
+        st.caption(f"✅ 選択中: {len(selected_topics)} / {len(all_topic_names)} トピック")
+        if selected_topics:
+            with st.expander("選択中のトピックを確認"):
+                for t in selected_topics:
+                    st.text(t)
     else:
-        selected_topics = []
-        st.caption("「トピック一覧を取得」を押すと、ここで選択できます。")
+        st.caption("「トピック一覧を取得」を押すと、ここで選択できます。"
+                   " (mcap を元ファイルのまま保存する場合はトピック選択は不要)")
 
     # ==============================================================
     # ④ 出力

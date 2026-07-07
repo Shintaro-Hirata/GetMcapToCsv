@@ -420,28 +420,28 @@ def filter_sources_by_time(sources, start_ns, end_ns, workers=16):
     return selected
 
 
-def find_sensor_siblings(client, bucket_name, selected_sources, sensor_subdir="record_sensor"):
-    """選ばれた record_develop ファイルと同じ連番の record_sensor ファイルを追加する。
+def find_sibling_files(client, bucket_name, selected_sources, subdir):
+    """選ばれた record_develop ファイルと同じ連番の兄弟サブディレクトリのファイルを追加する。
 
-    develop と sensor は同時刻で分割されているため、develop 側の絞り込みで確定した
-    連番をそのまま流用し、sensor 側のサマリ読み込みは行わない。
+    develop / image / sensor は同時刻で分割されているため、develop 側の絞り込みで
+    確定した連番をそのまま流用し、兄弟側のサマリ読み込みは行わない。
     時刻範囲も develop 側のものを引き継ぎ、ダウンロード方式の判断に使う。
     """
-    sensor_sources = []
+    sibling_sources = []
     by_dir = defaultdict(list)
     for src in selected_sources:
         if isinstance(src, GcsMcapSource):
             by_dir[src.session].append(src)
     for dev_dir, srcs in sorted(by_dir.items()):
         parent = dev_dir.rsplit("/", 1)[0]  # セッションディレクトリ
-        prefix = f"{parent}/{sensor_subdir}/"
+        prefix = f"{parent}/{subdir}/"
         wanted = {}
         for s in srcs:
             idx = numeric_suffix(s.name)
             if idx is not None:
                 wanted[idx] = s
             else:
-                print(f"[warn] 連番が読めないため {sensor_subdir} の対応付け不可: {s.name}")
+                print(f"[warn] 連番が読めないため {subdir} の対応付け不可: {s.name}")
         if not wanted:
             continue
         found = {}
@@ -450,16 +450,21 @@ def find_sensor_siblings(client, bucket_name, selected_sources, sensor_subdir="r
                 idx = numeric_suffix(blob.name)
                 if idx in wanted:
                     found[idx] = blob
+        if not found:
+            subs = list_subdirs(client, bucket_name, f"{parent}/")
+            names = [s[len(parent) + 1:].strip("/") for s in subs]
+            print(f"[warn] {prefix} に mcap がありません。"
+                  f"このセッションのサブディレクトリ: {', '.join(names) or '(なし)'}")
         for idx in sorted(wanted):
             if idx in found:
-                sensor_src = GcsMcapSource(found[idx])
-                sensor_src.time_range = wanted[idx].time_range
-                sensor_sources.append(sensor_src)
-                print(f"[info] sensor 追加: {sensor_src.name}  ({size_str(sensor_src.size)})")
-            else:
-                print(f"[warn] 対応する {sensor_subdir} ファイルがありません: "
+                sib = GcsMcapSource(found[idx])
+                sib.time_range = wanted[idx].time_range
+                sibling_sources.append(sib)
+                print(f"[info] {subdir} 追加: {sib.name}  ({size_str(sib.size)})")
+            elif found:
+                print(f"[warn] 対応する {subdir} ファイルがありません: "
                       f"{prefix} の連番 {idx}")
-    return sensor_sources
+    return sibling_sources
 
 
 def size_str(n):
@@ -832,7 +837,8 @@ def write_csvs(per_topic, topic_config, outdir, base, merged=True):
 # ------------------------------------------------------------------
 def find_gcs_sources(client, bucket, vehicle, start_dt, end_dt, subdir=DEFAULT_SUBDIR,
                      lookback_hours=24, workers=16, include_sensor=False,
-                     sensor_subdir="record_sensor"):
+                     sensor_subdir="record_sensor", include_image=False,
+                     image_subdir="record_image"):
     """条件に合う mcap ソースを GCS から探して返す。見つからなければ LookupError。"""
     vehicle = vehicle.strip().upper()
     start_ns, end_ns = to_ns(start_dt), to_ns(end_dt)
@@ -853,8 +859,11 @@ def find_gcs_sources(client, bucket, vehicle, start_dt, end_dt, subdir=DEFAULT_S
           f" (並列 {workers}, セッション単位の二分探索)...")
     sources = filter_sources_by_time([GcsMcapSource(b) for b in blobs],
                                      start_ns, end_ns, workers=workers)
-    if include_sensor and sources:
-        sources += find_sensor_siblings(client, bucket, sources, sensor_subdir)
+    base_sources = list(sources)  # 兄弟探索は develop 側の選定結果を基準にする
+    for flag, sib_subdir in ((include_image, image_subdir),
+                             (include_sensor, sensor_subdir)):
+        if flag and base_sources:
+            sources += find_sibling_files(client, bucket, base_sources, sib_subdir)
     return sources
 
 
@@ -1035,6 +1044,12 @@ def main():
     parser.add_argument("--sensor-subdir", default="record_sensor", metavar="DIR",
                         help="--include-sensor で追加するサブディレクトリ名"
                              " (default: record_sensor)")
+    parser.add_argument("--include-image", action="store_true",
+                        help="record_develop で確定した連番と同じ record_image の mcap も"
+                             "抽出対象に加える (時刻の再確認はしない)")
+    parser.add_argument("--image-subdir", default="record_image", metavar="DIR",
+                        help="--include-image で追加するサブディレクトリ名"
+                             " (default: record_image)")
     parser.add_argument("--session-lookback", type=int, default=24, metavar="HOURS",
                         help="抽出開始時刻の何時間前までに始まったセッションを対象にするか"
                              " (default: 24)")
@@ -1048,9 +1063,9 @@ def main():
 
     # --- 入力ソースの決定 ---
     if args.local is not None:
-        if args.include_sensor:
-            print("[info] --include-sensor は GCS モード専用のため無視します"
-                  " (--local では sensor ファイルも直接パターンで指定してください)")
+        if args.include_sensor or args.include_image:
+            print("[info] --include-sensor / --include-image は GCS モード専用のため無視します"
+                  " (--local では対象ファイルを直接パターンで指定してください)")
         patterns = args.local or ["*.mcap"]
         paths = []
         for pat in patterns:
@@ -1080,7 +1095,9 @@ def main():
                 client, args.bucket, vehicle, start_dt, end_dt,
                 subdir=args.subdir, lookback_hours=args.session_lookback,
                 workers=args.workers, include_sensor=args.include_sensor,
-                sensor_subdir=args.sensor_subdir)
+                sensor_subdir=args.sensor_subdir,
+                include_image=args.include_image,
+                image_subdir=args.image_subdir)
         except LookupError as e:
             raise SystemExit(f"[error] {e}")
 
