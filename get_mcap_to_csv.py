@@ -750,11 +750,11 @@ def topic_columns(fields, rows):
     return list(cols.keys())
 
 
-def write_csvs(per_topic, topic_config, outdir, base):
+def write_csvs(per_topic, topic_config, outdir, base, merged=True):
     """トピック別 CSV と (トピック指定時のみ) 全トピック結合 CSV を書き出す。
 
     topic_config が None のときは全トピックモード。トピックごとに CSV を 1 本ずつ
-    出力し、列数が膨大になる結合 CSV は作らない。
+    出力し、列数が膨大になる結合 CSV は作らない。merged=False でも結合 CSV を省く。
     """
     all_topics = topic_config is None
     all_t = [r["t_ns"] for rows in per_topic.values() for r in rows]
@@ -802,9 +802,10 @@ def write_csvs(per_topic, topic_config, outdir, base):
         written.append(out)
 
     # 全トピックモードは結合 CSV を作らない (列数が膨大になり実用的でないため)
-    if all_topics:
-        print(f"[info] 全トピックモードのため結合 CSV (_all.csv) は作成しません "
-              f"(トピック別 CSV を {len(written)} 本出力)。")
+    if all_topics or not merged:
+        if all_topics:
+            print(f"[info] 全トピックモードのため結合 CSV (_all.csv) は作成しません "
+                  f"(トピック別 CSV を {len(written)} 本出力)。")
         return written
 
     # (2) 全トピック結合 CSV (時刻順 / 値が無い列は空欄)
@@ -827,8 +828,147 @@ def write_csvs(per_topic, topic_config, outdir, base):
 
 
 # ------------------------------------------------------------------
+# GCS 検索の共通入口 (CLI / UI 共用)
+# ------------------------------------------------------------------
+def find_gcs_sources(client, bucket, vehicle, start_dt, end_dt, subdir=DEFAULT_SUBDIR,
+                     lookback_hours=24, workers=16, include_sensor=False,
+                     sensor_subdir="record_sensor"):
+    """条件に合う mcap ソースを GCS から探して返す。見つからなければ LookupError。"""
+    vehicle = vehicle.strip().upper()
+    start_ns, end_ns = to_ns(start_dt), to_ns(end_dt)
+    print(f"[info] バケット {bucket} から {vehicle} / "
+          f"{start_dt:%Y-%m-%d %H:%M:%S} - {end_dt:%Y-%m-%d %H:%M:%S} (JST) を探索")
+    top_dirs = list_top_dirs(client, bucket, vehicle, start_dt, end_dt)
+    if not top_dirs:
+        raise LookupError(f"該当ディレクトリがありません (パターン: YYYYMMDD_{vehicle}__*)。"
+                          "日付と vehicle ID を確認してください。")
+    for d in top_dirs:
+        print(f"[info] 候補ディレクトリ: {d}")
+    blobs = list_candidate_blobs(client, bucket, top_dirs, subdir,
+                                 start_dt, end_dt, lookback_hours)
+    if not blobs:
+        raise LookupError(f"mcap ファイルが見つかりません (サブディレクトリ: {subdir})。"
+                          "--subdir \"*\" や --session-lookback の拡大も試してください。")
+    print(f"[info] mcap 候補 {len(blobs)} 件。時刻メタデータで絞り込み中"
+          f" (並列 {workers}, セッション単位の二分探索)...")
+    sources = filter_sources_by_time([GcsMcapSource(b) for b in blobs],
+                                     start_ns, end_ns, workers=workers)
+    if include_sensor and sources:
+        sources += find_sensor_siblings(client, bucket, sources, sensor_subdir)
+    return sources
+
+
+# ------------------------------------------------------------------
+# mcap 出力 (時間帯クロップ / トピック絞り込み / 元ファイル保存)
+# ------------------------------------------------------------------
+def save_mcap_slice(sources, topics, start_ns, end_ns, out_path):
+    """複数ソースから指定時間帯・指定トピックのメッセージを 1 本の mcap に書き出す。
+
+    メッセージはデコードせず生データのままコピーする (スキーマ・チャンネルも引き継ぐ)。
+    topics が None のときは全トピック。
+    """
+    from mcap.writer import Writer  # Writer
+
+    n_msgs = 0
+    with open(out_path, "wb") as fo:
+        w = Writer(fo)
+        w.start()
+        schema_ids = {}   # (name, encoding, data) -> 新しい schema id
+        channel_ids = {}  # (topic, message_encoding, schema id) -> 新しい channel id
+        for src in sorted(sources, key=lambda s: s.name):
+            print(f"[info] mcap 読み込み中: {src.name}")
+            try:
+                with src.open() as f:
+                    reader = make_reader(f)
+                    for schema, channel, message in reader.iter_messages(
+                            topics=topics, start_time=start_ns, end_time=end_ns,
+                            log_time_order=True):
+                        if schema is not None:
+                            skey = (schema.name, schema.encoding, schema.data)
+                            if skey not in schema_ids:
+                                schema_ids[skey] = w.register_schema(
+                                    schema.name, schema.encoding, schema.data)
+                            sid = schema_ids[skey]
+                        else:
+                            sid = 0
+                        ckey = (channel.topic, channel.message_encoding, sid)
+                        if ckey not in channel_ids:
+                            channel_ids[ckey] = w.register_channel(
+                                channel.topic, channel.message_encoding, sid,
+                                dict(channel.metadata))
+                        w.add_message(channel_ids[ckey], message.log_time,
+                                      message.data, message.publish_time,
+                                      message.sequence)
+                        n_msgs += 1
+            except Exception as e:
+                print(f"[warn] 読み込み失敗 ({src.name}): {e}")
+        w.finish()
+    print(f"[ok] wrote {out_path}  ({n_msgs} messages, {size_str(os.path.getsize(out_path))})")
+    return out_path, n_msgs
+
+
+def download_raw_mcaps(sources, outdir, workers=4):
+    """対象の mcap を元ファイルのまま outdir に保存する (GCS は並列ダウンロード)。"""
+    os.makedirs(outdir, exist_ok=True)
+    written = []
+
+    def fetch(src):
+        dest = os.path.join(outdir, src.name.rsplit("/", 1)[-1])
+        if isinstance(src, GcsMcapSource):
+            src.blob.download_to_filename(dest)
+        else:
+            shutil.copyfile(src.path, dest)
+        return dest
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {pool.submit(fetch, src): src for src in sources}
+        for fut in as_completed(futures):
+            try:
+                dest = fut.result()
+                print(f"[ok] saved {dest}  ({size_str(os.path.getsize(dest))})")
+                written.append(dest)
+            except Exception as e:
+                print(f"[warn] 保存失敗 ({futures[fut].name}): {e}")
+    return sorted(written)
+
+
+# ------------------------------------------------------------------
 # トピック一覧 (--list-topics)
 # ------------------------------------------------------------------
+def collect_topics(sources, workers=8):
+    """対象ソースのサマリからトピック情報を集める。
+
+    戻り値: {topic: {"schema": 名前, "encoding": エンコーディング, "count": メッセージ数}}
+    """
+    def one(src):
+        info = {}
+        try:
+            with src.open(chunk_size=256 * 1024) as f:
+                summary = make_reader(f).get_summary()
+            if summary is None:
+                return info
+            stats = summary.statistics
+            counts = stats.channel_message_counts if stats else {}
+            for ch in summary.channels.values():
+                sc = summary.schemas.get(ch.schema_id)
+                info[ch.topic] = {
+                    "schema": sc.name if sc else "?",
+                    "encoding": sc.encoding if sc else "?",
+                    "count": counts.get(ch.id, 0),
+                }
+        except Exception as e:
+            print(f"[warn] トピック取得失敗 ({src.name}): {e}")
+        return info
+
+    merged = {}
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        for info in pool.map(one, sources):
+            for topic, meta in info.items():
+                if topic in merged:
+                    merged[topic]["count"] += meta["count"]
+                else:
+                    merged[topic] = dict(meta)
+    return dict(sorted(merged.items()))
 def print_topics(sources):
     for src in sources:
         print(f"\n=== {src.name} ===")
@@ -935,27 +1075,14 @@ def main():
         base = f"{vehicle}_{start_dt:%Y%m%d_%H%M%S}-{end_dt:%H%M%S}"
 
         client = gcs_client()
-        print(f"[info] バケット {args.bucket} から {vehicle} / "
-              f"{start_dt:%Y-%m-%d %H:%M:%S} - {end_dt:%Y-%m-%d %H:%M:%S} (JST) を探索")
-        top_dirs = list_top_dirs(client, args.bucket, vehicle, start_dt, end_dt)
-        if not top_dirs:
-            raise SystemExit(f"[error] 該当ディレクトリがありません "
-                             f"(パターン: YYYYMMDD_{vehicle}__*)。日付と vehicle ID を確認してください。")
-        for d in top_dirs:
-            print(f"[info] 候補ディレクトリ: {d}")
-        blobs = list_candidate_blobs(client, args.bucket, top_dirs, args.subdir,
-                                     start_dt, end_dt, args.session_lookback)
-        if not blobs:
-            raise SystemExit("[error] mcap ファイルが見つかりません "
-                             f"(サブディレクトリ: {args.subdir})。--subdir \"*\" や"
-                             " --session-lookback の拡大も試してください。")
-        print(f"[info] mcap 候補 {len(blobs)} 件。時刻メタデータで絞り込み中"
-              f" (並列 {args.workers}, セッション単位の二分探索)...")
-        sources = filter_sources_by_time([GcsMcapSource(b) for b in blobs],
-                                         start_ns, end_ns, workers=args.workers)
-        if args.include_sensor and sources:
-            sources += find_sensor_siblings(client, args.bucket, sources,
-                                            args.sensor_subdir)
+        try:
+            sources = find_gcs_sources(
+                client, args.bucket, vehicle, start_dt, end_dt,
+                subdir=args.subdir, lookback_hours=args.session_lookback,
+                workers=args.workers, include_sensor=args.include_sensor,
+                sensor_subdir=args.sensor_subdir)
+        except LookupError as e:
+            raise SystemExit(f"[error] {e}")
 
     if not sources:
         raise SystemExit("[error] 指定時間帯に重なる mcap がありません。")

@@ -1,0 +1,40 @@
+{
+  "_comment": "UI のトピックプリセット。キーがプリセット名、値がトピック名のリスト (ワイルドカード可)。『切り出し君互換』は社内ツール切り出し君の対象トピックに合わせて更新すること。",
+
+  "切り出し君互換 (要リスト更新)": [
+    "/t2/control/debug",
+    "/t2/localization_compositor/pose",
+    "/t2/odometry/ego",
+    "/t2/planning/planned_trajectory",
+    "/t2/system_state_manager/state"
+  ],
+
+  "走行解析 (制御・自己位置・計画)": [
+    "/t2/control/*",
+    "/t2/localization_compositor/pose",
+    "/t2/odometry/*",
+    "/t2/planning/*",
+    "/t2/system_state_manager/*",
+    "/t2/main_mabx/*",
+    "/t2/ready_judge/*",
+    "/t2/error_monitor/*"
+  ],
+
+  "知覚系": [
+    "/t2/bev_detection/*",
+    "/t2/camera_lane_detection/*",
+    "/t2/object_tracker/*",
+    "/t2/object_augmentor/*",
+    "/t2/scene_understanding/*",
+    "/t2/tracker_pre_filter/*",
+    "/t2/local_map/*",
+    "/t2/lane_augmentor/*"
+  ],
+
+  "acc (apollo旧世代の切り出しツール互換)": [
+    "/apollo/canbus/chassis",
+    "/apollo/control",
+    "/apollo/perception/detections/fusion",
+    "/apollo/planning"
+  ]
+}

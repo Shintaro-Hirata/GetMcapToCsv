@@ -4,6 +4,8 @@ mcap>=1.3.0
 mcap-protobuf-support>=0.5.3
 # GCS バケットへのアクセス
 google-cloud-storage>=2.14.0
+# ブラウザ UI (app.py / start_ui.bat)
+streamlit>=1.30
 
 # /t2/* トピック (ros2idl) のデコード用 社内パッケージ (zero-plotter リポジトリ内)。
 # private リポジトリのため git の GitHub 認証が必要。うまく入らない場合は README.md の
