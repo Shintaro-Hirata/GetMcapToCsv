@@ -64,6 +64,27 @@ def load_presets():
         return {}
 
 
+def parse_time_text(text):
+    """キーボード入力の時刻文字列を datetime.time にする (秒まで対応)。
+
+    受け付ける形式: "20:40" / "20:40:15" / "2040" / "204015" (全角コロンも可)
+    解釈できなければ None。
+    """
+    s = text.strip().replace("：", ":").replace(" ", "")
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.datetime.strptime(s, fmt).time()
+        except ValueError:
+            pass
+    if s.isdigit() and len(s) in (4, 6):
+        try:
+            fmt = "%H%M" if len(s) == 4 else "%H%M%S"
+            return datetime.datetime.strptime(s, fmt).time()
+        except ValueError:
+            pass
+    return None
+
+
 def source_kind(name):
     """パスから develop / image / sensor などの種類ラベルを取り出す。"""
     parent = name.rsplit("/", 2)
@@ -91,13 +112,26 @@ with col1:
 with col2:
     date = st.date_input("日付 (JST)", value=datetime.date.today() - datetime.timedelta(days=1))
 with col3:
-    t_start = st.time_input("開始時刻", value=datetime.time(12, 0), step=60)
+    t_start_text = st.text_input("開始時刻 (HH:MM:SS)", value="12:00:00",
+                                 help="秒まで指定可。例: 20:40 / 20:40:15 / 204015")
 with col4:
-    t_end = st.time_input("終了時刻", value=datetime.time(12, 5), step=60)
+    t_end_text = st.text_input("終了時刻 (HH:MM:SS)", value="12:05:00",
+                               help="秒まで指定可。例: 20:45 / 20:45:30 / 204530")
+
+t_start = parse_time_text(t_start_text)
+t_end = parse_time_text(t_end_text)
+time_ok = t_start is not None and t_end is not None
+if t_start is None:
+    st.error(f"開始時刻を解釈できません: 「{t_start_text}」 (例: 20:40:15)")
+if t_end is None:
+    st.error(f"終了時刻を解釈できません: 「{t_end_text}」 (例: 20:45:30)")
+if not time_ok:
+    t_start = t_start or datetime.time(0, 0)
+    t_end = t_end or datetime.time(0, 0)
 
 icol1, icol2, _ = st.columns([1, 1, 2])
 with icol1:
-    include_image = st.checkbox("record_image も含める", value=True,
+    include_image = st.checkbox("record_debug_image も含める", value=True,
                                 help="develop と同じ連番の image ファイルも対象に加える (ほぼ毎回使うため既定でオン)")
 with icol2:
     include_sensor = st.checkbox("record_sensor も含める", value=False,
@@ -109,7 +143,7 @@ with st.expander("詳細オプション"):
         bucket = st.text_input("GCS バケット", value=core.DEFAULT_BUCKET)
         subdir = st.text_input("基準サブディレクトリ", value=core.DEFAULT_SUBDIR)
     with oc2:
-        image_subdir = st.text_input("image サブディレクトリ名", value="record_image")
+        image_subdir = st.text_input("image サブディレクトリ名", value="record_debug_image")
         sensor_subdir = st.text_input("sensor サブディレクトリ名", value="record_sensor")
     with oc3:
         lookback = st.number_input("セッション遡り時間 (h)", value=24, min_value=1, max_value=96)
@@ -120,9 +154,12 @@ start_dt = datetime.datetime.combine(date, t_start, tzinfo=core.JST)
 end_dt = datetime.datetime.combine(date, t_end, tzinfo=core.JST)
 if end_dt <= start_dt:
     end_dt += datetime.timedelta(days=1)  # 終了が開始より前なら深夜跨ぎとみなす
-    st.info(f"終了時刻が開始時刻以前のため翌日扱いにします: 終了 = {end_dt:%m/%d %H:%M}")
+    if time_ok:
+        st.info(f"終了時刻が開始時刻以前のため翌日扱いにします: 終了 = {end_dt:%m/%d %H:%M:%S}")
+if time_ok:
+    st.caption(f"🕐 抽出時間帯: {start_dt:%Y-%m-%d %H:%M:%S} 〜 {end_dt:%Y-%m-%d %H:%M:%S} (JST)")
 
-if st.button("🔍 ① 候補ファイルを検索", type="primary"):
+if st.button("🔍 ① 候補ファイルを検索", type="primary", disabled=not time_ok):
     ss.sources = None
     ss.topics_info = None
     ss.result_files = None
@@ -289,35 +326,65 @@ if ss.sources:
     if st.button("🚀 ④ 抽出実行", type="primary", disabled=not can_run):
         params = ss.search_params
         os.makedirs(outdir, exist_ok=True)
+        prog = st.progress(0.0, text="準備中...")
         try:
             if out_format.startswith("CSV"):
                 topic_config = {t: {"suffix": t.strip("/").replace("/", "_"), "fields": []}
                                 for t in selected_topics}
-                with st.spinner("CSV 抽出中... (ダウンロード + デコード)"):
-                    def run():
-                        per_topic = core.extract_rows(
-                            selected_sources, topic_config,
-                            params["start_ns"], params["end_ns"],
-                            workers=params["extract_workers"])
-                        return core.write_csvs(per_topic, topic_config, outdir,
-                                               params["base"], merged=merged_csv)
-                    files, log = run_captured(run)
+
+                def on_file_done(done, total, name):
+                    prog.progress(done / total,
+                                  text=f"CSV 抽出中... {done}/{total} ファイル完了 "
+                                       f"(直近: {name.rsplit('/', 1)[-1]})")
+
+                prog.progress(0.0, text=f"CSV 抽出中... 0/{len(selected_sources)} ファイル完了 "
+                                        "(ダウンロード + デコードには数分かかることがあります)")
+
+                def run():
+                    per_topic = core.extract_rows(
+                        selected_sources, topic_config,
+                        params["start_ns"], params["end_ns"],
+                        workers=params["extract_workers"],
+                        progress=on_file_done)
+                    return core.write_csvs(per_topic, topic_config, outdir,
+                                           params["base"], merged=merged_csv)
+                files, log = run_captured(run)
             elif out_format.startswith("mcap (時間帯"):
                 out_path = os.path.join(outdir, f"{params['base']}_cropped.mcap")
-                with st.spinner("mcap 切り出し中... (生データコピー)"):
-                    (out_path, n), log = run_captured(
-                        core.save_mcap_slice, selected_sources, selected_topics,
-                        params["start_ns"], params["end_ns"], out_path)
+
+                def on_slice(done, total, name):
+                    prog.progress(done / total,
+                                  text=f"mcap 切り出し中... {done}/{total} ファイル処理済み "
+                                       f"(直近: {name.rsplit('/', 1)[-1]})")
+
+                (out_path, n), log = run_captured(
+                    core.save_mcap_slice, selected_sources, selected_topics,
+                    params["start_ns"], params["end_ns"], out_path,
+                    progress=on_slice)
                 files = [out_path] if n else []
                 if n == 0:
                     st.warning("該当メッセージが 0 件でした。トピック選択を確認してください。")
             else:
-                with st.spinner("mcap ダウンロード中..."):
-                    files, log = run_captured(
-                        core.download_raw_mcaps, selected_sources, outdir)
+                total_size = sum(s.size or 0 for s in selected_sources)
+
+                def on_dl(done_b, total_b, done_f, total_f):
+                    frac = (done_b / total_b) if total_b else (done_f / max(total_f, 1))
+                    prog.progress(min(1.0, frac),
+                                  text=f"ダウンロード中... {core.size_str(done_b)} / "
+                                       f"{core.size_str(total_b)} "
+                                       f"({done_f}/{total_f} ファイル完了)")
+
+                prog.progress(0.0, text=f"ダウンロード開始... 合計 {core.size_str(total_size)}")
+                files, log = run_captured(
+                    core.download_raw_mcaps, selected_sources, outdir,
+                    4, on_dl)
+            prog.progress(1.0, text="✅ 完了")
             ss.result_files = files
             ss.result_log = log
+            if files:
+                st.balloons()
         except Exception as e:
+            prog.progress(0.0, text="❌ 失敗")
             st.error(f"抽出に失敗しました: {e}")
 
     if ss.result_files is not None:

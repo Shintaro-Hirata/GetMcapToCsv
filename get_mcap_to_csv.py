@@ -46,8 +46,10 @@ import shutil
 import sys
 import tempfile
 import time
+import threading
 from collections import OrderedDict, defaultdict
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import (ProcessPoolExecutor, ThreadPoolExecutor,
+                                as_completed, wait)
 from fnmatch import fnmatch
 
 from mcap.reader import make_reader  # make_reader
@@ -688,10 +690,11 @@ def build_extract_jobs(sources, topic_config, exclude_pats, start_ns, end_ns,
 
 
 def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
-                 workers=None, no_download=False):
+                 workers=None, no_download=False, progress=None):
     """全ソースから対象トピックの行データを収集する (ファイル単位で並列)。
 
     topic_config が None のときは mcap に含まれる全トピックを対象にする。
+    progress: callable(完了ファイル数, 総ファイル数, 直近完了ファイル名)。
     """
     jobs = build_extract_jobs(sources, topic_config, exclude_pats,
                               start_ns, end_ns, no_download)
@@ -707,6 +710,8 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
     per_topic = {} if all_topics else {t: [] for t in topic_config}
     decode_errors = defaultdict(int)
 
+    n_done = [0]
+
     def merge(result):
         name, part, errors, count, sec = result
         for topic, rows in part.items():
@@ -714,6 +719,9 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
         for err, n in errors.items():
             decode_errors[err] += n
         print(f"[info]   {name.rsplit('/', 1)[-1]}: {count} 行 ({sec:.1f} 秒)")
+        n_done[0] += 1
+        if progress:
+            progress(n_done[0], len(jobs), name)
 
     if workers == 1 or len(jobs) == 1:
         for job in jobs:
@@ -838,7 +846,7 @@ def write_csvs(per_topic, topic_config, outdir, base, merged=True):
 def find_gcs_sources(client, bucket, vehicle, start_dt, end_dt, subdir=DEFAULT_SUBDIR,
                      lookback_hours=24, workers=16, include_sensor=False,
                      sensor_subdir="record_sensor", include_image=False,
-                     image_subdir="record_image"):
+                     image_subdir="record_debug_image"):
     """条件に合う mcap ソースを GCS から探して返す。見つからなければ LookupError。"""
     vehicle = vehicle.strip().upper()
     start_ns, end_ns = to_ns(start_dt), to_ns(end_dt)
@@ -870,21 +878,23 @@ def find_gcs_sources(client, bucket, vehicle, start_dt, end_dt, subdir=DEFAULT_S
 # ------------------------------------------------------------------
 # mcap 出力 (時間帯クロップ / トピック絞り込み / 元ファイル保存)
 # ------------------------------------------------------------------
-def save_mcap_slice(sources, topics, start_ns, end_ns, out_path):
+def save_mcap_slice(sources, topics, start_ns, end_ns, out_path, progress=None):
     """複数ソースから指定時間帯・指定トピックのメッセージを 1 本の mcap に書き出す。
 
     メッセージはデコードせず生データのままコピーする (スキーマ・チャンネルも引き継ぐ)。
     topics が None のときは全トピック。
+    progress: callable(完了ファイル数, 総ファイル数, 直近ファイル名)。
     """
     from mcap.writer import Writer  # Writer
 
     n_msgs = 0
+    ordered = sorted(sources, key=lambda s: s.name)
     with open(out_path, "wb") as fo:
         w = Writer(fo)
         w.start()
         schema_ids = {}   # (name, encoding, data) -> 新しい schema id
         channel_ids = {}  # (topic, message_encoding, schema id) -> 新しい channel id
-        for src in sorted(sources, key=lambda s: s.name):
+        for i, src in enumerate(ordered):
             print(f"[info] mcap 読み込み中: {src.name}")
             try:
                 with src.open() as f:
@@ -911,33 +921,63 @@ def save_mcap_slice(sources, topics, start_ns, end_ns, out_path):
                         n_msgs += 1
             except Exception as e:
                 print(f"[warn] 読み込み失敗 ({src.name}): {e}")
+            if progress:
+                progress(i + 1, len(ordered), src.name)
         w.finish()
     print(f"[ok] wrote {out_path}  ({n_msgs} messages, {size_str(os.path.getsize(out_path))})")
     return out_path, n_msgs
 
 
-def download_raw_mcaps(sources, outdir, workers=4):
-    """対象の mcap を元ファイルのまま outdir に保存する (GCS は並列ダウンロード)。"""
+def download_raw_mcaps(sources, outdir, workers=4, progress=None):
+    """対象の mcap を元ファイルのまま outdir に保存する (GCS は並列ダウンロード)。
+
+    progress: callable(done_bytes, total_bytes, done_files, total_files)。
+    ダウンロード中 0.5 秒おきに呼ばれる (UI の進捗バー更新用)。
+    """
     os.makedirs(outdir, exist_ok=True)
     written = []
+    total_bytes = sum(s.size or 0 for s in sources)
+    state = {"bytes": 0, "files": 0}
+    lock = threading.Lock()
 
     def fetch(src):
         dest = os.path.join(outdir, src.name.rsplit("/", 1)[-1])
         if isinstance(src, GcsMcapSource):
-            src.blob.download_to_filename(dest)
+            # 進捗を数えるためチャンク単位で読みながら書く
+            with src.open(chunk_size=32 * 1024 * 1024) as fin, open(dest, "wb") as fout:
+                while True:
+                    chunk = fin.read(8 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    fout.write(chunk)
+                    with lock:
+                        state["bytes"] += len(chunk)
         else:
             shutil.copyfile(src.path, dest)
+            with lock:
+                state["bytes"] += src.size or 0
+        with lock:
+            state["files"] += 1
         return dest
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         futures = {pool.submit(fetch, src): src for src in sources}
-        for fut in as_completed(futures):
-            try:
-                dest = fut.result()
-                print(f"[ok] saved {dest}  ({size_str(os.path.getsize(dest))})")
-                written.append(dest)
-            except Exception as e:
-                print(f"[warn] 保存失敗 ({futures[fut].name}): {e}")
+        pending = set(futures)
+        while pending:
+            done_now, pending = wait(pending, timeout=0.5)
+            for fut in done_now:
+                try:
+                    dest = fut.result()
+                    print(f"[ok] saved {dest}  ({size_str(os.path.getsize(dest))})")
+                    written.append(dest)
+                except Exception as e:
+                    print(f"[warn] 保存失敗 ({futures[fut].name}): {e}")
+            if progress:
+                with lock:
+                    b, fdone = state["bytes"], state["files"]
+                progress(b, total_bytes, fdone, len(sources))
+    if progress:
+        progress(total_bytes, total_bytes, len(sources), len(sources))
     return sorted(written)
 
 
@@ -1045,11 +1085,11 @@ def main():
                         help="--include-sensor で追加するサブディレクトリ名"
                              " (default: record_sensor)")
     parser.add_argument("--include-image", action="store_true",
-                        help="record_develop で確定した連番と同じ record_image の mcap も"
+                        help="record_develop で確定した連番と同じ record_debug_image の mcap も"
                              "抽出対象に加える (時刻の再確認はしない)")
-    parser.add_argument("--image-subdir", default="record_image", metavar="DIR",
+    parser.add_argument("--image-subdir", default="record_debug_image", metavar="DIR",
                         help="--include-image で追加するサブディレクトリ名"
-                             " (default: record_image)")
+                             " (default: record_debug_image)")
     parser.add_argument("--session-lookback", type=int, default=24, metavar="HOURS",
                         help="抽出開始時刻の何時間前までに始まったセッションを対象にするか"
                              " (default: 24)")
