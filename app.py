@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 import pandas as pd
 import streamlit as st
@@ -163,6 +164,7 @@ if st.button("🔍 ① 候補ファイルを検索", type="primary", disabled=no
     ss.sources = None
     ss.topics_info = None
     ss.result_files = None
+    ss.file_defaults = None  # 新しい検索結果ではチェック状態を全選択に戻す
     try:
         with st.spinner("GCS を検索中... (セッション特定 → 時刻メタデータで絞り込み)"):
             sources, log = run_captured(
@@ -198,11 +200,20 @@ if ss.sources:
     st.header("② 対象ファイル")
 
     src_by_name = {s.name: s for s in ss.sources}
+    names = [s.name for s in ss.sources]
+
+    # チェック状態の初期値 (一括操作ボタンで書き換え、表を作り直して反映する)
+    ss.setdefault("file_ver", 0)
+    if ss.get("file_defaults") is None or set(ss.file_defaults) != set(names):
+        ss.file_defaults = {n: True for n in names}
+        ss.file_ver += 1
+
     file_rows = []
-    for s in ss.sources:
+    for i, s in enumerate(ss.sources):
         rng = getattr(s, "time_range", None)
         file_rows.append({
-            "選択": True,
+            "No.": i + 1,
+            "選択": ss.file_defaults.get(s.name, True),
             "種類": source_kind(s.name),
             "ファイル名": s.name.rsplit("/", 1)[-1],
             "時間帯 (JST)": (f"{core.fmt_jst(rng[0])} - {core.fmt_jst(rng[1])}"
@@ -215,16 +226,65 @@ if ss.sources:
     edited_files = st.data_editor(
         pd.DataFrame(file_rows),
         column_config={
+            "No.": st.column_config.NumberColumn("No.", width="small"),
             "選択": st.column_config.CheckboxColumn("選択", width="small"),
             "パス": None,  # フルパスは非表示 (選択サマリで確認可能)
         },
-        disabled=["種類", "ファイル名", "時間帯 (JST)", "サイズ", "セッション"],
+        disabled=["No.", "種類", "ファイル名", "時間帯 (JST)", "サイズ", "セッション"],
         hide_index=True,
         use_container_width=True,
-        key=f"file_editor_{ss.search_id}",
+        key=f"file_editor_{ss.search_id}_{ss.file_ver}",
     )
-    picked = edited_files[edited_files["選択"]]
-    selected_sources = [src_by_name[p] for p in picked["パス"] if p in src_by_name]
+    current = dict(zip(edited_files["パス"], edited_files["選択"]))
+
+    def apply_file_selection(new_map):
+        ss.file_defaults = new_map
+        ss.file_ver += 1
+        st.rerun()
+
+    # --- 一括操作 ---
+    bc1, bc2, bc3, bc4 = st.columns([1, 1, 1, 3])
+    with bc1:
+        if st.button("☑ 全選択"):
+            apply_file_selection({n: True for n in names})
+    with bc2:
+        if st.button("☐ 全解除"):
+            apply_file_selection({n: False for n in names})
+    with bc3:
+        if st.button("🔁 選択を反転"):
+            apply_file_selection({n: not current.get(n, True) for n in names})
+    with bc4:
+        kinds = sorted({source_kind(n) for n in names})
+        kcols = st.columns(max(len(kinds), 1))
+        for kc, kind in zip(kcols, kinds):
+            with kc:
+                if st.button(f"{kind} のみ"):
+                    apply_file_selection({n: source_kind(n) == kind for n in names})
+
+    rc1, rc2, rc3, rc4 = st.columns([1, 1, 1, 3])
+    with rc1:
+        no_from = st.number_input("No. から", min_value=1, max_value=len(names),
+                                  value=1, step=1)
+    with rc2:
+        no_to = st.number_input("No. まで", min_value=1, max_value=len(names),
+                                value=len(names), step=1)
+    lo, hi = int(min(no_from, no_to)) - 1, int(max(no_from, no_to)) - 1
+    with rc3:
+        st.write("")
+        if st.button("範囲を選択"):
+            m = dict(current)
+            for n in names[lo:hi + 1]:
+                m[n] = True
+            apply_file_selection(m)
+    with rc4:
+        st.write("")
+        if st.button("範囲を解除"):
+            m = dict(current)
+            for n in names[lo:hi + 1]:
+                m[n] = False
+            apply_file_selection(m)
+
+    selected_sources = [src_by_name[n] for n in names if current.get(n)]
     sel_size = sum(s.size or 0 for s in selected_sources)
     st.caption(f"✅ 選択中: {len(selected_sources)} / {len(ss.sources)} ファイル "
                f"(合計 {core.size_str(sel_size)})")
@@ -366,13 +426,22 @@ if ss.sources:
                     st.warning("該当メッセージが 0 件でした。トピック選択を確認してください。")
             else:
                 total_size = sum(s.size or 0 for s in selected_sources)
+                t0 = time.monotonic()
 
                 def on_dl(done_b, total_b, done_f, total_f):
                     frac = (done_b / total_b) if total_b else (done_f / max(total_f, 1))
+                    elapsed = time.monotonic() - t0
+                    extra = ""
+                    if done_b > 0 and elapsed > 1.0:
+                        speed = done_b / elapsed
+                        remain = (total_b - done_b) / speed if speed > 0 else 0
+                        m, s_ = divmod(int(remain), 60)
+                        extra = (f" — {core.size_str(speed)}/s, 残り約 "
+                                 + (f"{m}分{s_:02d}秒" if m else f"{s_}秒"))
                     prog.progress(min(1.0, frac),
                                   text=f"ダウンロード中... {core.size_str(done_b)} / "
-                                       f"{core.size_str(total_b)} "
-                                       f"({done_f}/{total_f} ファイル完了)")
+                                       f"{core.size_str(total_b)} ({frac * 100:.1f}%) "
+                                       f"[{done_f}/{total_f} ファイル完了]{extra}")
 
                 prog.progress(0.0, text=f"ダウンロード開始... 合計 {core.size_str(total_size)}")
                 files, log = run_captured(

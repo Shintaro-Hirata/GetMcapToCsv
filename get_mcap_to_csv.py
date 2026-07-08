@@ -470,12 +470,15 @@ def find_sibling_files(client, bucket_name, selected_sources, subdir):
 
 
 def size_str(n):
+    """サイズの表示用文字列。KB 以上は小数 1 桁 (進捗が分かるように)。"""
     if n is None:
         return "?"
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024:
-            return f"{n:.0f}{unit}"
+    if n < 1024:
+        return f"{n:.0f}B"
+    for unit in ("KB", "MB", "GB", "TB"):
         n /= 1024.0
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f}{unit}"
     return f"{n:.1f}TB"
 
 
