@@ -409,16 +409,27 @@ def filter_sources_by_time(sources, start_ns, end_ns, workers=16):
             total_reads += reads
             for src, rng in picked:
                 src.time_range = rng  # 抽出フェーズでダウンロード方式の判断に使う
-                if rng is not None:
-                    print(f"[info] 対象: {src.name}  "
-                          f"({fmt_jst(rng[0])} - {fmt_jst(rng[1])}, {size_str(src.size)})")
-                else:
-                    print(f"[info] 対象: {src.name}  ({size_str(src.size)})")
-            selected.extend(src for src, _ in picked)
+                selected.append(src)
 
+    # 二分探索の内側で時刻を読まずに確定したファイルは、表示用に実時刻を追加取得する
+    # (選定後の少数ファイルだけなので軽い)
+    missing = [s for s in selected if s.time_range is None]
+    if missing:
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(missing)))) as pool:
+            for src, rng in zip(missing, pool.map(read_time_range, missing)):
+                src.time_range = rng
+                total_reads += 1
+
+    selected.sort(key=lambda s: s.name)
+    for src in selected:
+        rng = src.time_range
+        if rng is not None:
+            print(f"[info] 対象: {src.name}  "
+                  f"({fmt_jst(rng[0])} - {fmt_jst(rng[1])}, {size_str(src.size)})")
+        else:
+            print(f"[info] 対象: {src.name}  ({size_str(src.size)})")
     print(f"[info] 絞り込み完了: {len(sources)} 件中 {len(selected)} 件が対象 "
           f"(メタデータ読み込み {total_reads} 回)")
-    selected.sort(key=lambda s: s.name)
     return selected
 
 

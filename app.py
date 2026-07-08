@@ -208,52 +208,77 @@ if ss.sources:
         ss.file_defaults = {n: True for n in names}
         ss.file_ver += 1
 
+    current = dict(ss.file_defaults)  # {パス: 抽出対象か}
+
     file_rows = []
     for i, s in enumerate(ss.sources):
         rng = getattr(s, "time_range", None)
         file_rows.append({
             "No.": i + 1,
-            "選択": ss.file_defaults.get(s.name, True),
+            "抽出": "✅" if current.get(s.name, True) else "－",
             "種類": source_kind(s.name),
             "ファイル名": s.name.rsplit("/", 1)[-1],
             "時間帯 (JST)": (f"{core.fmt_jst(rng[0])} - {core.fmt_jst(rng[1])}"
-                          if rng else "(指定時間帯内)"),
+                          if rng else "(時刻不明)"),
             "サイズ": core.size_str(s.size),
             "セッション": s.name.split("/recording/")[-1].split("/")[0]
                         if "/recording/" in s.name else "",
             "パス": s.name,
         })
-    edited_files = st.data_editor(
+    st.caption("行をクリックで選択 (Shift+クリックで範囲選択、左端のチェックで複数選択)。"
+               "選んだ行に対して下のボタンで「抽出」列を切り替えます。")
+    event = st.dataframe(
         pd.DataFrame(file_rows),
         column_config={
             "No.": st.column_config.NumberColumn("No.", width="small"),
-            "選択": st.column_config.CheckboxColumn("選択", width="small"),
+            "抽出": st.column_config.TextColumn("抽出", width="small"),
             "パス": None,  # フルパスは非表示 (選択サマリで確認可能)
         },
-        disabled=["No.", "種類", "ファイル名", "時間帯 (JST)", "サイズ", "セッション"],
         hide_index=True,
         use_container_width=True,
-        key=f"file_editor_{ss.search_id}_{ss.file_ver}",
+        on_select="rerun",
+        selection_mode="multi-row",
+        key=f"file_table_{ss.search_id}_{ss.file_ver}",
     )
-    current = dict(zip(edited_files["パス"], edited_files["選択"]))
+    picked_rows = list(event.selection.rows) if event and event.selection else []
+    picked_names = [names[i] for i in picked_rows if 0 <= i < len(names)]
 
     def apply_file_selection(new_map):
         ss.file_defaults = new_map
-        ss.file_ver += 1
+        ss.file_ver += 1  # 表を作り直して「抽出」列と行選択をリセット
         st.rerun()
 
-    # --- 一括操作 ---
+    # --- 選択行への操作 ---
+    has_pick = bool(picked_names)
     bc1, bc2, bc3, bc4 = st.columns([1, 1, 1, 3])
     with bc1:
-        if st.button("☑ 全選択"):
-            apply_file_selection({n: True for n in names})
+        if st.button(f"✅ 選択行を含める ({len(picked_names)})", disabled=not has_pick):
+            m = dict(current)
+            for n in picked_names:
+                m[n] = True
+            apply_file_selection(m)
     with bc2:
-        if st.button("☐ 全解除"):
-            apply_file_selection({n: False for n in names})
+        if st.button(f"🚫 選択行を外す ({len(picked_names)})", disabled=not has_pick):
+            m = dict(current)
+            for n in picked_names:
+                m[n] = False
+            apply_file_selection(m)
     with bc3:
-        if st.button("🔁 選択を反転"):
-            apply_file_selection({n: not current.get(n, True) for n in names})
-    with bc4:
+        if st.button(f"🔁 選択行を入替 ({len(picked_names)})", disabled=not has_pick):
+            m = dict(current)
+            for n in picked_names:
+                m[n] = not m.get(n, True)
+            apply_file_selection(m)
+
+    # --- 全体への操作 ---
+    gc1, gc2, gc3 = st.columns([1, 1, 4])
+    with gc1:
+        if st.button("☑ 全て含める"):
+            apply_file_selection({n: True for n in names})
+    with gc2:
+        if st.button("☐ 全て外す"):
+            apply_file_selection({n: False for n in names})
+    with gc3:
         kinds = sorted({source_kind(n) for n in names})
         kcols = st.columns(max(len(kinds), 1))
         for kc, kind in zip(kcols, kinds):
@@ -261,30 +286,7 @@ if ss.sources:
                 if st.button(f"{kind} のみ"):
                     apply_file_selection({n: source_kind(n) == kind for n in names})
 
-    rc1, rc2, rc3, rc4 = st.columns([1, 1, 1, 3])
-    with rc1:
-        no_from = st.number_input("No. から", min_value=1, max_value=len(names),
-                                  value=1, step=1)
-    with rc2:
-        no_to = st.number_input("No. まで", min_value=1, max_value=len(names),
-                                value=len(names), step=1)
-    lo, hi = int(min(no_from, no_to)) - 1, int(max(no_from, no_to)) - 1
-    with rc3:
-        st.write("")
-        if st.button("範囲を選択"):
-            m = dict(current)
-            for n in names[lo:hi + 1]:
-                m[n] = True
-            apply_file_selection(m)
-    with rc4:
-        st.write("")
-        if st.button("範囲を解除"):
-            m = dict(current)
-            for n in names[lo:hi + 1]:
-                m[n] = False
-            apply_file_selection(m)
-
-    selected_sources = [src_by_name[n] for n in names if current.get(n)]
+    selected_sources = [src_by_name[n] for n in names if current.get(n, True)]
     sel_size = sum(s.size or 0 for s in selected_sources)
     st.caption(f"✅ 選択中: {len(selected_sources)} / {len(ss.sources)} ファイル "
                f"(合計 {core.size_str(sel_size)})")
