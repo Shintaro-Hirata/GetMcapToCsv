@@ -3,5 +3,6 @@ __pycache__/
 venv/
 .venv/
 out/
+mcap_cache/
 *.mcap
 *.csv

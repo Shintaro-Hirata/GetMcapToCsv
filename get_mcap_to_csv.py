@@ -85,6 +85,149 @@ DEFAULT_TOPIC_CONFIG = {
 # フラット展開時にリストを何要素まで展開するか
 FLATTEN_MAX_LIST = 8
 
+# GCS egress (東京リージョン→インターネット) の概算単価。コスト表示にのみ使用
+EGRESS_USD_PER_GB = 0.12
+USD_JPY = 150.0
+
+DEFAULT_CACHE_DIR = "mcap_cache"
+DEFAULT_CACHE_MAX_GB = 20.0
+
+
+# ------------------------------------------------------------------
+# GCS 転送量の計測 (コスト見える化) とローカルキャッシュ
+# ------------------------------------------------------------------
+class TransferStats:
+    """GCS から実際に読んだバイト数と、キャッシュで節約したバイト数を数える。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.gcs_bytes = 0
+        self.cache_bytes = 0
+
+    def reset(self):
+        with self._lock:
+            self.gcs_bytes = 0
+            self.cache_bytes = 0
+
+    def add_gcs(self, n):
+        with self._lock:
+            self.gcs_bytes += int(n)
+
+    def add_cache(self, n):
+        with self._lock:
+            self.cache_bytes += int(n)
+
+    def snapshot(self):
+        with self._lock:
+            return self.gcs_bytes, self.cache_bytes
+
+
+STATS = TransferStats()  # プロセス内の合計 (ワーカープロセス分は戻り値経由で合算)
+
+
+def cost_str(n_bytes):
+    """バイト数から egress 費用の概算表示を作る。"""
+    gb = n_bytes / (1024 ** 3)
+    usd = gb * EGRESS_USD_PER_GB
+    return f"約 ¥{usd * USD_JPY:,.0f} (${usd:.2f})"
+
+
+class CountingFile:
+    """read したバイト数を TransferStats に加算するファイルラッパ。"""
+
+    def __init__(self, f, stats):
+        self._f = f
+        self._stats = stats
+
+    def read(self, n=-1):
+        data = self._f.read(n)
+        if data:
+            self._stats.add_gcs(len(data))
+        return data
+
+    def __getattr__(self, name):
+        return getattr(self._f, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._f.close()
+        return False
+
+
+def cache_file_path(cache_dir, bucket_name, blob_name):
+    """blob に対応するキャッシュファイルのパス。"""
+    safe = blob_name.replace("\\", "/").lstrip("/").replace("..", "__")
+    return os.path.join(cache_dir, bucket_name, *safe.split("/"))
+
+
+def cache_lookup(cache_dir, bucket_name, blob_name, expected_size):
+    """キャッシュにサイズ一致のファイルがあればそのパスを返す。"""
+    if not cache_dir:
+        return None
+    path = cache_file_path(cache_dir, bucket_name, blob_name)
+    try:
+        if os.path.getsize(path) == expected_size:
+            os.utime(path, None)  # プルーニング (古い順削除) 用に参照時刻を更新
+            return path
+    except OSError:
+        pass
+    return None
+
+
+def cache_store_download(blob, cache_dir, stats=None):
+    """blob をキャッシュへダウンロードし、キャッシュ内のパスを返す (temp→rename で原子的に)。"""
+    path = cache_file_path(cache_dir, blob.bucket.name, blob.name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".part"
+    blob.download_to_filename(tmp)
+    os.replace(tmp, path)
+    if stats is not None:
+        stats.add_gcs(os.path.getsize(path))
+    return path
+
+
+def prune_cache(cache_dir, max_gb):
+    """キャッシュ合計サイズが上限を超えていたら、参照が古いファイルから削除する。"""
+    if not cache_dir or not os.path.isdir(cache_dir):
+        return
+    entries = []
+    for root, _, names in os.walk(cache_dir):
+        for name in names:
+            p = os.path.join(root, name)
+            try:
+                st = os.stat(p)
+                entries.append((st.st_mtime, st.st_size, p))
+            except OSError:
+                continue
+    total = sum(sz for _, sz, _ in entries)
+    limit = max_gb * (1024 ** 3)
+    if total <= limit:
+        return
+    for _, sz, p in sorted(entries):
+        try:
+            os.remove(p)
+            total -= sz
+        except OSError:
+            continue
+        if total <= limit:
+            break
+    print(f"[info] キャッシュを {size_str(total)} まで削減しました (上限 {max_gb:.0f}GB)")
+
+
+def cache_total_size(cache_dir):
+    """キャッシュディレクトリの合計サイズ (バイト)。"""
+    total = 0
+    if cache_dir and os.path.isdir(cache_dir):
+        for root, _, names in os.walk(cache_dir):
+            for name in names:
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    continue
+    return total
+
 
 # ------------------------------------------------------------------
 # デコーダ (入っているものを全部使う)
@@ -273,7 +416,8 @@ class GcsMcapSource:
         self.time_range = None  # 絞り込み時に判明したメッセージ時刻範囲 (不明なら None)
 
     def open(self, chunk_size=16 * 1024 * 1024):
-        return self.blob.open("rb", chunk_size=chunk_size)
+        # 読んだバイト数を計測する (転送量とコストの見える化)
+        return CountingFile(self.blob.open("rb", chunk_size=chunk_size), STATS)
 
 
 class LocalMcapSource:
@@ -637,23 +781,35 @@ def _collect_rows(reader, topic_config, exclude_pats, start_ns, end_ns):
 def _extract_worker(job):
     """1 ファイル分のダウンロード + デコードを行うワーカー (別プロセスで実行可)。
 
-    戻り値: (表示名, per_topic, decode_errors, 行数, 秒数)
+    戻り値: (表示名, per_topic, decode_errors, 行数, 秒数, GCS読込バイト, キャッシュ利用バイト)
     """
     t0 = time.monotonic()
     factories = build_decoder_factories(quiet=True)
+    stats = TransferStats()  # ワーカープロセス内のローカル計測 (戻り値で親へ返す)
     tmpdir = None
+    cache_dir = job.get("cache_dir")
     try:
         if job["kind"] == "gcs":
-            from google.cloud import storage  # storage.Client
-            blob = storage.Client().bucket(job["bucket"]).blob(job["blob_name"])
-            if job["download"]:
-                # 時間帯がファイルの大半を占めるなら一括ダウンロードの方が速い
-                tmpdir = tempfile.mkdtemp(prefix="getmcap_")
-                local = os.path.join(tmpdir, "part.mcap")
-                blob.download_to_filename(local)
-                f = open(local, "rb")
+            cached = cache_lookup(cache_dir, job["bucket"], job["blob_name"], job.get("size"))
+            if cached:
+                # キャッシュヒット時は GCS に一切アクセスしない (認証も不要)
+                stats.add_cache(os.path.getsize(cached))
+                f = open(cached, "rb")
             else:
-                f = blob.open("rb", chunk_size=16 * 1024 * 1024)
+                from google.cloud import storage  # storage.Client
+                blob = storage.Client().bucket(job["bucket"]).blob(job["blob_name"])
+                if job["download"]:
+                    # 時間帯がファイルの大半を占めるなら一括ダウンロードの方が速い
+                    if cache_dir:
+                        local = cache_store_download(blob, cache_dir, stats)
+                    else:
+                        tmpdir = tempfile.mkdtemp(prefix="getmcap_")
+                        local = os.path.join(tmpdir, "part.mcap")
+                        blob.download_to_filename(local)
+                        stats.add_gcs(os.path.getsize(local))
+                    f = open(local, "rb")
+                else:
+                    f = CountingFile(blob.open("rb", chunk_size=16 * 1024 * 1024), stats)
         else:
             f = open(job["path"], "rb")
         with f:
@@ -661,7 +817,8 @@ def _extract_worker(job):
             per_topic, errors, count = _collect_rows(
                 reader, job["topic_config"], job["exclude"],
                 job["start_ns"], job["end_ns"])
-        return job["name"], per_topic, errors, count, time.monotonic() - t0
+        return (job["name"], per_topic, errors, count, time.monotonic() - t0,
+                stats.gcs_bytes, stats.cache_bytes)
     finally:
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -677,7 +834,7 @@ def _window_coverage(src, start_ns, end_ns):
 
 
 def build_extract_jobs(sources, topic_config, exclude_pats, start_ns, end_ns,
-                       no_download=False):
+                       no_download=False, cache_dir=None):
     jobs = []
     for src in sources:
         job = {
@@ -686,11 +843,13 @@ def build_extract_jobs(sources, topic_config, exclude_pats, start_ns, end_ns,
             "exclude": exclude_pats or [],
             "start_ns": start_ns,
             "end_ns": end_ns,
+            "cache_dir": cache_dir,
         }
         if isinstance(src, GcsMcapSource):
             job["kind"] = "gcs"
             job["bucket"] = src.blob.bucket.name
             job["blob_name"] = src.blob.name
+            job["size"] = src.size
             # 時間帯がファイルの半分以上を覆うなら一括ダウンロード、
             # 一部だけならチャンクインデックスによる部分読み込み
             job["download"] = (not no_download
@@ -704,14 +863,15 @@ def build_extract_jobs(sources, topic_config, exclude_pats, start_ns, end_ns,
 
 
 def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
-                 workers=None, no_download=False, progress=None):
+                 workers=None, no_download=False, progress=None, cache_dir=None):
     """全ソースから対象トピックの行データを収集する (ファイル単位で並列)。
 
     topic_config が None のときは mcap に含まれる全トピックを対象にする。
     progress: callable(完了ファイル数, 総ファイル数, 直近完了ファイル名)。
+    cache_dir を指定すると一括ダウンロードをキャッシュし、再実行時は GCS を読まない。
     """
     jobs = build_extract_jobs(sources, topic_config, exclude_pats,
-                              start_ns, end_ns, no_download)
+                              start_ns, end_ns, no_download, cache_dir)
     if workers is None:
         workers = min(len(jobs), max(1, (os.cpu_count() or 4) - 1), 8)
     workers = max(1, workers)
@@ -727,12 +887,15 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
     n_done = [0]
 
     def merge(result):
-        name, part, errors, count, sec = result
+        name, part, errors, count, sec, gcs_b, cache_b = result
+        STATS.add_gcs(gcs_b)
+        STATS.add_cache(cache_b)
         for topic, rows in part.items():
             per_topic.setdefault(topic, []).extend(rows)
         for err, n in errors.items():
             decode_errors[err] += n
-        print(f"[info]   {name.rsplit('/', 1)[-1]}: {count} 行 ({sec:.1f} 秒)")
+        src_note = " [キャッシュ]" if cache_b and not gcs_b else ""
+        print(f"[info]   {name.rsplit('/', 1)[-1]}: {count} 行 ({sec:.1f} 秒){src_note}")
         n_done[0] += 1
         if progress:
             progress(n_done[0], len(jobs), name)
@@ -942,11 +1105,13 @@ def save_mcap_slice(sources, topics, start_ns, end_ns, out_path, progress=None):
     return out_path, n_msgs
 
 
-def download_raw_mcaps(sources, outdir, workers=4, progress=None):
+def download_raw_mcaps(sources, outdir, workers=4, progress=None, cache_dir=None):
     """対象の mcap を元ファイルのまま outdir に保存する (GCS は並列ダウンロード)。
 
     progress: callable(done_bytes, total_bytes, done_files, total_files)。
     ダウンロード中 0.5 秒おきに呼ばれる (UI の進捗バー更新用)。
+    cache_dir を指定するとキャッシュ済みファイルは GCS を読まずにコピーし、
+    新規ダウンロードはキャッシュにも保存する。
     """
     os.makedirs(outdir, exist_ok=True)
     written = []
@@ -954,18 +1119,36 @@ def download_raw_mcaps(sources, outdir, workers=4, progress=None):
     state = {"bytes": 0, "files": 0}
     lock = threading.Lock()
 
+    def _download_counted(src, dest_path):
+        """チャンク単位で読みながら書く (進捗と GCS 転送量を数える)。"""
+        raw = src.blob.open("rb", chunk_size=32 * 1024 * 1024)
+        with raw as fin, open(dest_path, "wb") as fout:
+            while True:
+                chunk = fin.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                fout.write(chunk)
+                STATS.add_gcs(len(chunk))
+                with lock:
+                    state["bytes"] += len(chunk)
+
     def fetch(src):
         dest = os.path.join(outdir, src.name.rsplit("/", 1)[-1])
         if isinstance(src, GcsMcapSource):
-            # 進捗を数えるためチャンク単位で読みながら書く
-            with src.open(chunk_size=32 * 1024 * 1024) as fin, open(dest, "wb") as fout:
-                while True:
-                    chunk = fin.read(8 * 1024 * 1024)
-                    if not chunk:
-                        break
-                    fout.write(chunk)
-                    with lock:
-                        state["bytes"] += len(chunk)
+            cached = cache_lookup(cache_dir, src.blob.bucket.name, src.blob.name, src.size)
+            if cached:
+                shutil.copyfile(cached, dest)
+                STATS.add_cache(os.path.getsize(dest))
+                with lock:
+                    state["bytes"] += os.path.getsize(dest)
+            elif cache_dir:
+                cpath = cache_file_path(cache_dir, src.blob.bucket.name, src.blob.name)
+                os.makedirs(os.path.dirname(cpath), exist_ok=True)
+                _download_counted(src, cpath + ".part")
+                os.replace(cpath + ".part", cpath)
+                shutil.copyfile(cpath, dest)
+            else:
+                _download_counted(src, dest)
         else:
             shutil.copyfile(src.path, dest)
             with lock:
@@ -1060,6 +1243,17 @@ def print_topics(sources):
             print(f"  [warn] 読み込み失敗: {e}")
 
 
+def print_transfer_summary():
+    """今回の実行で GCS から読んだ量とキャッシュ節約分を表示する。"""
+    gcs_b, cache_b = STATS.snapshot()
+    if not gcs_b and not cache_b:
+        return
+    msg = f"[info] GCS 読み込み量: {size_str(gcs_b)} (egress {cost_str(gcs_b)})"
+    if cache_b:
+        msg += f" / キャッシュ利用: {size_str(cache_b)} (節約 {cost_str(cache_b)})"
+    print(msg)
+
+
 # ------------------------------------------------------------------
 # main
 # ------------------------------------------------------------------
@@ -1092,6 +1286,14 @@ def main():
                              "--exclude-topics \"/tf*\" \"/t2/positioning_driver/internal/*\"")
     parser.add_argument("--no-download", action="store_true",
                         help="一括ダウンロードせず常にチャンク単位の部分読み込みを使う")
+    parser.add_argument("--cache-dir", default=DEFAULT_CACHE_DIR, metavar="DIR",
+                        help="一括ダウンロードのローカルキャッシュ先。同じファイルの"
+                             f"再ダウンロード (= 再課金) を防ぐ (default: {DEFAULT_CACHE_DIR})")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="キャッシュを使わない (毎回 GCS から読む)")
+    parser.add_argument("--cache-max-gb", type=float, default=DEFAULT_CACHE_MAX_GB,
+                        help="キャッシュの上限サイズ GB。超えたら古いものから削除"
+                             f" (default: {DEFAULT_CACHE_MAX_GB:.0f})")
     parser.add_argument("--include-sensor", action="store_true",
                         help="record_develop で確定した連番と同じ record_sensor の mcap も"
                              "抽出対象に加える (時刻の再確認はしない)")
@@ -1162,10 +1364,12 @@ def main():
         print(f"\n対象ファイル ({len(sources)} 件):")
         for src in sources:
             print(f"  {src.name}  ({size_str(src.size)})")
+        print_transfer_summary()
         return
 
     if args.list_topics:
         print_topics(sources)
+        print_transfer_summary()
         return
 
     # --- 抽出 ---
@@ -1179,11 +1383,16 @@ def main():
     if not factories:
         raise SystemExit("[error] 使えるデコーダがありません。"
                          " `pip install -r requirements.txt` を実行してください。")
+    cache_dir = None if args.no_cache else args.cache_dir
     per_topic = extract_rows(sources, topic_config, start_ns, end_ns,
                              exclude_pats=args.exclude_topics,
                              workers=args.extract_workers,
-                             no_download=args.no_download)
+                             no_download=args.no_download,
+                             cache_dir=cache_dir)
     write_csvs(per_topic, topic_config, args.outdir, base)
+    if cache_dir:
+        prune_cache(cache_dir, args.cache_max_gb)
+    print_transfer_summary()
 
 
 if __name__ == "__main__":

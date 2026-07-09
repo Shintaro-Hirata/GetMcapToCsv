@@ -16,9 +16,11 @@ GetMcapToCsv の Streamlit UI。
 
 import contextlib
 import datetime
+import glob
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -43,6 +45,8 @@ ss.setdefault("topics_log", "")
 ss.setdefault("result_files", None)
 ss.setdefault("result_log", "")
 ss.setdefault("search_params", None)  # 検索時の (start_ns, end_ns, base 名) を保持
+ss.setdefault("search_transfer", None)  # 検索時の GCS 転送量 (bytes)
+ss.setdefault("result_transfer", None)  # 抽出時の GCS 転送量とキャッシュ利用量
 
 
 def run_captured(fn, *args, **kwargs):
@@ -107,9 +111,30 @@ def gcs_client():
 # ==================================================================
 st.header("① 検索条件")
 
-col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
-with col1:
-    vehicle = st.text_input("車両ID", value="GIGA09", help="例: GIGA07, GIGA09")
+input_mode = st.radio(
+    "入力元", ["GCS から検索", "ローカルの mcap"],
+    horizontal=True, key="input_mode",
+    help="ダウンロード済みの mcap から CSV を抽出する場合は「ローカルの mcap」を選択"
+         "（GCS 課金なし）。")
+is_gcs = input_mode.startswith("GCS")
+
+if is_gcs:
+    col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+    with col1:
+        vehicle = st.text_input("車両ID", value="GIGA09", help="例: GIGA07, GIGA09")
+else:
+    vehicle = ""
+    local_pattern = st.text_input(
+        "mcap のフォルダまたは glob パターン",
+        value="",
+        key="local_pattern",
+        help=r"例: C:\data\mcap （フォルダ指定で中の *.mcap を再帰検索） / C:\data\*.mcap",
+    )
+    local_time_filter = st.checkbox(
+        "時間帯で絞り込む", value=True, key="local_time_filter",
+        help="オフにするとフォルダ内の全ファイルの全時間帯を対象にします。")
+    col2, col3, col4 = st.columns([1, 1, 1])
+
 with col2:
     date = st.date_input("日付 (JST)", value=datetime.date.today() - datetime.timedelta(days=1))
 with col3:
@@ -119,24 +144,29 @@ with col4:
     t_end_text = st.text_input("終了時刻 (HH:MM:SS)", value="12:05:00",
                                help="秒まで指定可。例: 20:45 / 20:45:30 / 204530")
 
+time_needed = is_gcs or st.session_state.get("local_time_filter", True)
 t_start = parse_time_text(t_start_text)
 t_end = parse_time_text(t_end_text)
 time_ok = t_start is not None and t_end is not None
-if t_start is None:
-    st.error(f"開始時刻を解釈できません: 「{t_start_text}」 (例: 20:40:15)")
-if t_end is None:
-    st.error(f"終了時刻を解釈できません: 「{t_end_text}」 (例: 20:45:30)")
+if time_needed:
+    if t_start is None:
+        st.error(f"開始時刻を解釈できません: 「{t_start_text}」 (例: 20:40:15)")
+    if t_end is None:
+        st.error(f"終了時刻を解釈できません: 「{t_end_text}」 (例: 20:45:30)")
 if not time_ok:
     t_start = t_start or datetime.time(0, 0)
     t_end = t_end or datetime.time(0, 0)
 
-icol1, icol2, _ = st.columns([1, 1, 2])
-with icol1:
-    include_image = st.checkbox("record_debug_image も含める", value=True,
-                                help="develop と同じ連番の image ファイルも対象に加える (ほぼ毎回使うため既定でオン)")
-with icol2:
-    include_sensor = st.checkbox("record_sensor も含める", value=False,
-                                 help="develop と同じ連番の sensor ファイルも対象に加える (サイズ大)")
+if is_gcs:
+    icol1, icol2, _ = st.columns([1, 1, 2])
+    with icol1:
+        include_image = st.checkbox(
+            "record_debug_image も含める", value=True,
+            help="develop と同じ連番の image ファイルも対象に加える。"
+                 "CSV 抽出だけが目的なら、オフにすると GCS 転送量 (課金) を大きく減らせます。")
+    with icol2:
+        include_sensor = st.checkbox("record_sensor も含める", value=False,
+                                     help="develop と同じ連番の sensor ファイルも対象に加える (サイズ大)")
 
 with st.expander("詳細オプション"):
     oc1, oc2, oc3 = st.columns(3)
@@ -151,43 +181,113 @@ with st.expander("詳細オプション"):
         meta_workers = st.number_input("メタデータ並列数", value=16, min_value=1, max_value=64)
         extract_workers = st.number_input("抽出並列数 (0=自動)", value=0, min_value=0, max_value=16)
 
+    st.markdown("**ローカルキャッシュ**（同じ mcap の再ダウンロード = 再課金を防ぐ）")
+    cc1, cc2, cc3 = st.columns([1, 2, 1])
+    with cc1:
+        cache_enable = st.checkbox("キャッシュを使う", value=True, key="cache_enable")
+    with cc2:
+        cache_dir_input = st.text_input("キャッシュフォルダ",
+                                        value=os.path.abspath(core.DEFAULT_CACHE_DIR),
+                                        key="cache_dir")
+    with cc3:
+        cache_max_gb = st.number_input("上限 (GB)", value=float(core.DEFAULT_CACHE_MAX_GB),
+                                       min_value=1.0, max_value=500.0, step=5.0,
+                                       key="cache_max_gb")
+    csize = core.cache_total_size(cache_dir_input)
+    ccol1, ccol2 = st.columns([2, 1])
+    with ccol1:
+        st.caption(f"現在のキャッシュ: {core.size_str(csize)}")
+    with ccol2:
+        if csize and st.button("🗑 キャッシュをクリア"):
+            shutil.rmtree(cache_dir_input, ignore_errors=True)
+            st.rerun()
+
+cache_dir = cache_dir_input if cache_enable else None
+
 start_dt = datetime.datetime.combine(date, t_start, tzinfo=core.JST)
 end_dt = datetime.datetime.combine(date, t_end, tzinfo=core.JST)
 if end_dt <= start_dt:
     end_dt += datetime.timedelta(days=1)  # 終了が開始より前なら深夜跨ぎとみなす
-    if time_ok:
+    if time_ok and time_needed:
         st.info(f"終了時刻が開始時刻以前のため翌日扱いにします: 終了 = {end_dt:%m/%d %H:%M:%S}")
-if time_ok:
+if time_ok and time_needed:
     st.caption(f"🕐 抽出時間帯: {start_dt:%Y-%m-%d %H:%M:%S} 〜 {end_dt:%Y-%m-%d %H:%M:%S} (JST)")
 
-if st.button("🔍 ① 候補ファイルを検索", type="primary", disabled=not time_ok):
+_btn_label = "🔍 ① 候補ファイルを検索" if is_gcs else "📂 ① ローカル mcap を読み込み"
+if st.button(_btn_label, type="primary", disabled=(time_needed and not time_ok)):
     ss.sources = None
     ss.topics_info = None
     ss.result_files = None
     ss.file_defaults = None  # 新しい検索結果ではチェック状態を全選択に戻す
-    try:
-        with st.spinner("GCS を検索中... (セッション特定 → 時刻メタデータで絞り込み)"):
-            sources, log = run_captured(
-                core.find_gcs_sources, gcs_client(), bucket, vehicle,
-                start_dt, end_dt, subdir=subdir, lookback_hours=int(lookback),
-                workers=int(meta_workers),
-                include_sensor=include_sensor, sensor_subdir=sensor_subdir,
-                include_image=include_image, image_subdir=image_subdir)
-        ss.sources = sources
-        ss.search_id += 1
-        ss.search_log = log
-        ss.search_params = {
-            "start_ns": core.to_ns(start_dt),
-            "end_ns": core.to_ns(end_dt),
-            "base": f"{vehicle.strip().upper()}_{start_dt:%Y%m%d_%H%M%S}-{end_dt:%H%M%S}",
-            "extract_workers": int(extract_workers) or None,
-        }
-    except LookupError as e:
-        st.error(f"見つかりませんでした: {e}")
-        ss.search_log = ""
-    except Exception as e:
-        st.error(f"検索に失敗しました: {e}")
+    ss.search_transfer = None
+    core.STATS.reset()
+    if is_gcs:
+        try:
+            with st.spinner("GCS を検索中... (セッション特定 → 時刻メタデータで絞り込み)"):
+                sources, log = run_captured(
+                    core.find_gcs_sources, gcs_client(), bucket, vehicle,
+                    start_dt, end_dt, subdir=subdir, lookback_hours=int(lookback),
+                    workers=int(meta_workers),
+                    include_sensor=include_sensor, sensor_subdir=sensor_subdir,
+                    include_image=include_image, image_subdir=image_subdir)
+            ss.sources = sources
+            ss.search_id += 1
+            ss.search_log = log
+            ss.search_transfer = core.STATS.snapshot()
+            ss.search_params = {
+                "start_ns": core.to_ns(start_dt),
+                "end_ns": core.to_ns(end_dt),
+                "base": f"{vehicle.strip().upper()}_{start_dt:%Y%m%d_%H%M%S}-{end_dt:%H%M%S}",
+                "extract_workers": int(extract_workers) or None,
+            }
+        except LookupError as e:
+            st.error(f"見つかりませんでした: {e}")
+            ss.search_log = ""
+        except Exception as e:
+            st.error(f"検索に失敗しました: {e}")
+    else:
+        pattern = (local_pattern or "").strip().strip('"')
+        if not pattern:
+            st.error("mcap のフォルダまたはパターンを入力してください。")
+        else:
+            if os.path.isdir(pattern):
+                paths = sorted(glob.glob(os.path.join(pattern, "**", "*.mcap"),
+                                         recursive=True))
+            else:
+                paths = sorted(glob.glob(pattern))
+            if not paths:
+                st.error(f"mcap が見つかりません: {pattern}")
+            else:
+                sources = [core.LocalMcapSource(p) for p in paths]
+                use_filter = bool(st.session_state.get("local_time_filter", True))
+                log = ""
+                if use_filter:
+                    with st.spinner("時刻メタデータで絞り込み中..."):
+                        sources, log = run_captured(
+                            core.filter_sources_by_time, sources,
+                            core.to_ns(start_dt), core.to_ns(end_dt), 8)
+                if not sources:
+                    st.error("指定時間帯に重なる mcap がありません。")
+                    ss.search_log = log
+                else:
+                    ss.sources = sources
+                    ss.search_id += 1
+                    ss.search_log = log
+                    folder = os.path.basename(os.path.dirname(os.path.abspath(paths[0]))) or "local"
+                    base = (f"{folder}_{start_dt:%Y%m%d_%H%M%S}-{end_dt:%H%M%S}"
+                            if use_filter else folder)
+                    ss.search_params = {
+                        "start_ns": core.to_ns(start_dt) if use_filter else None,
+                        "end_ns": core.to_ns(end_dt) if use_filter else None,
+                        "base": base,
+                        "extract_workers": int(extract_workers) or None,
+                    }
 
+if ss.get("search_transfer"):
+    g_b, c_b = ss.search_transfer
+    if g_b or c_b:
+        st.caption(f"📡 この検索での GCS 読み込み: {core.size_str(g_b)} "
+                   f"(egress {core.cost_str(g_b)})")
 if ss.search_log:
     with st.expander("検索ログ"):
         st.code(ss.search_log)
@@ -389,6 +489,7 @@ if ss.sources:
         params = ss.search_params
         os.makedirs(outdir, exist_ok=True)
         prog = st.progress(0.0, text="準備中...")
+        core.STATS.reset()
         try:
             if out_format.startswith("CSV"):
                 topic_config = {t: {"suffix": t.strip("/").replace("/", "_"), "fields": []}
@@ -407,7 +508,8 @@ if ss.sources:
                         selected_sources, topic_config,
                         params["start_ns"], params["end_ns"],
                         workers=params["extract_workers"],
-                        progress=on_file_done)
+                        progress=on_file_done,
+                        cache_dir=cache_dir)
                     return core.write_csvs(per_topic, topic_config, outdir,
                                            params["base"], merged=merged_csv)
                 files, log = run_captured(run)
@@ -448,10 +550,13 @@ if ss.sources:
                 prog.progress(0.0, text=f"ダウンロード開始... 合計 {core.size_str(total_size)}")
                 files, log = run_captured(
                     core.download_raw_mcaps, selected_sources, outdir,
-                    4, on_dl)
+                    4, on_dl, cache_dir)
             prog.progress(1.0, text="✅ 完了")
+            if cache_dir:
+                core.prune_cache(cache_dir, float(cache_max_gb))
             ss.result_files = files
             ss.result_log = log
+            ss.result_transfer = core.STATS.snapshot()
             if files:
                 st.balloons()
         except Exception as e:
@@ -459,6 +564,16 @@ if ss.sources:
             st.error(f"抽出に失敗しました: {e}")
 
     if ss.result_files is not None:
+        if ss.get("result_transfer"):
+            g_b, c_b = ss.result_transfer
+            parts = []
+            if g_b:
+                parts.append(f"GCS 読み込み: {core.size_str(g_b)} (egress {core.cost_str(g_b)})")
+            if c_b:
+                parts.append(f"キャッシュ利用: {core.size_str(c_b)} (節約 {core.cost_str(c_b)})")
+            if not g_b and not c_b:
+                parts.append("GCS 読み込みなし (ローカルのみ)")
+            st.info("💰 " + " / ".join(parts))
         if ss.result_files:
             st.success(f"完了: {len(ss.result_files)} ファイルを出力しました")
             for fpath in ss.result_files:
