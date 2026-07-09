@@ -716,6 +716,8 @@ def load_topic_config(path):
             entry = {"fields": entry}
         suffix = entry.get("suffix") or topic.strip("/").replace("/", "_")
         config[topic] = {"suffix": suffix, "fields": list(entry.get("fields", []))}
+        if entry.get("columns"):  # フラット展開時に残す列 (フル列名)
+            config[topic]["columns"] = list(entry["columns"])
     return config
 
 
@@ -728,8 +730,14 @@ def _collect_rows(reader, topic_config, exclude_pats, start_ns, end_ns):
 
     topic_config が None のときは全トピック対象。exclude_pats に一致するトピックは
     デコード自体をスキップする (対象トピックのリストを先に確定して reader に渡す)。
+    設定の "columns" (フル列名リスト) があるトピックは、フラット展開後にその列だけ残す。
     """
     all_topics = topic_config is None
+    include_cols = {}
+    if not all_topics:
+        for t, cfg in topic_config.items():
+            if cfg.get("columns"):
+                include_cols[t] = frozenset(cfg["columns"])
     if all_topics:
         topics_arg = None
         if exclude_pats:
@@ -771,7 +779,10 @@ def _collect_rows(reader, topic_config, exclude_pats, start_ns, end_ns):
             for fld in fields:
                 r[fld.split(".")[-1]] = dig(decoded, fld)
         else:  # フィールド未指定ならメッセージ全体をフラット展開
+            include = include_cols.get(topic)
             for k, v in flatten(decoded).items():
+                if include is not None and k not in include:
+                    continue
                 r[k] = v
         per_topic[topic].append(r)
         count += 1
@@ -1241,6 +1252,61 @@ def print_topics(sources):
                     print(f"  {topic:<{width}}  {n:>8} msgs  [{enc}] {name}")
         except Exception as e:
             print(f"  [warn] 読み込み失敗: {e}")
+
+
+def sample_topic_columns(sources, topics, cache_dir=None, samples_per_topic=3,
+                         start_ns=None, end_ns=None):
+    """各トピックのメッセージを数件だけデコードし、フラット展開後の列名一覧を返す。
+
+    UI のカラム絞り込み用。チャンクインデックスにより先頭付近のチャンクしか
+    読まないため軽い (キャッシュ済みファイルがあれば GCS を読まない)。
+    戻り値: {topic: [列名, ...]}
+    """
+    factories = build_decoder_factories(quiet=True)
+    remaining = set(topics)
+    counts = defaultdict(int)
+    cols = {t: OrderedDict() for t in topics}
+
+    for src in sources:
+        if not remaining:
+            break
+        f = None
+        try:
+            if isinstance(src, GcsMcapSource) and cache_dir:
+                cached = cache_lookup(cache_dir, src.blob.bucket.name,
+                                      src.blob.name, src.size)
+                if cached:
+                    f = open(cached, "rb")
+            if f is None:
+                f = src.open(chunk_size=4 * 1024 * 1024)
+            with f:
+                reader = make_reader(f, decoder_factories=factories)
+                it = reader.iter_decoded_messages(
+                    topics=sorted(remaining), start_time=start_ns, end_time=end_ns)
+                while remaining:
+                    try:
+                        tup = next(it)
+                    except StopIteration:
+                        break
+                    except Exception:
+                        continue  # 個別メッセージのデコード失敗はスキップ
+                    topic = tup.channel.topic
+                    if topic not in cols or counts[topic] >= samples_per_topic:
+                        continue
+                    try:
+                        for k in flatten(tup.decoded_message):
+                            cols[topic][k] = True
+                        counts[topic] += 1
+                    except Exception:
+                        continue
+                    if counts[topic] >= samples_per_topic:
+                        remaining.discard(topic)
+        except Exception as e:
+            print(f"[warn] カラム取得失敗 ({src.name}): {e}")
+    for t in topics:
+        if not cols[t]:
+            print(f"[warn] カラムを取得できませんでした: {t}")
+    return {t: list(c) for t, c in cols.items() if c}
 
 
 def print_transfer_summary():

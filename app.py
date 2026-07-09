@@ -47,6 +47,7 @@ ss.setdefault("result_log", "")
 ss.setdefault("search_params", None)  # 検索時の (start_ns, end_ns, base 名) を保持
 ss.setdefault("search_transfer", None)  # 検索時の GCS 転送量 (bytes)
 ss.setdefault("result_transfer", None)  # 抽出時の GCS 転送量とキャッシュ利用量
+ss.setdefault("topic_columns", {})      # {topic: [フラット列名, ...]} カラム絞り込み用
 
 
 def run_captured(fn, *args, **kwargs):
@@ -220,6 +221,7 @@ if st.button(_btn_label, type="primary", disabled=(time_needed and not time_ok))
     ss.result_files = None
     ss.file_defaults = None  # 新しい検索結果ではチェック状態を全選択に戻す
     ss.search_transfer = None
+    ss.topic_columns = {}
     core.STATS.reset()
     if is_gcs:
         try:
@@ -460,6 +462,33 @@ if ss.sources:
             with st.expander("選択中のトピックを確認"):
                 for t in selected_topics:
                     st.text(t)
+
+        # --- カラム絞り込み (CSV 出力の列を選ぶ。既定は全カラム) ---
+        if selected_topics:
+            with st.expander("🧩 カラム絞り込み（任意・CSV のみ）"):
+                st.caption(
+                    "トピックごとに CSV へ出力する列を選べます (既定は全カラム)。"
+                    "※ mcap はメッセージ単位で取得するため、列を絞っても GCS の"
+                    "ダウンロード量は変わりません。CSV のサイズと見やすさの改善用です。")
+                if st.button("🔎 選択トピックのカラム一覧を取得"):
+                    with st.spinner("カラム名を取得中... (各トピック数メッセージだけデコード)"):
+                        cols_map, log = run_captured(
+                            core.sample_topic_columns, selected_sources,
+                            selected_topics, cache_dir)
+                    ss.topic_columns.update(cols_map)
+                    missed = [t for t in selected_topics if t not in ss.topic_columns]
+                    if missed:
+                        st.warning("カラムを取得できなかったトピック: " + ", ".join(missed))
+                for t in selected_topics:
+                    opts = ss.topic_columns.get(t)
+                    if not opts:
+                        continue
+                    st.multiselect(
+                        t, options=opts, default=opts,  # 取得直後は全選択
+                        key=f"colsel_{t}",
+                        help="× で外した列は CSV に出力されません。全部外すと全カラム扱い。")
+                if not any(t in ss.topic_columns for t in selected_topics):
+                    st.caption("「カラム一覧を取得」を押すと、ここで列を選べます。")
     else:
         st.caption("「トピック一覧を取得」を押すと、ここで選択できます。"
                    " (mcap を元ファイルのまま保存する場合はトピック選択は不要)")
@@ -492,8 +521,15 @@ if ss.sources:
         core.STATS.reset()
         try:
             if out_format.startswith("CSV"):
-                topic_config = {t: {"suffix": t.strip("/").replace("/", "_"), "fields": []}
-                                for t in selected_topics}
+                topic_config = {}
+                for t in selected_topics:
+                    cfg = {"suffix": t.strip("/").replace("/", "_"), "fields": []}
+                    opts = ss.topic_columns.get(t)
+                    sel = st.session_state.get(f"colsel_{t}")
+                    # 一部の列だけ選ばれていれば絞り込む (全選択/空選択は全カラム扱い)
+                    if opts and sel and 0 < len(sel) < len(opts):
+                        cfg["columns"] = list(sel)
+                    topic_config[t] = cfg
 
                 def on_file_done(done, total, name):
                     prog.progress(done / total,
