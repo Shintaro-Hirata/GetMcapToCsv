@@ -81,6 +81,27 @@ Python まで用意する。数分で終わる。
 中に入れる・データに触れるのは自分だけになるが、IAP 用ファイアウォール作成が必要で、
 組織ポリシーによっては失敗しうる（下の「セキュリティ」参照）。
 
+### 手順 2.5. VM にバケット読み取り権限を持たせる（初回のみ）
+
+VM の中の抽出は既定で **VM のサービスアカウント**の権限で GCS を読む。別プロジェクトの
+バケット（`t2-ft-original-data`）はそのままでは読めないことが多い。
+
+自分（バケットを読めるアカウント）の認証を VM に一度だけ入れると、その権限で動く
+（バケット側の IAM 変更が不要）:
+```powershell
+gcloud compute ssh <VM名> --zone asia-northeast1-a --project <PROJECT> `
+  --command "gcloud auth application-default login --no-launch-browser"
+```
+表示された URL をブラウザで開いて認証し、出たコードを貼り戻す。以後この VM は
+あなたの権限で GCS を読む。
+
+まず軽い確認（ダウンロードなし）で読めるかを見ておくと安全:
+```powershell
+.\scripts\gcp_fetch.ps1 -Vehicle GIGA09 -Start "2026-07-01 20:40" -End "2026-07-01 20:45" -ExtraArgs "--list-only","--all-topics"
+```
+対象ファイルが一覧表示されれば権限 OK。`403` 等が出たら上の application-default login を
+実施する（または VM のサービスアカウントにバケットの `roles/storage.objectViewer` を付与）。
+
 ### 手順 3. 抽出する
 
 ```powershell
@@ -140,12 +161,24 @@ gcloud config get-value project      # 既定のプロジェクト
 ```
 出てきた **PROJECT_ID**（表示名ではなく ID）を `gcp.env` の `GCP_PROJECT` に設定する。
 
+### どのプロジェクトに VM を作ればよいか
+
+`gcloud projects list` に出るのは「見えるプロジェクト」で、VM を作れるとは限らない。
+**個人の作業 VM は `t2-remote-devbox`（開発者用の devbox プロジェクト）が第一候補**。
+作れるかは次で事前確認できる（エラーにならなければ Compute 権限あり）:
+```bash
+gcloud compute instances list --project t2-remote-devbox
+```
+VM の**プロジェクトはバケットと別でよい**（egress 無料は同一**リージョン**であればよく、
+プロジェクト一致は不要）。VM を東京（asia-northeast1）に置き、手順 2.5 でバケット読み取り
+権限を持たせればよい。
+
 ### `Permission denied to enable service [compute.googleapis.com]` / VM 作成が権限で失敗
 
 そのプロジェクトで **Compute Engine を使う権限が自分に無い**。これは各自の GCP の
 権限設定しだいで、ツール側では解決できない。対処は次のいずれか:
 
-1. **Compute を使えるプロジェクトに変える** — 別プロジェクトで権限があるならそれを使う。
+1. **Compute を使えるプロジェクトに変える** — `t2-remote-devbox` 等、権限のある所を使う。
 2. **管理者に依頼する** — 対象プロジェクトで以下を有効化・付与してもらう:
    - Compute Engine API の有効化（`compute.googleapis.com`）
    - 自分のアカウントに `roles/compute.instanceAdmin.v1`（VM 作成・起動停止）
