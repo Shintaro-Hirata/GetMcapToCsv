@@ -28,7 +28,12 @@ param(
   [switch]$DeleteAfter   # delete the VM+disk after (even on error) so idle cost is zero
 )
 
-$ErrorActionPreference = 'Stop'
+# NOTE: use 'Continue', not 'Stop'. gcloud/plink write normal progress and errors
+# (e.g. "Connection refused" while a fresh VM's sshd starts) to stderr, and under
+# 'Stop' PowerShell 5.1 turns any native-command stderr line into a terminating
+# error. That would abort the SSH-readiness poll on its first attempt. Real
+# failures are still caught explicitly via $LASTEXITCODE checks and throw below.
+$ErrorActionPreference = 'Continue'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoDir   = Split-Path -Parent $scriptDir
 
@@ -104,9 +109,11 @@ function Get-VmStatus {
   return (& gcloud compute instances describe $vm "--project=$project" "--zone=$zone" --format='value(status)')
 }
 function Wait-Ssh {
-  # poll until an SSH command succeeds (a freshly created VM needs time for sshd)
-  for ($i = 0; $i -lt 30; $i++) {
-    & gcloud compute ssh $vm @baseFlags --command 'true' 2>$null | Out-Null
+  # poll until an SSH command succeeds (a freshly created VM needs time for sshd).
+  # Swallow every failure (connection refused, key propagation) and keep retrying;
+  # only the exit code decides success. 40 x 5s ~= 3 min.
+  for ($i = 0; $i -lt 40; $i++) {
+    try { & gcloud compute ssh $vm @baseFlags --command 'true' 2>&1 | Out-Null } catch { }
     if ($LASTEXITCODE -eq 0) { return $true }
     Start-Sleep -Seconds 5
   }
