@@ -38,9 +38,10 @@ Write-Host ''
 Write-Host "--- ディスク (name=$vm) ---  ※ 存在するだけで (停止中でも) 課金"
 & gcloud compute disks list --project=$project --filter="name=$vm" --format='table(name,zone,sizeGb,status)'
 Write-Host ''
-Write-Host "--- 予約済み外部IP ---  ※ 未使用でも課金 (通常は無いはず)"
-& gcloud compute addresses list --project=$project --format='table(name,region,address,status)'
+Write-Host "--- 予約済み外部IP (name=$vm) ---  ※ このツールは IP を予約しないので通常は空"
+& gcloud compute addresses list --project=$project --filter="name~$vm" --format='table(name,region,address,status)'
 Write-Host ''
-Write-Host "上に $vm の行が無ければ、この用途での課金はありません。"
+Write-Host "上の各セクションに $vm の行が無ければ、この用途での課金はありません。"
+Write-Host "(共有プロジェクトでは他人の VM/IP も存在しますが、それらは無関係。触らないこと。)"
 Write-Host "残っていた場合の削除:"
 Write-Host "  gcloud compute instances delete $vm --project=$project --zone=<ZONE>"

@@ -22,9 +22,10 @@ echo
 echo "--- ディスク (name=$GCP_VM) ---  ※ 存在するだけで (停止中でも) 課金"
 gcloud compute disks list --project "$GCP_PROJECT" --filter="name=$GCP_VM" --format='table(name,zone,sizeGb,status)'
 echo
-echo "--- 予約済み外部IP ---  ※ 未使用でも課金 (通常は無いはず)"
-gcloud compute addresses list --project "$GCP_PROJECT" --format='table(name,region,address,status)'
+echo "--- 予約済み外部IP (name=$GCP_VM) ---  ※ このツールは IP を予約しないので通常は空"
+gcloud compute addresses list --project "$GCP_PROJECT" --filter="name~$GCP_VM" --format='table(name,region,address,status)'
 echo
-echo "上に $GCP_VM の行が無ければ、この用途での課金はありません。"
+echo "上の各セクションに $GCP_VM の行が無ければ、この用途での課金はありません。"
+echo "(共有プロジェクトでは他人の VM/IP も存在しますが、それらは無関係。触らないこと。)"
 echo "残っていた場合の削除:"
 echo "  gcloud compute instances delete $GCP_VM --project $GCP_PROJECT --zone <ZONE>"
