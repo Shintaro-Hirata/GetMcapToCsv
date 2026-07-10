@@ -46,6 +46,8 @@ for f in get_mcap_to_csv.py requirements.txt topics.example.t2.json topics.examp
   gcloud compute scp "${SSH_FLAGS[@]}" "$REPO_DIR/$f" "$REMOTE:$REMOTE_DIR/$f"
 done
 gcloud compute scp "${SSH_FLAGS[@]}" "$REPO_DIR/scripts/run_on_gcp.sh" "$REMOTE:$REMOTE_DIR/scripts/run_on_gcp.sh"
+# CRLF チェックアウト対策 (bash が pipefail\r 等で失敗するため VM 側で除去)
+run_ssh "sed -i 's/\r//' $REMOTE_DIR/scripts/run_on_gcp.sh"
 
 # /t2 デコード用の私物パッケージを手元から VM へ転送 (VM での GitHub 認証を回避)
 ROS2IDL_REMOTE=""

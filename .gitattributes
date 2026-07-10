@@ -1,0 +1,4 @@
+# シェルスクリプトは常に LF で管理・チェックアウトする。
+# Windows の core.autocrlf=true でも CRLF に変換されないようにし、
+# Linux VM 上で bash が \r で失敗するのを防ぐ。
+*.sh text eol=lf

@@ -102,6 +102,8 @@ foreach ($f in @('get_mcap_to_csv.py', 'requirements.txt', 'topics.example.t2.js
   Invoke-Scp (Join-Path $repoDir $f) "${vm}:$remoteDir/$f"
 }
 Invoke-Scp (Join-Path $repoDir 'scripts\run_on_gcp.sh') "${vm}:$remoteDir/scripts/run_on_gcp.sh"
+# Windows の Git チェックアウトで付いた CRLF を除去 (bash が pipefail\r 等で失敗するため)
+Invoke-RemoteSsh "sed -i 's/\r//' $remoteDir/scripts/run_on_gcp.sh"
 
 # ユーザー指定の topics ファイルがあれば転送し、リモートではその basename を使う
 $remoteTopics = $null
