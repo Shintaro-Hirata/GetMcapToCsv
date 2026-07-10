@@ -6,3 +6,4 @@ out/
 mcap_cache/
 *.mcap
 *.csv
+scripts/gcp.env
