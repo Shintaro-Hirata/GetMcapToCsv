@@ -39,16 +39,24 @@ REMOTE="$GCP_VM"
 
 run_ssh() { gcloud compute ssh "$REMOTE" "${SSH_FLAGS[@]}" --command "$1"; }
 
-# --setup-auth / --start-stop / --delete-after を取り出す (残りは get_mcap_to_csv.py へ渡す)
+# --setup-auth / --start-stop / --delete-after / --local-out を取り出す
+# (残りは get_mcap_to_csv.py へ渡す)
 SETUP_AUTH=0
 START_STOP=0
 DELETE_AFTER=0
+TOPICS_FILE=""
 POS_ARGS=()
+EXPECT_LOCAL_OUT=0
+EXPECT_TOPICS=0
 for a in "$@"; do
+  if [ "$EXPECT_LOCAL_OUT" = "1" ]; then LOCAL_OUT="$a"; EXPECT_LOCAL_OUT=0; continue; fi
+  if [ "$EXPECT_TOPICS" = "1" ]; then TOPICS_FILE="$a"; EXPECT_TOPICS=0; continue; fi
   case "$a" in
     --setup-auth) SETUP_AUTH=1 ;;
     --start-stop) START_STOP=1 ;;
     --delete-after) DELETE_AFTER=1 ;;
+    --local-out) EXPECT_LOCAL_OUT=1 ;;
+    --topics) EXPECT_TOPICS=1 ;;  # 手元の topics JSON は VM へ転送してから basename で渡す
     *) POS_ARGS+=("$a") ;;
   esac
 done
@@ -95,6 +103,14 @@ done
 gcloud compute scp "${SSH_FLAGS[@]}" "$REPO_DIR/scripts/run_on_gcp.sh" "$REMOTE:$REMOTE_DIR/scripts/run_on_gcp.sh"
 # CRLF チェックアウト対策 (bash が pipefail\r 等で失敗するため VM 側で除去)
 run_ssh "sed -i 's/\r//' $REMOTE_DIR/scripts/run_on_gcp.sh"
+
+# 手元で指定した topics JSON を VM へ転送し、VM 上では basename で参照する
+if [ -n "$TOPICS_FILE" ]; then
+  [ -f "$TOPICS_FILE" ] || { echo "[error] topics JSON がありません: $TOPICS_FILE"; exit 1; }
+  TNAME="$(basename "$TOPICS_FILE")"
+  gcloud compute scp "${SSH_FLAGS[@]}" "$TOPICS_FILE" "$REMOTE:$REMOTE_DIR/$TNAME"
+  set -- "$@" --topics "$TNAME"
+fi
 
 # /t2 デコード用の私物パッケージを手元から VM へ転送 (VM での GitHub 認証を回避)
 ROS2IDL_REMOTE=""

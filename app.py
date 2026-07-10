@@ -163,8 +163,9 @@ st.header("① 検索条件")
 input_mode = st.radio(
     "入力元", ["GCS から検索", "ローカルの mcap", "GCS (VM経由・課金最小)"],
     horizontal=True, key="input_mode",
-    help="「GCS から検索」= この PC で直接抽出（mcap を丸ごとダウンロード＝egress 課金）。"
-         "「GCS (VM経由)」= GCP 内の VM で変換し CSV だけ回収（egress ほぼ 0・推奨）。"
+    help="「GCS から検索」= ファイル・トピック・カラムを確認しながら選べる (推奨)。"
+         "CSV は④で「VM 経由」を選べば mcap のダウンロード課金なしで取得できる。"
+         "「GCS (VM経由)」= 検索 UI を使わず条件だけ指定して一気に VM 実行する簡易版。"
          "「ローカルの mcap」= 手元の mcap から抽出。")
 
 # ================================================================
@@ -711,10 +712,65 @@ if ss.sources:
         merged_csv = st.checkbox("結合 CSV (_all.csv) も出力", value=False,
                                  help="選択した全トピックを時刻順に 1 本へ結合 (CSV のみ)")
 
+    # --- CSV の抽出ルート (GCS のみ): この PC で直接 or GCP 内の VM 経由 ---
+    # ここで決めた時間帯・トピック・カラムをそのまま VM に渡せるので、
+    # 「選びやすさは検索 UI、ダウンロード課金は VM 経由」の両取りができる。
+    csv_route_vm = False
+    vm_route_ready = True
+    if is_gcs and out_format.startswith("CSV"):
+        route = st.radio(
+            "CSV の抽出ルート",
+            ["🌐 VM 経由（課金最小・推奨）", "💻 この PC で直接（mcap を全量ダウンロード）"],
+            horizontal=True, key="csv_route",
+            help="VM 経由: GCP 内に VM を用意し、そこで mcap→CSV 変換して CSV だけ回収"
+                 "（重い mcap は GCP から出ないため egress 課金がほぼ 0。準備に数分）。"
+                 "直接: この PC に mcap を丸ごとダウンロードして抽出（すぐ始まるが課金あり）。")
+        csv_route_vm = route.startswith("🌐")
+        if csv_route_vm:
+            gcp_cfg = read_gcp_env()
+            vm_route_ready = bool(gcp_cfg.get("GCP_PROJECT")) and \
+                gcp_cfg.get("GCP_PROJECT") != "your-project-id"
+            if not vm_route_ready:
+                st.error("scripts/gcp.env が未設定のため VM 経由は使えません。"
+                         "docs/GCP_EXECUTION.md の手順で設定してください。")
+            if selected_sources:
+                # 直接ルートで発生するダウンロード量 = 選択ファイル合計
+                # (見積もり済みならチャンクスキップ後の量を採用)
+                dl_direct = sel_size
+                est = ss.get("transfer_estimate")
+                if est and est[1].get("needed"):
+                    dl_direct = min(dl_direct, est[1]["needed"])
+                st.info(
+                    f"💰 **節約見込み ≈ {core.cost_str(dl_direct)}**\n\n"
+                    f"- この PC で直接: mcap 約 {core.size_str(dl_direct)} をダウンロード "
+                    f"(egress {core.cost_str(dl_direct)})\n"
+                    f"- VM 経由: mcap は GCP 内で処理。手元に来るのは CSV だけ"
+                    f"（通常数 MB〜数十 MB ≈ ¥1 前後）\n"
+                    f"- 別途 VM 稼働費: 約 ¥35/時（実行中のみ。10 分なら ¥6 前後、"
+                    f"Spot 設定ならさらに約 1/3）")
+            vmc1, vmc2 = st.columns([2, 1])
+            with vmc1:
+                st.radio("VM 運用",
+                         ["B: 毎回作って消す（待機費 ¥0）", "A: 既存 VM を start→stop"],
+                         horizontal=True, key="csvvm_model",
+                         help="B は使わない間 ¥0（毎回 VM 作成で数分）。"
+                              "A は VM を残す（停止中もディスク代 月 ~¥450）が立ち上がりが速い。")
+            with vmc2:
+                st.checkbox("認証を VM に入れる（新規 VM は必須）", value=True, key="csvvm_auth",
+                            help="手元の gcloud auth application-default login の認証を VM へコピー。")
+            if include_image:
+                st.caption("※ VM 経由の CSV 抽出では record_debug_image は読みません"
+                           "（CSV に画像データは入らないため。処理時間の節約）。")
+            if st.button("🔍 課金状況を確認（VM が残っていないか）", key="csvvm_status"):
+                with st.spinner("確認中..."):
+                    run_script_streaming(_vm_script_cmd("gcp_status", [], []), st.empty())
+
     can_run = bool(selected_sources) and (
         out_format.startswith("mcap (元ファイル") or bool(selected_topics))
     if not can_run and selected_sources:
         st.caption("CSV / mcap(絞り込み) はトピックを 1 つ以上選択してください。")
+    if csv_route_vm and not vm_route_ready:
+        can_run = False
 
     # --- 転送量 (課金) の事前見積もり ---
     if selected_sources and selected_topics and is_gcs:
@@ -760,6 +816,64 @@ if ss.sources:
     if st.button("🚀 ④ 抽出実行", type="primary", disabled=not can_run):
         params = ss.search_params
         os.makedirs(outdir, exist_ok=True)
+
+        # --- VM 経由 (CSV のみ): 検索 UI で決めた条件を topics JSON にして VM へ渡す ---
+        if out_format.startswith("CSV") and csv_route_vm:
+            topic_config = {}
+            for t in selected_topics:
+                cfg_t = {"suffix": t.strip("/").replace("/", "_"), "fields": []}
+                opts = ss.topic_columns.get(t)
+                sel = st.session_state.get(f"colsel_{t}")
+                if opts and sel and 0 < len(sel) < len(opts):
+                    cfg_t["columns"] = list(sel)
+                topic_config[t] = cfg_t
+            topics_path = os.path.join(outdir, "_vm_topics.json")
+            with open(topics_path, "w", encoding="utf-8") as f:
+                json.dump(topic_config, f, ensure_ascii=False, indent=1)
+
+            s_str = f"{datetime.datetime.fromtimestamp(params['start_ns'] / 1e9, core.JST):%Y-%m-%d %H:%M:%S}"
+            e_str = f"{datetime.datetime.fromtimestamp(params['end_ns'] / 1e9, core.JST):%Y-%m-%d %H:%M:%S}"
+            ps = ["-Vehicle", vehicle, "-Start", s_str, "-End", e_str,
+                  "-Topics", topics_path, "-LocalOut", outdir]
+            sh = ["--vehicle", vehicle, "--start", s_str, "--end", e_str,
+                  "--topics", topics_path, "--local-out", outdir]
+            if include_sensor:
+                ps.append("-IncludeSensor"); sh.append("--include-sensor")
+            if st.session_state.get("csvvm_auth", True):
+                ps.append("-SetupAuth"); sh.append("--setup-auth")
+            vm_model_b = str(st.session_state.get("csvvm_model", "B")).startswith("B")
+            if vm_model_b:
+                ps.append("-DeleteAfter"); sh.append("--delete-after")
+            else:
+                ps.append("-StartStop"); sh.append("--start-stop")
+
+            log_area = st.empty()
+            t_run0 = time.time()
+            ok = True
+            if vm_model_b:
+                st.info("① VM を作成します（1〜2 分）...")
+                rc, _ = run_script_streaming(
+                    _vm_script_cmd("gcp_create_vm", ["-Yes"], ["--yes"]), log_area)
+                ok = rc == 0
+                if not ok:
+                    st.error("VM 作成に失敗しました。ログを確認してください。")
+            if ok:
+                st.info("② VM で抽出し、CSV を回収します...")
+                rc, _ = run_script_streaming(_vm_script_cmd("gcp_fetch", ps, sh), log_area)
+                if rc == 0:
+                    csvs = [p for p in sorted(glob.glob(os.path.join(outdir, "*.csv")))
+                            if os.path.getmtime(p) >= t_run0 - 5]
+                    st.success(f"完了: CSV {len(csvs)} 件を {outdir} に取得しました"
+                               "（mcap は GCP 内で処理したため egress 課金はほぼ 0）。")
+                    for c in csvs[:200]:
+                        st.write(f"- `{os.path.basename(c)}` "
+                                 f"({core.size_str(os.path.getsize(c))})")
+                else:
+                    st.error("抽出に失敗しました。ログを確認してください。"
+                             "（VM は自動で削除/停止済みのはずですが、"
+                             "「課金状況を確認」でも確認できます）")
+            st.stop()
+
         prog = st.progress(0.0, text="準備中...")
         core.STATS.reset()
         try:

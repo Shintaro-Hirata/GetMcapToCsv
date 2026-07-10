@@ -58,6 +58,10 @@ $imageFamily = Cfg 'IMAGE_FAMILY' 'debian-12'
 $imageProj   = Cfg 'IMAGE_PROJECT' 'debian-cloud'
 $private     = (Cfg 'PRIVATE' '0') -eq '1'
 $iapTag      = Cfg 'IAP_TAG' 'mcap-iap-ssh'
+# SPOT=1: Spot VM (~1/3 compute price). GCP may rarely terminate it mid-run; the VM
+# then deletes itself (--instance-termination-action=DELETE) so nothing keeps billing.
+# Just rerun on failure. Good fit for short Model-B jobs.
+$spot        = (Cfg 'SPOT' '0') -eq '1'
 
 $sshFlags = @()
 if ($cfg.ContainsKey('GCLOUD_SSH_FLAGS') -and $cfg['GCLOUD_SSH_FLAGS']) {
@@ -67,10 +71,13 @@ if ($cfg.ContainsKey('GCLOUD_SSH_FLAGS') -and $cfg['GCLOUD_SSH_FLAGS']) {
 # pass it to plink, avoiding host-key mismatch prompts when an IP is reused.
 $metadata = 'enable-guest-attributes=TRUE'
 $netArgs = @()
+if ($spot) {
+  $netArgs += @('--provisioning-model=SPOT', '--instance-termination-action=DELETE')
+}
 if ($private) {
   $metadata = 'enable-oslogin=TRUE,enable-guest-attributes=TRUE'
-  $netArgs = @('--no-address', "--tags=$iapTag",
-               '--shielded-secure-boot', '--shielded-vtpm', '--shielded-integrity-monitoring')
+  $netArgs += @('--no-address', "--tags=$iapTag",
+                '--shielded-secure-boot', '--shielded-vtpm', '--shielded-integrity-monitoring')
   if ($sshFlags -notcontains '--tunnel-through-iap') { $sshFlags += '--tunnel-through-iap' }
 }
 
@@ -79,6 +86,7 @@ Write-Host "  project : $project"
 Write-Host "  zone    : $zone"
 Write-Host "  name    : $vm"
 Write-Host "  machine : $machineType / boot disk ${bootDiskGb}GB / $imageFamily"
+if ($spot) { Write-Host '  pricing : Spot (~1/3; may rarely be terminated mid-run, then auto-deletes)' }
 Write-Host '  scope   : bucket read (devstorage.read_only)'
 if ($private) {
   Write-Host '  network : private (no external IP / IAP SSH / OS Login)'

@@ -42,16 +42,23 @@ IMAGE_PROJECT="${IMAGE_PROJECT:-debian-cloud}"
 #   (IAP 用ファイアウォールを作るため、組織ポリシー/権限によっては失敗しうる)。
 PRIVATE="${PRIVATE:-0}"
 IAP_TAG="${IAP_TAG:-mcap-iap-ssh}"                # IAP SSH 許可の対象タグ
+# SPOT=1: Spot VM で作る (実行中の計算単価が通常の 1/3 程度)。GCP 都合で稀に途中終了
+# されうるが、その際は VM ごと自動削除 (--instance-termination-action=DELETE) され
+# 課金は残らない。失敗したら再実行するだけ。短時間ジョブのモデルBに向く。
+SPOT="${SPOT:-0}"
 
 # enable-guest-attributes: gcloud が VM の SSH ホスト鍵を API から取得して plink に渡すため、
 # IP 再利用時のホスト鍵不一致プロンプトを避けられる。
 METADATA="enable-guest-attributes=TRUE"
 net_args=()
+if [ "$SPOT" = "1" ]; then
+  net_args+=(--provisioning-model=SPOT --instance-termination-action=DELETE)
+fi
 if [ "$PRIVATE" = "1" ]; then
   METADATA="enable-oslogin=TRUE,enable-guest-attributes=TRUE"
-  net_args=(--no-address
-            --tags="$IAP_TAG"
-            --shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring)
+  net_args+=(--no-address
+             --tags="$IAP_TAG"
+             --shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring)
   # 以降の gcloud ssh/scp は IAP トンネル必須になる
   export GCLOUD_SSH_FLAGS="${GCLOUD_SSH_FLAGS:-} --tunnel-through-iap"
 fi
@@ -61,6 +68,9 @@ echo "  プロジェクト : $GCP_PROJECT"
 echo "  ゾーン       : $GCP_ZONE"
 echo "  名前         : $GCP_VM"
 echo "  マシン       : $MACHINE_TYPE / ブートディスク ${BOOT_DISK_GB}GB / $IMAGE_FAMILY"
+if [ "$SPOT" = "1" ]; then
+  echo "  料金モデル   : Spot (約1/3。稀に途中終了→VM自動削除。再実行でリカバリ)"
+fi
 echo "  権限         : バケット読み取り (devstorage.read_only)"
 if [ "$PRIVATE" = "1" ]; then
   echo "  公開範囲     : 最小 (外部IPなし / IAP SSH / OS Login)  ← あなた以外は中に入れない"

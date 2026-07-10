@@ -23,6 +23,7 @@ param(
   [switch]$IncludeImage,
   [string[]]$ExtraArgs,
   [string]$EnvFile,
+  [string]$LocalOut,     # local folder to receive the CSVs (overrides LOCAL_OUT in gcp.env)
   [switch]$SetupAuth,    # copy local ADC to the VM so it reads GCS as you (first time)
   [switch]$StartStop,    # start before run, stop after (even on error) to minimize cost
   [switch]$DeleteAfter   # delete the VM+disk after (even on error) so idle cost is zero
@@ -68,7 +69,7 @@ $vm        = Cfg 'GCP_VM';      if (-not $vm)      { throw 'Set GCP_VM in gcp.en
 $remoteDir = Cfg 'REMOTE_DIR' 'GetMcapToCsv'
 # strip a leading ~/ (pscp cannot expand it); make it home-relative
 $remoteDir = $remoteDir -replace '^~[/\\]', ''
-$localOut  = Cfg 'LOCAL_OUT' 'out'
+$localOut  = if ($LocalOut) { $LocalOut } else { Cfg 'LOCAL_OUT' 'out' }
 $venvDir   = Cfg 'VENV_DIR'
 $ros2idl   = Cfg 'ROS2IDL_LOCAL_PATH'
 
