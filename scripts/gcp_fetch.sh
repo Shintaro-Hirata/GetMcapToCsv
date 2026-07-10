@@ -54,7 +54,7 @@ for a in "$@"; do
 done
 set -- "${POS_ARGS[@]}"
 
-# --start-stop / --delete-after: 実行前に起動し、終了時 (エラー時も) 停止 or 削除する
+# --start-stop / --delete-after: 終了時 (エラー時も) 停止 or 削除する trap を仕掛ける
 if [ "$START_STOP" = "1" ] || [ "$DELETE_AFTER" = "1" ]; then
   cleanup_vm() {
     if [ "$DELETE_AFTER" = "1" ]; then
@@ -68,19 +68,23 @@ if [ "$START_STOP" = "1" ] || [ "$DELETE_AFTER" = "1" ]; then
     fi
   }
   trap cleanup_vm EXIT
-  st=$(gcloud compute instances describe "$REMOTE" --project "$GCP_PROJECT" --zone "$GCP_ZONE" --format='value(status)' 2>/dev/null || echo UNKNOWN)
-  if [ "$st" != "RUNNING" ]; then
-    echo "[info] VM を起動中... (現在: $st)"
-    gcloud compute instances start "$REMOTE" --project "$GCP_PROJECT" --zone "$GCP_ZONE" >/dev/null
-    echo "[info] SSH の準備を待機中..."
-    for _ in $(seq 1 24); do
-      if gcloud compute ssh "$REMOTE" "${SSH_FLAGS[@]}" --command 'true' >/dev/null 2>&1; then break; fi
-      sleep 5
-    done
-  else
-    echo "[info] VM は起動済みです。"
-  fi
 fi
+
+# VM を起動し、SSH が受け付けるまで必ず待つ。
+# 作りたての VM は RUNNING でも sshd がまだ接続を拒否する ("Connection refused")
+# ことがあるため、状態に関わらず SSH が通るまでポーリングする。
+st=$(gcloud compute instances describe "$REMOTE" --project "$GCP_PROJECT" --zone "$GCP_ZONE" --format='value(status)' 2>/dev/null || echo UNKNOWN)
+if [ "$st" != "RUNNING" ]; then
+  echo "[info] VM を起動中... (現在: $st)"
+  gcloud compute instances start "$REMOTE" --project "$GCP_PROJECT" --zone "$GCP_ZONE" >/dev/null
+else
+  echo "[info] VM は起動済みです。"
+fi
+echo "[info] SSH の準備を待機中..."
+for _ in $(seq 1 30); do
+  if gcloud compute ssh "$REMOTE" "${SSH_FLAGS[@]}" --command 'true' >/dev/null 2>&1; then break; fi
+  sleep 5
+done
 
 echo "[info] VM ($GCP_VM / $GCP_ZONE) にツールを転送..."
 run_ssh "mkdir -p $REMOTE_DIR/scripts"

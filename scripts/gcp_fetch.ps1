@@ -103,18 +103,26 @@ function Q([string]$s) { "'" + ($s -replace "'", "'\''") + "'" }
 function Get-VmStatus {
   return (& gcloud compute instances describe $vm "--project=$project" "--zone=$zone" --format='value(status)')
 }
-function Start-VmIfNeeded {
-  $st = Get-VmStatus
-  if ($st -eq 'RUNNING') { Write-Host '[info] VM already running.'; return }
-  Write-Host "[info] Starting VM... (was: $st)"
-  & gcloud compute instances start $vm "--project=$project" "--zone=$zone" | Out-Null
-  Write-Host '[info] Waiting for SSH...'
-  for ($i = 0; $i -lt 24; $i++) {
+function Wait-Ssh {
+  # poll until an SSH command succeeds (a freshly created VM needs time for sshd)
+  for ($i = 0; $i -lt 30; $i++) {
     & gcloud compute ssh $vm @baseFlags --command 'true' 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) { return }
+    if ($LASTEXITCODE -eq 0) { return $true }
     Start-Sleep -Seconds 5
   }
-  Write-Warning 'SSH not responding yet; continuing anyway.'
+  return $false
+}
+function Wait-VmReady {
+  $st = Get-VmStatus
+  if ($st -ne 'RUNNING') {
+    Write-Host "[info] Starting VM... (was: $st)"
+    & gcloud compute instances start $vm "--project=$project" "--zone=$zone" | Out-Null
+  } else {
+    Write-Host '[info] VM already running.'
+  }
+  # Always wait for SSH: a just-created VM is RUNNING but sshd may not accept yet
+  Write-Host '[info] Waiting for SSH to be ready...'
+  if (-not (Wait-Ssh)) { Write-Warning 'SSH not ready after waiting; continuing (may fail).' }
 }
 function Stop-VmNow {
   Write-Host '[info] Stopping VM (halt billing)...'
@@ -128,7 +136,10 @@ function Remove-VmNow {
 }
 
 try {
-if ($StartStop -or $DeleteAfter) { Start-VmIfNeeded }
+# Always ensure the VM is up and sshd is accepting connections before the first
+# SSH/SCP. A just-created VM reports RUNNING but sshd may still refuse the first
+# connection ("Connection refused"), so we poll until SSH works.
+Wait-VmReady
 
 Write-Host "[info] Pushing tool to VM ($vm / $zone)..."
 Invoke-RemoteSsh "mkdir -p $remoteDir/scripts"
