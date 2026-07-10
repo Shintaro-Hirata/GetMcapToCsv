@@ -45,6 +45,20 @@ for f in get_mcap_to_csv.py requirements.txt topics.example.t2.json topics.examp
 done
 gcloud compute scp "${SSH_FLAGS[@]}" "$REPO_DIR/scripts/run_on_gcp.sh" "$REMOTE:$REMOTE_DIR/scripts/run_on_gcp.sh"
 
+# /t2 デコード用の私物パッケージを手元から VM へ転送 (VM での GitHub 認証を回避)
+ROS2IDL_REMOTE=""
+if [ -n "${ROS2IDL_LOCAL_PATH:-}" ]; then
+  if [ -d "$ROS2IDL_LOCAL_PATH" ]; then
+    echo "[info] mcap-ros2idl-support を VM へ転送..."
+    run_ssh "rm -rf $REMOTE_DIR/mcap-ros2idl-support"
+    gcloud compute scp --recurse "${SSH_FLAGS[@]}" "$ROS2IDL_LOCAL_PATH" \
+      "$REMOTE:$REMOTE_DIR/mcap-ros2idl-support"
+    ROS2IDL_REMOTE="$REMOTE_DIR/mcap-ros2idl-support"
+  else
+    echo "[warn] ROS2IDL_LOCAL_PATH が見つかりません: $ROS2IDL_LOCAL_PATH (スキップ)"
+  fi
+fi
+
 # 引数を安全に 1 つの文字列へ (空白を含む時刻等をクォート)
 ARGS=""
 for a in "$@"; do
@@ -53,6 +67,9 @@ done
 VENV_EXPORT=""
 if [ -n "${VENV_DIR:-}" ]; then
   VENV_EXPORT="VENV_DIR=$(printf '%q' "$VENV_DIR") "
+fi
+if [ -n "$ROS2IDL_REMOTE" ]; then
+  VENV_EXPORT+="ROS2IDL_PATH=$(printf '%q' "$ROS2IDL_REMOTE") "
 fi
 
 echo "[info] VM 上で抽出を実行 (GCS 読み込みは egress 無料)..."

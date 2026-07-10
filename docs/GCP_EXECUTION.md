@@ -16,22 +16,70 @@ mcap は全トピックが混在した zstd 圧縮チャンクで格納されて
  GCP内: GCS ──[ mcap 1.4GB / ¥0 ]──> VM(同一リージョン) ──変換──> CSV ──[ 数MB ]──> 手元PC
 ```
 
-## 前提と準備
+## いちばん簡単な手順（ゼロから VM を作る）
 
-- **バケットと同一リージョンの VM**。`t2-ft-original-data` を扱う zero-plotter の VM が
-  あればそれを流用できる（無ければ小さな VM を1台用意）。リージョン確認:
-  ```bash
-  gcloud storage buckets describe gs://t2-ft-original-data --format="value(location)"
-  ```
-  この location と同じリージョンに VM を置く（例 `asia-northeast1`）。
-- VM のサービスアカウントに **バケットの読み取り権限**（`roles/storage.objectViewer`）。
-- VM に **Python 3.10+** と、`/t2/*` デコード用の **mcap-ros2idl-support**。
-  zero-plotter の venv を流用するのが早い（`VENV_DIR` で指定可）。無ければ:
-  ```bash
-  git clone https://github.com/t2-auto/zero-plotter.git
-  pip install ./zero-plotter/mcap-ros2idl-support
-  ```
-- 手元 PC に **gcloud CLI**（認証済み）。
+初めてでもこの順でやれば動く。すべて手元 PC（Windows は Git Bash か WSL）で操作する。
+
+### 手順 0. バケットのリージョンを確認（済んでいれば飛ばす）
+
+```bash
+gcloud storage buckets describe gs://t2-ft-original-data --format="value(location)"
+```
+→ `ASIA-NORTHEAST1`（東京）と出る。VM も東京に作る。
+（このあと出る「components update してください」の案内は無視してよい。更新は不要。）
+
+### 手順 1. 設定ファイルを用意
+
+```bash
+cp scripts/gcp.env.example scripts/gcp.env
+```
+`scripts/gcp.env` を開いて最低限これだけ埋める:
+- `GCP_PROJECT` … 自分のプロジェクトID（`gcloud config get-value project` で確認）
+- `GCP_ZONE` … `asia-northeast1-a`（東京。そのままでよい）
+- `GCP_VM` … 好きな名前（例 `mcap-worker`）
+- `ROS2IDL_LOCAL_PATH` … 手元の `zero-plotter/mcap-ros2idl-support` フォルダのパス
+  （`/t2/*` を CSV 化するのに必要。GetMcapToCsv をローカルで動かせているなら手元にあるはず）
+
+### 手順 2. VM を1台作る（1コマンド）
+
+```bash
+bash scripts/gcp_create_vm.sh
+```
+東京リージョンに小さな VM（4 vCPU / 16GB / ディスク100GB / バケット読み取り権限つき）を作り、
+Python まで用意する。数分で終わる。
+
+### 手順 3. 抽出する（今までと同じ引数）
+
+```bash
+bash scripts/gcp_fetch.sh --vehicle GIGA09 --start "2026-07-01 20:40" \
+    --end "2026-07-01 20:45" --topics topics.example.t2.json
+```
+重い mcap は VM の中で処理され（GCS 読み込みは無料）、手元の `out/` には CSV だけ届く。
+
+### 手順 4. 使い終わったら VM を止める（課金を抑える）
+
+```bash
+gcloud compute instances stop <VM名> --zone asia-northeast1-a --project <プロジェクトID>
+```
+止めている間は VM の計算料金はかからない（ディスク分のわずかな料金のみ）。
+次に使うときは `start` で再開できる（作り直し不要）:
+```bash
+gcloud compute instances start <VM名> --zone asia-northeast1-a --project <プロジェクトID>
+```
+
+---
+
+## 前提（うまく動かないとき確認する）
+
+- 手元 PC に **gcloud CLI**（`gcloud auth login` 済み）。
+- VM は**バケットと同一リージョン**（東京）。`gcp_create_vm.sh` を使えば自動でそうなる。
+- VM のサービスアカウントに **バケット読み取り権限**（`roles/storage.objectViewer`）。
+  `gcp_create_vm.sh` は読み取りスコープを付けて作るが、組織のポリシーで別途 IAM 付与が
+  必要な場合がある。
+- `/t2/*`（ros2idl）のデコードには **mcap-ros2idl-support** が必須。
+  `ROS2IDL_LOCAL_PATH` を設定しておけば `gcp_fetch.sh` が VM へ自動で入れる
+  （VM 側で GitHub 認証は不要）。zero-plotter の VM を流用する場合はその venv を
+  `VENV_DIR` で指定してもよい。
 
 ## 使い方 A: 手元 PC から一発（推奨）
 

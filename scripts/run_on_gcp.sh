@@ -25,13 +25,23 @@ fi
 # shellcheck disable=SC1090
 source "$VENV_DIR/bin/activate"
 
-if ! python -c "import mcap, google.cloud.storage" 2>/dev/null; then
+# requirements.txt は private git 依存 (mcap-ros2idl-support) と streamlit を含むため
+# VM では使わず、CLI に必要なものだけを直接入れる (VM での GitHub 認証が不要になる)。
+if ! python -c "import mcap, mcap_protobuf, google.cloud.storage" 2>/dev/null; then
   echo "[info] 依存関係をインストール中..."
-  pip install --quiet -r requirements.txt
+  pip install --quiet "mcap>=1.3.0" "mcap-protobuf-support>=0.5.3" "google-cloud-storage>=2.14.0"
 fi
+
+# mcap-ros2idl-support (/t2/* デコード用) は ROS2IDL_PATH でローカルパスを渡すと入る。
+# gcp_fetch.sh が手元の zero-plotter/mcap-ros2idl-support を転送してここに渡す。
 if ! python -c "import mcap_ros2idl_support" 2>/dev/null; then
-  echo "[warn] mcap-ros2idl-support が未インストールです。/t2/* トピックはデコードできません。"
-  echo "       README の手順で zero-plotter/mcap-ros2idl-support を pip install してください。"
+  if [ -n "${ROS2IDL_PATH:-}" ] && [ -e "$ROS2IDL_PATH" ]; then
+    echo "[info] mcap-ros2idl-support をインストール: $ROS2IDL_PATH"
+    pip install --quiet "$ROS2IDL_PATH"
+  else
+    echo "[warn] mcap-ros2idl-support が未インストールです。/t2/* トピックはデコードできません。"
+    echo "       gcp.env の ROS2IDL_LOCAL_PATH に手元の zero-plotter/mcap-ros2idl-support を指定してください。"
+  fi
 fi
 
 # --- 抽出 (GCS 読み込みは VM 内なので egress 無料) ---
