@@ -29,7 +29,9 @@ source "$ENV_FILE"
 : "${GCP_PROJECT:?gcp.env に GCP_PROJECT を設定してください}"
 : "${GCP_ZONE:?gcp.env に GCP_ZONE を設定してください}"
 : "${GCP_VM:?gcp.env に GCP_VM を設定してください}"
-REMOTE_DIR="${REMOTE_DIR:-~/GetMcapToCsv}"
+# ホーム相対パス (先頭 ~/ は付けない。Windows 版と揃え、scp の ~ 展開問題も避ける)
+REMOTE_DIR="${REMOTE_DIR:-GetMcapToCsv}"
+REMOTE_DIR="${REMOTE_DIR#\~/}"
 LOCAL_OUT="${LOCAL_OUT:-out}"
 
 SSH_FLAGS=(--project "$GCP_PROJECT" --zone "$GCP_ZONE" ${GCLOUD_SSH_FLAGS:-})
@@ -53,7 +55,8 @@ if [ -n "${ROS2IDL_LOCAL_PATH:-}" ]; then
     run_ssh "rm -rf $REMOTE_DIR/mcap-ros2idl-support"
     gcloud compute scp --recurse "${SSH_FLAGS[@]}" "$ROS2IDL_LOCAL_PATH" \
       "$REMOTE:$REMOTE_DIR/mcap-ros2idl-support"
-    ROS2IDL_REMOTE="$REMOTE_DIR/mcap-ros2idl-support"
+    # run_on_gcp.sh はリポジトリルート ($REMOTE_DIR) に cd するので、そこからの相対で渡す
+    ROS2IDL_REMOTE="mcap-ros2idl-support"
   else
     echo "[warn] ROS2IDL_LOCAL_PATH が見つかりません: $ROS2IDL_LOCAL_PATH (スキップ)"
   fi

@@ -56,7 +56,9 @@ function Cfg([string]$key, $default = $null) {
 $project   = Cfg 'GCP_PROJECT'; if (-not $project) { throw 'gcp.env に GCP_PROJECT を設定してください' }
 $zone      = Cfg 'GCP_ZONE';    if (-not $zone)    { throw 'gcp.env に GCP_ZONE を設定してください' }
 $vm        = Cfg 'GCP_VM';      if (-not $vm)      { throw 'gcp.env に GCP_VM を設定してください' }
-$remoteDir = Cfg 'REMOTE_DIR' '~/GetMcapToCsv'
+$remoteDir = Cfg 'REMOTE_DIR' 'GetMcapToCsv'
+# 先頭の ~/ は pscp が展開できないので除去 (ホーム相対にする)
+$remoteDir = $remoteDir -replace '^~[/\\]', ''
 $localOut  = Cfg 'LOCAL_OUT' 'out'
 $venvDir   = Cfg 'VENV_DIR'
 $ros2idl   = Cfg 'ROS2IDL_LOCAL_PATH'
@@ -103,7 +105,8 @@ if ($ros2idl) {
     Write-Host '[info] mcap-ros2idl-support を VM へ転送...'
     Invoke-RemoteSsh "rm -rf $remoteDir/mcap-ros2idl-support"
     Invoke-Scp $ros2idl "${vm}:$remoteDir/mcap-ros2idl-support" -Recurse
-    $envExport += "ROS2IDL_PATH=$(Q "$remoteDir/mcap-ros2idl-support") "
+    # run_on_gcp.sh はリポジトリルート ($remoteDir) に cd するので、そこからの相対で渡す
+    $envExport += "ROS2IDL_PATH=$(Q 'mcap-ros2idl-support') "
   } else {
     Write-Warning "ROS2IDL_LOCAL_PATH が見つかりません: $ros2idl (スキップ)"
   }
