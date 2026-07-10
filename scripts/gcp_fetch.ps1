@@ -78,6 +78,21 @@ function Invoke-Scp($src, $dst, [switch]$Recurse) {
   & gcloud @a
   if ($LASTEXITCODE -ne 0) { throw "転送に失敗しました: $src -> $dst" }
 }
+# フォルダを tar に固めて転送し VM 側で展開する (pscp -r はリモートにフォルダを
+# 作れず失敗するため。単一ファイル scp なら pscp でも確実)。
+function Send-Folder($localDir, $remoteParent) {
+  $name = Split-Path -Leaf $localDir
+  $parent = Split-Path -Parent $localDir
+  $tmp = Join-Path $env:TEMP ("gcpfetch_" + $name + ".tgz")
+  # 重い/不要なものは除外 (venv やビルド成果物が混ざっても小さく確実に送れる)
+  & tar -czf $tmp '--exclude=.venv' '--exclude=venv' '--exclude=__pycache__' `
+      '--exclude=*.egg-info' '--exclude=build' '--exclude=dist' '--exclude=.git' `
+      -C $parent $name
+  if ($LASTEXITCODE -ne 0) { throw "tar 作成に失敗しました: $localDir" }
+  Invoke-Scp $tmp "${vm}:$remoteParent/$name.tgz"
+  Invoke-RemoteSsh "cd $remoteParent && rm -rf $name && tar -xzf $name.tgz && rm -f $name.tgz"
+  Remove-Item $tmp -ErrorAction SilentlyContinue
+}
 # bash 用に単一引用符でクォート (VM 側は bash で受ける)
 function Q([string]$s) { "'" + ($s -replace "'", "'\''") + "'" }
 
@@ -103,8 +118,7 @@ if ($venvDir) { $envExport += "VENV_DIR=$(Q $venvDir) " }
 if ($ros2idl) {
   if (Test-Path $ros2idl) {
     Write-Host '[info] mcap-ros2idl-support を VM へ転送...'
-    Invoke-RemoteSsh "rm -rf $remoteDir/mcap-ros2idl-support"
-    Invoke-Scp $ros2idl "${vm}:$remoteDir/mcap-ros2idl-support" -Recurse
+    Send-Folder $ros2idl $remoteDir
     # run_on_gcp.sh はリポジトリルート ($remoteDir) に cd するので、そこからの相対で渡す
     $envExport += "ROS2IDL_PATH=$(Q 'mcap-ros2idl-support') "
   } else {
