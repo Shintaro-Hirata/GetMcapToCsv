@@ -39,13 +39,40 @@ REMOTE="$GCP_VM"
 
 run_ssh() { gcloud compute ssh "$REMOTE" "${SSH_FLAGS[@]}" --command "$1"; }
 
-# --setup-auth を先頭引数から取り出す (残りは get_mcap_to_csv.py へ渡す)
+# --setup-auth / --start-stop を取り出す (残りは get_mcap_to_csv.py へ渡す)
 SETUP_AUTH=0
+START_STOP=0
 POS_ARGS=()
 for a in "$@"; do
-  if [ "$a" = "--setup-auth" ]; then SETUP_AUTH=1; else POS_ARGS+=("$a"); fi
+  case "$a" in
+    --setup-auth) SETUP_AUTH=1 ;;
+    --start-stop) START_STOP=1 ;;
+    *) POS_ARGS+=("$a") ;;
+  esac
 done
 set -- "${POS_ARGS[@]}"
+
+# --start-stop: 実行前に起動し、終了時 (エラー時も) 必ず停止する
+if [ "$START_STOP" = "1" ]; then
+  stop_vm() {
+    echo "[info] VM を停止します (課金を止める)..."
+    gcloud compute instances stop "$REMOTE" --project "$GCP_PROJECT" --zone "$GCP_ZONE" >/dev/null \
+      && echo "[ok] VM を停止しました。"
+  }
+  trap stop_vm EXIT
+  st=$(gcloud compute instances describe "$REMOTE" --project "$GCP_PROJECT" --zone "$GCP_ZONE" --format='value(status)' 2>/dev/null || echo UNKNOWN)
+  if [ "$st" != "RUNNING" ]; then
+    echo "[info] VM を起動中... (現在: $st)"
+    gcloud compute instances start "$REMOTE" --project "$GCP_PROJECT" --zone "$GCP_ZONE" >/dev/null
+    echo "[info] SSH の準備を待機中..."
+    for _ in $(seq 1 24); do
+      if gcloud compute ssh "$REMOTE" "${SSH_FLAGS[@]}" --command 'true' >/dev/null 2>&1; then break; fi
+      sleep 5
+    done
+  else
+    echo "[info] VM は起動済みです。"
+  fi
+fi
 
 echo "[info] VM ($GCP_VM / $GCP_ZONE) にツールを転送..."
 run_ssh "mkdir -p $REMOTE_DIR/scripts"

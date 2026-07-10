@@ -22,7 +22,8 @@ param(
   [switch]$IncludeImage,
   [string[]]$ExtraArgs,
   [string]$EnvFile,
-  [switch]$SetupAuth     # 手元の ADC を VM にコピーし、VM が自分の権限で GCS を読めるようにする (初回のみ)
+  [switch]$SetupAuth,    # 手元の ADC を VM にコピーし、VM が自分の権限で GCS を読めるようにする (初回のみ)
+  [switch]$StartStop     # 実行前に VM を起動し、終了後 (エラー時も) 必ず停止する (課金最小化)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -96,6 +97,31 @@ function Send-Folder($localDir, $remoteParent) {
 }
 # bash 用に単一引用符でクォート (VM 側は bash で受ける)
 function Q([string]$s) { "'" + ($s -replace "'", "'\''") + "'" }
+
+function Get-VmStatus {
+  return (& gcloud compute instances describe $vm "--project=$project" "--zone=$zone" --format='value(status)')
+}
+function Start-VmIfNeeded {
+  $st = Get-VmStatus
+  if ($st -eq 'RUNNING') { Write-Host '[info] VM は起動済みです。'; return }
+  Write-Host "[info] VM を起動中... (現在: $st)"
+  & gcloud compute instances start $vm "--project=$project" "--zone=$zone" | Out-Null
+  Write-Host '[info] SSH の準備を待機中...'
+  for ($i = 0; $i -lt 24; $i++) {
+    & gcloud compute ssh $vm @baseFlags --command 'true' 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) { return }
+    Start-Sleep -Seconds 5
+  }
+  Write-Warning 'SSH がまだ応答しませんが処理を続行します。'
+}
+function Stop-VmNow {
+  Write-Host '[info] VM を停止します (課金を止める)...'
+  & gcloud compute instances stop $vm "--project=$project" "--zone=$zone" | Out-Null
+  Write-Host '[ok] VM を停止しました。'
+}
+
+try {
+if ($StartStop) { Start-VmIfNeeded }
 
 Write-Host "[info] VM ($vm / $zone) にツールを転送..."
 Invoke-RemoteSsh "mkdir -p $remoteDir/scripts"
@@ -172,16 +198,21 @@ Invoke-RemoteSsh $runCmd
 
 if ($noCsvMode) {
   Write-Host '[ok] 完了 (一覧/見積もりモードのため CSV ダウンロードはありません)。'
-  return
+}
+else {
+  Write-Host '[info] CSV を手元へダウンロード...'
+  New-Item -ItemType Directory -Force -Path $localOut | Out-Null
+  $archive = Join-Path $localOut 'out_csv.tar.gz'
+  Invoke-Scp "${vm}:$remoteDir/out_csv.tar.gz" $archive
+  # Windows 10+ は tar.exe 同梱
+  & tar -xzf $archive -C $localOut
+  Remove-Item $archive -ErrorAction SilentlyContinue
+
+  Write-Host "[ok] 完了。CSV は $localOut\ に展開しました:"
+  Get-ChildItem -Path $localOut -Filter *.csv | ForEach-Object { Write-Host "  $($_.Name)" }
 }
 
-Write-Host '[info] CSV を手元へダウンロード...'
-New-Item -ItemType Directory -Force -Path $localOut | Out-Null
-$archive = Join-Path $localOut 'out_csv.tar.gz'
-Invoke-Scp "${vm}:$remoteDir/out_csv.tar.gz" $archive
-# Windows 10+ は tar.exe 同梱
-& tar -xzf $archive -C $localOut
-Remove-Item $archive -ErrorAction SilentlyContinue
-
-Write-Host "[ok] 完了。CSV は $localOut\ に展開しました:"
-Get-ChildItem -Path $localOut -Filter *.csv | ForEach-Object { Write-Host "  $($_.Name)" }
+}
+finally {
+  if ($StartStop) { Stop-VmNow }
+}

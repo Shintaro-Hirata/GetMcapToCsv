@@ -129,14 +129,37 @@ PowerShell 版の主なオプション: `-AllTopics`（全トピック）、`-In
 
 ### 手順 4. 使い終わったら VM を止める（課金を抑える）
 
-```bash
+手動で止める場合:
+```powershell
 gcloud compute instances stop <VM名> --zone asia-northeast1-a --project <プロジェクトID>
 ```
 止めている間は VM の計算料金はかからない（ディスク分のわずかな料金のみ）。
-次に使うときは `start` で再開できる（作り直し不要）:
-```bash
+次に使うときは `start` で再開:
+```powershell
 gcloud compute instances start <VM名> --zone asia-northeast1-a --project <プロジェクトID>
 ```
+
+**おすすめ: `-StartStop` で自動化。** 付けると「起動 → 抽出 → 停止」を1コマンドで行い、
+**エラーで落ちても必ず停止**する（止め忘れ防止）。
+```powershell
+.\scripts\gcp_fetch.ps1 -StartStop -Vehicle GIGA09 -Start "2026-07-01 20:40" -End "2026-07-01 20:45" -Topics topics.example.t2.json
+```
+bash 版は `--start-stop`:
+```bash
+bash scripts/gcp_fetch.sh --start-stop --vehicle GIGA09 --start "..." --end "..." --topics topics.example.t2.json
+```
+
+### コストの考え方（停止運用が正解）
+
+| 状態 | 課金（e2-standard-4 / 東京の目安） |
+|------|-----------------------------------|
+| 起動中 | 約 ¥25〜30/時（起動しっぱなしは月 ~¥18,000） |
+| 停止中 | 計算は ¥0。ブートディスク 100GB のみ ~¥1,500/月 継続 |
+
+- **使う時だけ起動 → 終わったら停止**（`-StartStop`）で 1 回あたり実質 ¥6〜8 程度。
+- ディスク代を下げるなら、VM 作成時に gcp.env で `BOOT_DISK_GB=30` 程度に。
+  長期間使わないなら VM ごと削除してもよい（`gcloud compute instances delete <VM名> ...`）。
+  次回は `gcp_create_vm` で作り直す。
 
 ---
 
