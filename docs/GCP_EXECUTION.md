@@ -149,17 +149,51 @@ bash 版は `--start-stop`:
 bash scripts/gcp_fetch.sh --start-stop --vehicle GIGA09 --start "..." --end "..." --topics topics.example.t2.json
 ```
 
-### コストの考え方（停止運用が正解）
+### かかるコストの一覧
 
-| 状態 | 課金（e2-standard-4 / 東京の目安） |
-|------|-----------------------------------|
-| 起動中 | 約 ¥25〜30/時（起動しっぱなしは月 ~¥18,000） |
-| 停止中 | 計算は ¥0。ブートディスク 100GB のみ ~¥1,500/月 継続 |
+| コスト | いつ | 目安（e2-standard-4 / 東京） | 抑え方 |
+|--------|------|------------------------------|--------|
+| vCPU + メモリ | 起動中のみ | 約 ¥25〜30/時 | 停止すれば ¥0 |
+| **ブートディスク** | **VM が存在する限り常時**（停止中も） | 30GB≒¥450/月 · 100GB≒¥1,500/月 | ディスクを小さく / VM 削除 |
+| 外部 IP（ephemeral） | 起動中のみ | 約 ¥0.7/時 | 停止で解放・¥0 |
+| egress（VM→PC の CSV） | 抽出時 | CSV サイズ分（数 MB≒¥0） | 実質無視 |
+| GCS 操作 / 同一リージョン読み取り | 抽出時 | 1 円未満 / 無料 | 無視 |
 
-- **使う時だけ起動 → 終わったら停止**（`-StartStop`）で 1 回あたり実質 ¥6〜8 程度。
-- ディスク代を下げるなら、VM 作成時に gcp.env で `BOOT_DISK_GB=30` 程度に。
-  長期間使わないなら VM ごと削除してもよい（`gcloud compute instances delete <VM名> ...`）。
-  次回は `gcp_create_vm` で作り直す。
+standing（放置していてもかかる）コストは実質**ブートディスクだけ**。消し方は 2 つ:
+
+### 運用モデル A: VM を残す + 小さいディスク + `-StartStop`（頻繁に使う人向け）
+
+- `BOOT_DISK_GB=30` で作成（既定）。停止中のディスク代は**約 ¥450/月**。
+- 毎回 `-StartStop` で起動→抽出→停止。1 回あたり実質 ¥6〜8。
+- セットアップ（依存・ADC）は一度きり。すぐ使える。
+```powershell
+.\scripts\gcp_fetch.ps1 -StartStop -Vehicle GIGA09 -Start "..." -End "..." -Topics topics.example.t2.json
+```
+
+### 運用モデル B: 毎回 VM を作って消す（`-DeleteAfter`）（たまにしか使わない人向け・standing ¥0）
+
+- 抽出後に **VM をディスクごと削除**するので、使っていない間の料金は**完全にゼロ**。
+- 代わりに毎回 VM 作成（数分）＋依存インストール＋`-SetupAuth` が必要（時間はかかる）。
+```powershell
+# 1. VM を作る (毎回)
+.\scripts\gcp_create_vm.ps1
+# 2. ADC を入れて抽出し、終わったら VM を削除
+.\scripts\gcp_fetch.ps1 -SetupAuth -DeleteAfter -Vehicle GIGA09 -Start "..." -End "..." -Topics topics.example.t2.json
+```
+`-DeleteAfter` はエラーで落ちても削除するので、消し忘れがない。bash 版は `--delete-after`。
+
+> どちらでも VM は使う時だけ課金される。**月に数回なら B（standing ¥0）**、
+> **週に何度も使うなら A（小さいディスクを残す）**が快適。
+
+### 既存 VM に相乗りする（VM を自分で持たない）
+
+バケットを扱える既存 VM（例: zero-plotter の VM）に SSH できるなら、そこを使えば
+**自分のディスク・VM コストはゼロ**（その VM の持ち主が費用を持つ）。gcp.env の
+`GCP_VM`/`GCP_PROJECT`/`GCP_ZONE` をその VM に向け、`gcp_create_vm` は使わず
+`gcp_fetch`（`-StartStop`/`-DeleteAfter` は付けない）だけ実行する。
+ただし他人の VM で重い処理を回すことになるので、**持ち主の許可と SSH アクセス権**が前提。
+その VM に mcap-ros2idl-support が既に入っていれば `ROS2IDL_LOCAL_PATH` も不要
+（`VENV_DIR` でその環境を指す）。
 
 ---
 

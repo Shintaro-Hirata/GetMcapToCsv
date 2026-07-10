@@ -23,7 +23,8 @@ param(
   [string[]]$ExtraArgs,
   [string]$EnvFile,
   [switch]$SetupAuth,    # 手元の ADC を VM にコピーし、VM が自分の権限で GCS を読めるようにする (初回のみ)
-  [switch]$StartStop     # 実行前に VM を起動し、終了後 (エラー時も) 必ず停止する (課金最小化)
+  [switch]$StartStop,    # 実行前に VM を起動し、終了後 (エラー時も) 必ず停止する (課金最小化)
+  [switch]$DeleteAfter   # 終了後 (エラー時も) VM をディスクごと削除する (停止中ディスク代もゼロに)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -119,9 +120,14 @@ function Stop-VmNow {
   & gcloud compute instances stop $vm "--project=$project" "--zone=$zone" | Out-Null
   Write-Host '[ok] VM を停止しました。'
 }
+function Remove-VmNow {
+  Write-Host '[info] VM をディスクごと削除します (以後の標準料金をゼロに)...'
+  & gcloud compute instances delete $vm "--project=$project" "--zone=$zone" --quiet | Out-Null
+  Write-Host '[ok] VM を削除しました。次回は gcp_create_vm.ps1 で作り直してください。'
+}
 
 try {
-if ($StartStop) { Start-VmIfNeeded }
+if ($StartStop -or $DeleteAfter) { Start-VmIfNeeded }
 
 Write-Host "[info] VM ($vm / $zone) にツールを転送..."
 Invoke-RemoteSsh "mkdir -p $remoteDir/scripts"
@@ -214,5 +220,6 @@ else {
 
 }
 finally {
-  if ($StartStop) { Stop-VmNow }
+  if ($DeleteAfter) { Remove-VmNow }
+  elseif ($StartStop) { Stop-VmNow }
 }

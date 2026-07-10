@@ -53,7 +53,7 @@ gcp.env が未編集です (GCP_PROJECT / GCP_VM がサンプルのまま)。実
 }
 
 $machineType = Cfg 'MACHINE_TYPE' 'e2-standard-4'
-$bootDiskGb  = Cfg 'BOOT_DISK_GB' '100'
+$bootDiskGb  = Cfg 'BOOT_DISK_GB' '30'   # OS + 一時ファイルに十分。停止中ディスク代を抑える (30GB≒月¥450)
 $imageFamily = Cfg 'IMAGE_FAMILY' 'debian-12'
 $imageProj   = Cfg 'IMAGE_PROJECT' 'debian-cloud'
 $private     = (Cfg 'PRIVATE' '0') -eq '1'

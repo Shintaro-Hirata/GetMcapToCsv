@@ -30,7 +30,7 @@ fi
 
 # 既定値 (必要なら gcp.env で上書き可能)
 MACHINE_TYPE="${MACHINE_TYPE:-e2-standard-4}"     # 4 vCPU / 16GB。並列デコードに十分
-BOOT_DISK_GB="${BOOT_DISK_GB:-100}"               # キャッシュ + 一時ファイル用に余裕を持たせる
+BOOT_DISK_GB="${BOOT_DISK_GB:-30}"                # OS + 一時ファイルに十分。停止中ディスク代を抑える (30GB≒月¥450)
 IMAGE_FAMILY="${IMAGE_FAMILY:-debian-12}"
 IMAGE_PROJECT="${IMAGE_PROJECT:-debian-cloud}"
 # PRIVATE=0 (既定): 外部IP付きの標準的な VM (SSH は IAM/鍵で保護)。手順が単純で詰まりにくい。

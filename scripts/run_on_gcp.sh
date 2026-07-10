@@ -53,9 +53,11 @@ for a in "$@"; do
 done
 
 # --- 抽出 (GCS 読み込みは VM 内なので egress 無料) ---
+# VM ではキャッシュを持たない (--no-cache)。egress 無料なので再読み込みしても課金されず、
+# ディスクを小さく保てる (キャッシュでディスクが膨らむのを防ぐ)。
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
-python get_mcap_to_csv.py "$@" --outdir "$OUT_DIR"
+python get_mcap_to_csv.py "$@" --outdir "$OUT_DIR" --no-cache
 
 if [ "$NO_CSV" = "1" ]; then
   echo "[ok] 一覧/見積もりモードのため CSV 出力はありません。"
