@@ -28,7 +28,18 @@ gcloud storage buckets describe gs://t2-ft-original-data --format="value(locatio
 → `ASIA-NORTHEAST1`（東京）と出る。VM も東京に作る。
 （このあと出る「components update してください」の案内は無視してよい。更新は不要。）
 
-### 手順 1. 設定ファイルを用意
+### 手順 1a. mcap-ros2idl-support を手元に用意（/t2 デコードに必須）
+
+`/t2/*` トピックのデコードに使う社内パッケージ。zero-plotter リポジトリの一部フォルダなので、
+リポジトリを clone してそのフォルダを使う（zero-plotter の開発者でなくても read 権限があれば取得可）。
+
+```bash
+cd ~/Desktop/Dev     # 好きな場所
+git clone -b yatagarasu/main https://github.com/t2-auto/zero-plotter.git
+# → ~/Desktop/Dev/zero-plotter/mcap-ros2idl-support ができる
+```
+
+### 手順 1b. 設定ファイルを用意
 
 ```bash
 cp scripts/gcp.env.example scripts/gcp.env
@@ -37,8 +48,8 @@ cp scripts/gcp.env.example scripts/gcp.env
 - `GCP_PROJECT` … 自分のプロジェクトID（`gcloud config get-value project` で確認）
 - `GCP_ZONE` … `asia-northeast1-a`（東京。そのままでよい）
 - `GCP_VM` … 好きな名前（例 `mcap-worker`）
-- `ROS2IDL_LOCAL_PATH` … 手元の `zero-plotter/mcap-ros2idl-support` フォルダのパス
-  （`/t2/*` を CSV 化するのに必要。GetMcapToCsv をローカルで動かせているなら手元にあるはず）
+- `ROS2IDL_LOCAL_PATH` … 手順 1a で clone した `zero-plotter/mcap-ros2idl-support` のパス
+- （最小公開 VM を使うので）`GCLOUD_SSH_FLAGS="--tunnel-through-iap"` の行を有効化
 
 ### 手順 2. VM を1台作る（1コマンド）
 
@@ -47,6 +58,16 @@ bash scripts/gcp_create_vm.sh
 ```
 東京リージョンに小さな VM（4 vCPU / 16GB / ディスク100GB / バケット読み取り権限つき）を作り、
 Python まで用意する。数分で終わる。
+
+既定は**最小公開**（`PRIVATE=1`）で作る:
+- **外部 IP なし** … インターネットから一切到達不可
+- **IAP トンネル SSH のみ** … 接続にあなたの Google 認証が必須（IAP 用ファイアウォールも自動作成）
+- **OS Login** … SSH ログインを IAM ユーザー単位に限定
+
+つまり **VM の中に入れる・データに触れるのはあなただけ**になる。
+（プロジェクトに強い権限を持つ人にはコンソール上で「VM が存在すること」自体は見えるが、
+中に入ることはできない。存在ごと隠したい場合は自分専用プロジェクトを作るしかない — 下の
+「完全に隠したい場合」参照。標準的な外部IP付きにしたいなら gcp.env で `PRIVATE=0`。）
 
 ### 手順 3. 抽出する（今までと同じ引数）
 
@@ -68,6 +89,23 @@ gcloud compute instances start <VM名> --zone asia-northeast1-a --project <プ�
 ```
 
 ---
+
+## VM を「自分だけ」に近づける（セキュリティ）
+
+`gcp_create_vm.sh` の既定（`PRIVATE=1`）で以下が有効になる:
+
+| 設定 | 効果 |
+|------|------|
+| 外部 IP なし (`--no-address`) | インターネットから到達不可。SSH は IAP トンネルのみ |
+| IAP SSH + ファイアウォール | 接続にあなたの Google 認証が必須。`35.235.240.0/20` からの tcp:22 のみ許可 |
+| OS Login | SSH ログインを IAM ユーザーに限定（鍵の共有ではなくアカウント単位） |
+| storage 読み取りスコープのみ | VM ができるのはバケット読み取りだけ |
+
+**完全に隠したい場合**: 上記でも、プロジェクトの Owner/Editor には VM の存在は見える
+（GCP はプロジェクト単位で権限が効くため）。それも避けたいなら、**自分専用の GCP プロジェクト**を
+作ってそこに VM を置くのが唯一の完全解。その場合 `gcp.env` の `GCP_PROJECT` を専用プロジェクトに
+すればスクリプトはそのまま使える（バケットは別プロジェクトのままでよいが、VM のサービスアカウントに
+`t2-ft-original-data` の読み取り権限を付与する必要がある）。
 
 ## 前提（うまく動かないとき確認する）
 
