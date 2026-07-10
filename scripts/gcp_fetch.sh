@@ -39,6 +39,14 @@ REMOTE="$GCP_VM"
 
 run_ssh() { gcloud compute ssh "$REMOTE" "${SSH_FLAGS[@]}" --command "$1"; }
 
+# --setup-auth を先頭引数から取り出す (残りは get_mcap_to_csv.py へ渡す)
+SETUP_AUTH=0
+POS_ARGS=()
+for a in "$@"; do
+  if [ "$a" = "--setup-auth" ]; then SETUP_AUTH=1; else POS_ARGS+=("$a"); fi
+done
+set -- "${POS_ARGS[@]}"
+
 echo "[info] VM ($GCP_VM / $GCP_ZONE) にツールを転送..."
 run_ssh "mkdir -p $REMOTE_DIR/scripts"
 # 実行に必要な最小ファイルだけ転送 (mcap 本体は転送しない)
@@ -75,6 +83,20 @@ if [ -n "${VENV_DIR:-}" ]; then
 fi
 if [ -n "$ROS2IDL_REMOTE" ]; then
   VENV_EXPORT+="ROS2IDL_PATH=$(printf '%q' "$ROS2IDL_REMOTE") "
+fi
+
+# 手元の ADC を VM にコピー (VM が自分の権限で GCS を読めるようにする。IAM 変更不要)
+if [ "$SETUP_AUTH" = "1" ]; then
+  ADC="${GOOGLE_APPLICATION_CREDENTIALS:-$HOME/.config/gcloud/application_default_credentials.json}"
+  if [ ! -f "$ADC" ]; then
+    echo "[error] ローカルの ADC が見つかりません: $ADC"
+    echo "        先に 'gcloud auth application-default login' を実行してください。"
+    exit 1
+  fi
+  echo "[info] ローカルの認証情報 (ADC) を VM へコピー..."
+  run_ssh "mkdir -p .config/gcloud"
+  gcloud compute scp "${SSH_FLAGS[@]}" "$ADC" "$REMOTE:.config/gcloud/application_default_credentials.json"
+  echo "[ok] 以後この VM はあなたの権限で GCS を読みます。"
 fi
 
 echo "[info] VM 上で抽出を実行 (GCS 読み込みは egress 無料)..."

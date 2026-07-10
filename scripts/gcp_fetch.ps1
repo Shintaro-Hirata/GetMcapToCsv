@@ -21,7 +21,8 @@ param(
   [switch]$IncludeSensor,
   [switch]$IncludeImage,
   [string[]]$ExtraArgs,
-  [string]$EnvFile
+  [string]$EnvFile,
+  [switch]$SetupAuth     # 手元の ADC を VM にコピーし、VM が自分の権限で GCS を読めるようにする (初回のみ)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -126,6 +127,25 @@ if ($ros2idl) {
   } else {
     Write-Warning "ROS2IDL_LOCAL_PATH が見つかりません: $ros2idl (スキップ)"
   }
+}
+
+# 手元の ADC (application-default 認証) を VM にコピー。VM のサービスアカウントではなく
+# 自分の権限で GCS を読めるようになる (バケット側の IAM 変更が不要)。
+if ($SetupAuth) {
+  $adc = if ($env:GOOGLE_APPLICATION_CREDENTIALS) { $env:GOOGLE_APPLICATION_CREDENTIALS }
+         else { Join-Path $env:APPDATA 'gcloud\application_default_credentials.json' }
+  if (-not (Test-Path $adc)) {
+    throw @"
+ローカルの ADC が見つかりません: $adc
+先に PowerShell で次を実行してください (ブラウザで認証):
+  gcloud auth application-default login
+その後もう一度 -SetupAuth 付きで実行してください。
+"@
+  }
+  Write-Host '[info] ローカルの認証情報 (ADC) を VM へコピー...'
+  Invoke-RemoteSsh 'mkdir -p .config/gcloud'
+  Invoke-Scp $adc "${vm}:.config/gcloud/application_default_credentials.json"
+  Write-Host '[ok] 以後この VM はあなたの権限で GCS を読みます。'
 }
 
 # 抽出引数を組み立てる

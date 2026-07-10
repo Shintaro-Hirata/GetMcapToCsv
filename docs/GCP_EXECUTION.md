@@ -84,23 +84,32 @@ Python まで用意する。数分で終わる。
 ### 手順 2.5. VM にバケット読み取り権限を持たせる（初回のみ）
 
 VM の中の抽出は既定で **VM のサービスアカウント**の権限で GCS を読む。別プロジェクトの
-バケット（`t2-ft-original-data`）はそのままでは読めないことが多い。
+バケット（`t2-ft-original-data`）はそのままでは読めず、`403 ... does not have
+storage.objects.list access` になる。自分は読めるので、**自分の認証 (ADC) を VM に
+コピー**して自分の権限で読ませる（バケット側の IAM 変更不要）。
 
-自分（バケットを読めるアカウント）の認証を VM に一度だけ入れると、その権限で動く
-（バケット側の IAM 変更が不要）:
 ```powershell
-gcloud compute ssh <VM名> --zone asia-northeast1-a --project <PROJECT> `
-  --command "gcloud auth application-default login --no-launch-browser"
-```
-表示された URL をブラウザで開いて認証し、出たコードを貼り戻す。以後この VM は
-あなたの権限で GCS を読む。
+# 1. 手元 PC で一度だけ ADC を作る (ブラウザで認証)
+gcloud auth application-default login
 
-まず軽い確認（ダウンロードなし）で読めるかを見ておくと安全:
-```powershell
-.\scripts\gcp_fetch.ps1 -Vehicle GIGA09 -Start "2026-07-01 20:40" -End "2026-07-01 20:45" -ExtraArgs "--list-only","--all-topics"
+# 2. 抽出時に -SetupAuth を付けると ADC を VM にコピーしてから実行する (初回のみ)
+.\scripts\gcp_fetch.ps1 -SetupAuth -Vehicle GIGA09 -Start "2026-07-01 20:40" -End "2026-07-01 20:45" -ExtraArgs "--list-only","--all-topics"
 ```
-対象ファイルが一覧表示されれば権限 OK。`403` 等が出たら上の application-default login を
-実施する（または VM のサービスアカウントにバケットの `roles/storage.objectViewer` を付与）。
+bash 版は同じ意味で `--setup-auth` を付ける:
+```bash
+bash scripts/gcp_fetch.sh --setup-auth --vehicle GIGA09 --start "..." --end "..." --list-only --all-topics
+```
+2回目以降は `-SetupAuth`（`--setup-auth`）は不要。対象ファイルが一覧表示されれば権限 OK。
+
+> セキュリティ補足: `-SetupAuth` はあなたの個人 ADC を VM 上に置く。共有プロジェクトの
+> VM で他者が SSH できる場合、その資格情報を読めてしまう点に留意。代替として、管理者に
+> **VM のサービスアカウントへバケット読み取り権限**を付与してもらう手もある:
+> ```
+> gcloud storage buckets add-iam-policy-binding gs://t2-ft-original-data \
+>   --member="serviceAccount:<VMのSA>" --role="roles/storage.objectViewer"
+> ```
+> （`<VMのSA>` は 403 エラーに出る `...-compute@developer.gserviceaccount.com`。
+> ただし既定 SA はプロジェクト内の全 VM 共通なので、専用 SA の利用が望ましい。）
 
 ### 手順 3. 抽出する
 
