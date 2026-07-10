@@ -128,6 +128,38 @@ gcloud compute instances start <VM名> --zone asia-northeast1-a --project <プ�
 すればスクリプトはそのまま使える（バケットは別プロジェクトのままでよいが、VM のサービスアカウントに
 `t2-ft-original-data` の読み取り権限を付与する必要がある）。
 
+## VM 作成でつまずくとき
+
+### `プロジェクト : your-project-id` のまま / PERMISSION_DENIED
+
+`gcp.env` の `GCP_PROJECT` を**実際のプロジェクトID**に書き換えていないと起きる。
+自分が使えるプロジェクトを確認:
+```bash
+gcloud projects list                 # アクセスできるプロジェクト一覧
+gcloud config get-value project      # 既定のプロジェクト
+```
+出てきた **PROJECT_ID**（表示名ではなく ID）を `gcp.env` の `GCP_PROJECT` に設定する。
+
+### `Permission denied to enable service [compute.googleapis.com]` / VM 作成が権限で失敗
+
+そのプロジェクトで **Compute Engine を使う権限が自分に無い**。これは各自の GCP の
+権限設定しだいで、ツール側では解決できない。対処は次のいずれか:
+
+1. **Compute を使えるプロジェクトに変える** — 別プロジェクトで権限があるならそれを使う。
+2. **管理者に依頼する** — 対象プロジェクトで以下を有効化・付与してもらう:
+   - Compute Engine API の有効化（`compute.googleapis.com`）
+   - 自分のアカウントに `roles/compute.instanceAdmin.v1`（VM 作成・起動停止）
+   - （最小公開 VM を使うなら）`roles/compute.securityAdmin`（ファイアウォール作成）
+3. **既存の VM を間借りする（VM を自作しない）** — バケットを扱える VM
+   （例: zero-plotter の VM）に SSH できるなら、`gcp_create_vm` は実行せず、`gcp.env` の
+   `GCP_VM` にその VM 名、`GCP_PROJECT`/`GCP_ZONE` をその VM のものにして、
+   `gcp_fetch` だけを使う。VM に mcap-ros2idl-support が既に入っていれば
+   `ROS2IDL_LOCAL_PATH` は不要（`VENV_DIR` でその venv を指す手もある）。
+
+どのプロジェクトでも Compute の権限が無い場合は、管理者に「解析用の小さな VM を1台
+作れるようにしてほしい（Compute Engine の有効化と compute.instanceAdmin.v1 付与）」と
+依頼するのが早い。
+
 ## 前提（うまく動かないとき確認する）
 
 - 手元 PC に **gcloud CLI**（`gcloud auth login` 済み）。

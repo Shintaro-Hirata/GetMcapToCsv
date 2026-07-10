@@ -20,6 +20,14 @@ source "$ENV_FILE"
 : "${GCP_ZONE:?gcp.env に GCP_ZONE を設定してください}"
 : "${GCP_VM:?gcp.env に GCP_VM を設定してください}"
 
+if [ "$GCP_PROJECT" = "your-project-id" ] || [ "$GCP_VM" = "your-vm-name" ]; then
+  echo "[error] gcp.env が未編集です (GCP_PROJECT / GCP_VM がサンプルのまま)。実際の値に書き換えてください。"
+  echo "        現在の GCP_PROJECT = '$GCP_PROJECT'"
+  echo "        使えるプロジェクト: gcloud projects list"
+  echo "        既定プロジェクト  : gcloud config get-value project"
+  exit 1
+fi
+
 # 既定値 (必要なら gcp.env で上書き可能)
 MACHINE_TYPE="${MACHINE_TYPE:-e2-standard-4}"     # 4 vCPU / 16GB。並列デコードに十分
 BOOT_DISK_GB="${BOOT_DISK_GB:-100}"               # キャッシュ + 一時ファイル用に余裕を持たせる

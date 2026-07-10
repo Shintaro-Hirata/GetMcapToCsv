@@ -43,6 +43,15 @@ $project = Cfg 'GCP_PROJECT'; if (-not $project) { throw 'gcp.env に GCP_PROJEC
 $zone    = Cfg 'GCP_ZONE';    if (-not $zone)    { throw 'gcp.env に GCP_ZONE を設定してください' }
 $vm      = Cfg 'GCP_VM';      if (-not $vm)      { throw 'gcp.env に GCP_VM を設定してください' }
 
+if ($project -eq 'your-project-id' -or $vm -eq 'your-vm-name') {
+  throw @"
+gcp.env が未編集です (GCP_PROJECT / GCP_VM がサンプルのまま)。実際の値に書き換えてください。
+  現在の GCP_PROJECT = '$project'
+使えるプロジェクトの一覧:  gcloud projects list
+既定のプロジェクト確認  :  gcloud config get-value project
+"@
+}
+
 $machineType = Cfg 'MACHINE_TYPE' 'e2-standard-4'
 $bootDiskGb  = Cfg 'BOOT_DISK_GB' '100'
 $imageFamily = Cfg 'IMAGE_FAMILY' 'debian-12'
