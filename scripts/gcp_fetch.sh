@@ -99,8 +99,21 @@ if [ "$SETUP_AUTH" = "1" ]; then
   echo "[ok] 以後この VM はあなたの権限で GCS を読みます。"
 fi
 
+# 一覧/確認/見積もりモードは CSV を出さないので、実行だけで終わる
+NO_CSV_MODE=0
+for a in "$@"; do
+  case "$a" in
+    --list-only | --list-topics | --estimate) NO_CSV_MODE=1 ;;
+  esac
+done
+
 echo "[info] VM 上で抽出を実行 (GCS 読み込みは egress 無料)..."
 run_ssh "cd $REMOTE_DIR && ${VENV_EXPORT}bash scripts/run_on_gcp.sh$ARGS"
+
+if [ "$NO_CSV_MODE" = "1" ]; then
+  echo "[ok] 完了 (一覧/見積もりモードのため CSV ダウンロードはありません)。"
+  exit 0
+fi
 
 echo "[info] CSV を手元へダウンロード..."
 mkdir -p "$LOCAL_OUT"

@@ -164,8 +164,16 @@ if ($ra.Count -eq 0) { throw '抽出引数がありません。-Vehicle/-Start/-
 $remoteArgs = ($ra | ForEach-Object { Q $_ }) -join ' '
 $runCmd = "cd $remoteDir && $envExport" + "bash scripts/run_on_gcp.sh $remoteArgs"
 
+# 一覧/確認/見積もりモードは CSV を出さないので、実行だけで終わる
+$noCsvMode = @('--list-only', '--list-topics', '--estimate') | Where-Object { $ra -contains $_ }
+
 Write-Host '[info] VM 上で抽出を実行 (GCS 読み込みは egress 無料)...'
 Invoke-RemoteSsh $runCmd
+
+if ($noCsvMode) {
+  Write-Host '[ok] 完了 (一覧/見積もりモードのため CSV ダウンロードはありません)。'
+  return
+}
 
 Write-Host '[info] CSV を手元へダウンロード...'
 New-Item -ItemType Directory -Force -Path $localOut | Out-Null

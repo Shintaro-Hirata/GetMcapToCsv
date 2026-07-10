@@ -44,10 +44,23 @@ if ! python -c "import mcap_ros2idl_support" 2>/dev/null; then
   fi
 fi
 
+# 一覧・トピック確認・見積もりモードは CSV を出さない (成功扱いで抜ける)
+NO_CSV=0
+for a in "$@"; do
+  case "$a" in
+    --list-only | --list-topics | --estimate) NO_CSV=1 ;;
+  esac
+done
+
 # --- 抽出 (GCS 読み込みは VM 内なので egress 無料) ---
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 python get_mcap_to_csv.py "$@" --outdir "$OUT_DIR"
+
+if [ "$NO_CSV" = "1" ]; then
+  echo "[ok] 一覧/見積もりモードのため CSV 出力はありません。"
+  exit 0
+fi
 
 # --- CSV を 1 つの tar.gz にまとめる (取り出しを scp 1 回で済ませる) ---
 ARCHIVE="${ARCHIVE:-out_csv.tar.gz}"
