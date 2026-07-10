@@ -542,9 +542,10 @@ if ss.sources:
                 lines = [f"チャンクスキップ後の転送量: {core.size_str(needed)} / "
                          f"全体 {core.size_str(total)} (削減 {pct:.1f}%, "
                          f"{core.cost_str(total)} → {core.cost_str(needed)})"]
-                if agg["win_uncomp"]:
+                if agg["sel_uncomp"] is not None and agg["win_uncomp"]:
+                    approx = "≈" if agg.get("ratio_sampled") else ""
                     share = 100.0 * agg["sel_uncomp"] / agg["win_uncomp"]
-                    lines.append(f"選択トピックの実データ比率: {share:.1f}% (非圧縮換算)")
+                    lines.append(f"選択トピックの実データ比率: {approx}{share:.1f}% (非圧縮換算)")
                     if agg["compressions"] <= {"none", ""}:
                         lines.append(f"チャンクが非圧縮のため、メッセージ単位取得を実装すれば"
                                      f"理論上 約{100 - share:.0f}% 削減の余地あり (未実装・要相談)")

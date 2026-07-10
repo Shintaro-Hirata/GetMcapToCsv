@@ -1315,34 +1315,56 @@ def _parse_message_indexes(buf):
         i += 9 + ln
     return out
 
-# メッセージインデックスの読み込み量の上限 (見積もりが高くつかないように)
-_ESTIMATE_MAX_INDEX_BYTES = 16 * 1024 * 1024
+def _sample_selected_uncomp(f, chunk_index, sel_ids):
+    """1 チャンクのメッセージインデックスだけ読み、(選択トピックの非圧縮バイト, チャンク非圧縮バイト)。
+
+    チャンク本体は読まず、末尾のメッセージインデックス (数十KB) だけをシーク読みする。
+    """
+    ci = chunk_index
+    if not ci.message_index_length:
+        return 0, ci.uncompressed_size
+    f.seek(ci.chunk_start_offset + ci.chunk_length)
+    buf = f.read(ci.message_index_length)
+    offsets = _parse_message_indexes(buf)
+    all_offs = sorted(o for offs in offsets.values() for o in offs)
+    bounds = all_offs + [ci.uncompressed_size]
+    span = {o: bounds[k + 1] - o for k, o in enumerate(all_offs)}
+    sel = sum(span.get(o, 0) for cid in sel_ids for o in offsets.get(cid, []))
+    return sel, ci.uncompressed_size
 
 
-def analyze_transfer(source, topics, start_ns=None, end_ns=None, cache_dir=None):
+def analyze_transfer(source, topics, start_ns=None, end_ns=None, cache_dir=None,
+                     sample_chunks=3):
     """1 ファイルについて、選択トピック抽出に必要な転送量をサマリから見積もる。
 
+    合計値 (total/needed/win_uncomp/圧縮方式) はサマリのみから即座に求める
+    (追加ダウンロードなし)。実データ比率のための非圧縮バイトは、先頭付近の
+    最大 sample_chunks 個のチャンクのメッセージインデックスだけを読み、
+    その比率を必要チャンク全体へ外挿する (0 なら比率は測らない)。
+
     戻り値 dict:
-      total_bytes      : 時間帯内チャンクの合計 (一括ダウンロード相当の対象部分)
+      total_bytes      : 時間帯内チャンクの合計 (一括ダウンロード相当)
       needed_bytes     : 選択トピックを含むチャンクだけの合計 (チャンクスキップ後)
-      sel_uncomp_bytes : 選択トピックのメッセージ実バイト (非圧縮換算)
+      sel_uncomp_bytes : 選択トピックのメッセージ実バイト (非圧縮換算, 外挿。不明なら None)
       win_uncomp_bytes : 時間帯内チャンクの非圧縮合計
       compressions     : チャンク圧縮方式の集合 (例 {"zstd"} / {"none"})
       cached           : キャッシュ済みか (True なら転送ゼロで読める)
+      ratio_sampled    : sel_uncomp が全数計測でなく外挿か
     """
     cached = None
     if isinstance(source, GcsMcapSource) and cache_dir:
         cached = cache_lookup(cache_dir, source.blob.bucket.name,
                               source.blob.name, source.size)
-    f = open(cached, "rb") if cached else source.open(chunk_size=1024 * 1024)
+    f = open(cached, "rb") if cached else source.open(chunk_size=256 * 1024)
     with f:
         summary = make_reader(f).get_summary()
         if summary is None or not summary.chunk_indexes:
             return None
         sel_ids = {cid for cid, ch in summary.channels.items()
                    if topics is None or ch.topic in set(topics)}
-        total = needed = win_uncomp = sel_uncomp = idx_read = 0
+        total = needed = win_uncomp = needed_uncomp = 0
         comps = set()
+        needed_chunks = []
         for ci in summary.chunk_indexes:
             if start_ns is not None and ci.message_end_time < start_ns:
                 continue
@@ -1351,25 +1373,33 @@ def analyze_transfer(source, topics, start_ns=None, end_ns=None, cache_dir=None)
             total += ci.chunk_length + ci.message_index_length
             win_uncomp += ci.uncompressed_size
             comps.add(ci.compression or "none")
-            if not any(cid in ci.message_index_offsets for cid in sel_ids):
-                continue
-            # ストリーミングはチャンクレコードだけ読む (チャンク間のメッセージ
-            # インデックスはシークで飛ばす) ため、必要量にはチャンク長のみ数える
-            needed += ci.chunk_length
-            # メッセージインデックスから選択トピックの実バイト数 (非圧縮) を推定
-            if ci.message_index_length and idx_read < _ESTIMATE_MAX_INDEX_BYTES:
+            if any(cid in ci.message_index_offsets for cid in sel_ids):
+                # ストリーミングはチャンク本体だけ読む (チャンク間のメッセージ
+                # インデックスはシークで飛ばす) ため、必要量はチャンク長のみ
+                needed += ci.chunk_length
+                needed_uncomp += ci.uncompressed_size
+                needed_chunks.append(ci)
+
+        # 実データ比率は先頭の数チャンクだけサンプリングして外挿する (I/O を限定)
+        sel_uncomp = None
+        ratio_sampled = False
+        if sample_chunks and needed_chunks:
+            local = bool(cached) or isinstance(source, LocalMcapSource)
+            n_sample = len(needed_chunks) if local else min(sample_chunks, len(needed_chunks))
+            sampled_sel = sampled_uncomp = 0
+            ok = False
+            for ci in needed_chunks[:n_sample]:
                 try:
-                    f.seek(ci.chunk_start_offset + ci.chunk_length)
-                    buf = f.read(ci.message_index_length)
-                    idx_read += len(buf)
-                    offsets = _parse_message_indexes(buf)
-                    all_offs = sorted(o for offs in offsets.values() for o in offs)
-                    bounds = all_offs + [ci.uncompressed_size]
-                    pos = {o: bounds[k + 1] - o for k, o in enumerate(all_offs)}
-                    for cid in sel_ids:
-                        sel_uncomp += sum(pos.get(o, 0) for o in offsets.get(cid, []))
+                    s, u = _sample_selected_uncomp(f, ci, sel_ids)
+                    sampled_sel += s
+                    sampled_uncomp += u
+                    ok = True
                 except Exception:
-                    pass
+                    continue
+            if ok and sampled_uncomp > 0:
+                frac = sampled_sel / sampled_uncomp
+                sel_uncomp = frac * needed_uncomp
+                ratio_sampled = n_sample < len(needed_chunks)
         return {
             "total_bytes": total,
             "needed_bytes": needed,
@@ -1377,6 +1407,7 @@ def analyze_transfer(source, topics, start_ns=None, end_ns=None, cache_dir=None)
             "win_uncomp_bytes": win_uncomp,
             "compressions": comps,
             "cached": bool(cached),
+            "ratio_sampled": ratio_sampled,
         }
 
 
@@ -1396,13 +1427,15 @@ def estimate_transfer_report(sources, topics, start_ns=None, end_ns=None,
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         rows = [r for r in pool.map(one, sources) if r]
 
+    have_ratio = [r for r in rows if r["sel_uncomp_bytes"] is not None]
     agg = {
         "total": sum(r["total_bytes"] for r in rows),
         "needed": sum(r["needed_bytes"] for r in rows),
-        "sel_uncomp": sum(r["sel_uncomp_bytes"] for r in rows),
-        "win_uncomp": sum(r["win_uncomp_bytes"] for r in rows),
+        "sel_uncomp": sum(r["sel_uncomp_bytes"] for r in have_ratio) if have_ratio else None,
+        "win_uncomp": sum(r["win_uncomp_bytes"] for r in have_ratio),
         "cached": sum(r["total_bytes"] for r in rows if r["cached"]),
         "compressions": set().union(*(r["compressions"] for r in rows)) if rows else set(),
+        "ratio_sampled": any(r.get("ratio_sampled") for r in rows),
     }
     return rows, agg
 
@@ -1422,9 +1455,10 @@ def print_transfer_estimate(rows, agg):
     pct = 100.0 * (1 - needed / total) if total else 0.0
     print(f"  合計: 全体 {size_str(total)} → チャンクスキップ後 {size_str(needed)} "
           f"(削減 {pct:.1f}%, {cost_str(total)} → {cost_str(needed)})")
-    if agg["win_uncomp"]:
+    if agg["sel_uncomp"] is not None and agg["win_uncomp"]:
+        approx = "≈" if agg["ratio_sampled"] else ""
         share = 100.0 * agg["sel_uncomp"] / agg["win_uncomp"]
-        print(f"  選択トピックの実データ比率: {share:.1f}% (非圧縮換算)")
+        print(f"  選択トピックの実データ比率: {approx}{share:.1f}% (非圧縮換算)")
         if agg["compressions"] <= {"none", ""}:
             print(f"  → チャンクが非圧縮のため、メッセージ単位の範囲取得を実装すれば "
                   f"理論上 約{100 - share:.0f}% 削減の余地あり")
