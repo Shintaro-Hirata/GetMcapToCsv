@@ -43,11 +43,14 @@ IMAGE_PROJECT="${IMAGE_PROJECT:-debian-cloud}"
 PRIVATE="${PRIVATE:-0}"
 IAP_TAG="${IAP_TAG:-mcap-iap-ssh}"                # IAP SSH 許可の対象タグ
 
+# enable-guest-attributes: gcloud が VM の SSH ホスト鍵を API から取得して plink に渡すため、
+# IP 再利用時のホスト鍵不一致プロンプトを避けられる。
+METADATA="enable-guest-attributes=TRUE"
 net_args=()
 if [ "$PRIVATE" = "1" ]; then
+  METADATA="enable-oslogin=TRUE,enable-guest-attributes=TRUE"
   net_args=(--no-address
             --tags="$IAP_TAG"
-            --metadata=enable-oslogin=TRUE
             --shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring)
   # 以降の gcloud ssh/scp は IAP トンネル必須になる
   export GCLOUD_SSH_FLAGS="${GCLOUD_SSH_FLAGS:-} --tunnel-through-iap"
@@ -91,14 +94,12 @@ gcloud compute instances create "$GCP_VM" \
   --image-project="$IMAGE_PROJECT" \
   --boot-disk-size="${BOOT_DISK_GB}GB" \
   --boot-disk-type=pd-balanced \
+  --metadata="$METADATA" \
   --scopes=https://www.googleapis.com/auth/devstorage.read_only \
   "${net_args[@]}"
 
-echo
-echo "[ok] 作成しました。初回のみ Python を用意します..."
-# Debian 12 は python3 同梱。venv/pip 用に python3-venv を入れておく
-gcloud compute ssh "$GCP_VM" --project="$GCP_PROJECT" --zone="$GCP_ZONE" ${GCLOUD_SSH_FLAGS:-} \
-  --command="sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv python3-pip >/dev/null && python3 --version"
+# Python 依存は run_on_gcp.sh が初回実行時に自前で入れる (自己完結) ため、
+# ここで SSH 経由の apt install はしない (ホスト鍵の影響を受ける手順を減らす)。
 
 echo
 if [ "$PRIVATE" = "1" ]; then

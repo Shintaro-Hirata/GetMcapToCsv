@@ -63,9 +63,13 @@ $sshFlags = @()
 if ($cfg.ContainsKey('GCLOUD_SSH_FLAGS') -and $cfg['GCLOUD_SSH_FLAGS']) {
   $sshFlags = $cfg['GCLOUD_SSH_FLAGS'] -split '\s+'
 }
+# enable-guest-attributes lets gcloud fetch the VM's SSH host key from the API and
+# pass it to plink, avoiding host-key mismatch prompts when an IP is reused.
+$metadata = 'enable-guest-attributes=TRUE'
 $netArgs = @()
 if ($private) {
-  $netArgs = @('--no-address', "--tags=$iapTag", '--metadata=enable-oslogin=TRUE',
+  $metadata = 'enable-oslogin=TRUE,enable-guest-attributes=TRUE'
+  $netArgs = @('--no-address', "--tags=$iapTag",
                '--shielded-secure-boot', '--shielded-vtpm', '--shielded-integrity-monitoring')
   if ($sshFlags -notcontains '--tunnel-through-iap') { $sshFlags += '--tunnel-through-iap' }
 }
@@ -104,15 +108,13 @@ $createArgs = @('compute', 'instances', 'create', $vm,
   "--project=$project", "--zone=$zone", "--machine-type=$machineType",
   "--image-family=$imageFamily", "--image-project=$imageProj",
   "--boot-disk-size=${bootDiskGb}GB", '--boot-disk-type=pd-balanced',
+  "--metadata=$metadata",
   '--scopes=https://www.googleapis.com/auth/devstorage.read_only') + $netArgs
 & gcloud @createArgs
 if ($LASTEXITCODE -ne 0) { throw 'VM creation failed. Check the error above.' }
 
-Write-Host ''
-Write-Host '[ok] Created. Installing Python (first boot)...'
-$installCmd = 'sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv python3-pip >/dev/null && python3 --version'
-$sshArgs = @('compute', 'ssh', $vm, "--project=$project", "--zone=$zone") + $sshFlags + @('--command', $installCmd)
-& gcloud @sshArgs
+# Python deps are installed by run_on_gcp.sh on first use (self-contained),
+# so no apt install over SSH here (avoids a host-key-sensitive step).
 
 Write-Host ''
 if ($private) {
