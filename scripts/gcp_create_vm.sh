@@ -25,9 +25,10 @@ MACHINE_TYPE="${MACHINE_TYPE:-e2-standard-4}"     # 4 vCPU / 16GB。並列デコ
 BOOT_DISK_GB="${BOOT_DISK_GB:-100}"               # キャッシュ + 一時ファイル用に余裕を持たせる
 IMAGE_FAMILY="${IMAGE_FAMILY:-debian-12}"
 IMAGE_PROJECT="${IMAGE_PROJECT:-debian-cloud}"
-# PRIVATE=1 (既定): 外部IPなし + IAP SSH + OS Login。あなた以外の踏み込みを実務上防ぐ。
-# PRIVATE=0 にすると外部IP付きの標準的な VM (SSH は IAM で保護)。
-PRIVATE="${PRIVATE:-1}"
+# PRIVATE=0 (既定): 外部IP付きの標準的な VM (SSH は IAM/鍵で保護)。手順が単純で詰まりにくい。
+# PRIVATE=1 にすると外部IPなし + IAP SSH + OS Login でネットワーク面を最小公開にする
+#   (IAP 用ファイアウォールを作るため、組織ポリシー/権限によっては失敗しうる)。
+PRIVATE="${PRIVATE:-0}"
 IAP_TAG="${IAP_TAG:-mcap-iap-ssh}"                # IAP SSH 許可の対象タグ
 
 net_args=()

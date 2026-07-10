@@ -49,7 +49,9 @@ cp scripts/gcp.env.example scripts/gcp.env
 - `GCP_ZONE` … `asia-northeast1-a`（東京。そのままでよい）
 - `GCP_VM` … 好きな名前（例 `mcap-worker`）
 - `ROS2IDL_LOCAL_PATH` … 手順 1a で clone した `zero-plotter/mcap-ros2idl-support` のパス
-- （最小公開 VM を使うので）`GCLOUD_SSH_FLAGS="--tunnel-through-iap"` の行を有効化
+
+（既定は外部IP付きの標準 VM。ネットワークをより閉じたい場合のみ `PRIVATE=1` と
+`GCLOUD_SSH_FLAGS="--tunnel-through-iap"` を有効化する。）
 
 ### 手順 2. VM を1台作る（1コマンド）
 
@@ -59,15 +61,12 @@ bash scripts/gcp_create_vm.sh
 東京リージョンに小さな VM（4 vCPU / 16GB / ディスク100GB / バケット読み取り権限つき）を作り、
 Python まで用意する。数分で終わる。
 
-既定は**最小公開**（`PRIVATE=1`）で作る:
-- **外部 IP なし** … インターネットから一切到達不可
-- **IAP トンネル SSH のみ** … 接続にあなたの Google 認証が必須（IAP 用ファイアウォールも自動作成）
-- **OS Login** … SSH ログインを IAM ユーザー単位に限定
+既定は**標準構成**（外部IP付き、SSH は IAM/鍵で保護）。手順が単純で詰まりにくい。
+どのみちプロジェクト管理者には VM の存在は見えるため、ここは割り切って標準構成でよい。
 
-つまり **VM の中に入れる・データに触れるのはあなただけ**になる。
-（プロジェクトに強い権限を持つ人にはコンソール上で「VM が存在すること」自体は見えるが、
-中に入ることはできない。存在ごと隠したい場合は自分専用プロジェクトを作るしかない — 下の
-「完全に隠したい場合」参照。標準的な外部IP付きにしたいなら gcp.env で `PRIVATE=0`。）
+ネットワークをより閉じたい場合は gcp.env で `PRIVATE=1`（外部IPなし + IAP SSH + OS Login）。
+中に入れる・データに触れるのは自分だけになるが、IAP 用ファイアウォール作成が必要で、
+組織ポリシーによっては失敗しうる（下の「セキュリティ」参照）。
 
 ### 手順 3. 抽出する（今までと同じ引数）
 
@@ -90,9 +89,10 @@ gcloud compute instances start <VM名> --zone asia-northeast1-a --project <プ�
 
 ---
 
-## VM を「自分だけ」に近づける（セキュリティ）
+## VM を「自分だけ」に近づける（セキュリティ・任意）
 
-`gcp_create_vm.sh` の既定（`PRIVATE=1`）で以下が有効になる:
+標準構成（既定）でも SSH は IAM/鍵で保護されており、他人が勝手に中に入ることはない。
+さらにネットワークを閉じたい場合は gcp.env で `PRIVATE=1` にすると以下が有効になる:
 
 | 設定 | 効果 |
 |------|------|
