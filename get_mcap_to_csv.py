@@ -789,6 +789,34 @@ def _collect_rows(reader, topic_config, exclude_pats, start_ns, end_ns):
     return per_topic, dict(decode_errors), count
 
 
+def _stream_saving_fraction(blob, topics, start_ns, end_ns, stats):
+    """サマリだけ読み、チャンクスキップでどれだけ転送を減らせるか (0.0-1.0) を返す。"""
+    try:
+        with CountingFile(blob.open("rb", chunk_size=256 * 1024), stats) as f:
+            summary = make_reader(f).get_summary()
+        if summary is None or not summary.chunk_indexes:
+            return None
+        sel_ids = {cid for cid, ch in summary.channels.items() if ch.topic in topics}
+        total = needed = 0
+        for ci in summary.chunk_indexes:
+            if start_ns is not None and ci.message_end_time < start_ns:
+                continue
+            if end_ns is not None and ci.message_start_time >= end_ns:
+                continue
+            total += ci.chunk_length + ci.message_index_length
+            if any(cid in ci.message_index_offsets for cid in sel_ids):
+                needed += ci.chunk_length  # ストリーミングが読むのはチャンク本体のみ
+        if total <= 0:
+            return None
+        return 1.0 - needed / total
+    except Exception:
+        return None
+
+
+# 一括ダウンロードをやめて部分読み込みに切り替える削減率のしきい値
+_AUTO_STREAM_SAVING = 0.4
+
+
 def _extract_worker(job):
     """1 ファイル分のダウンロード + デコードを行うワーカー (別プロセスで実行可)。
 
@@ -809,7 +837,18 @@ def _extract_worker(job):
             else:
                 from google.cloud import storage  # storage.Client
                 blob = storage.Client().bucket(job["bucket"]).blob(job["blob_name"])
-                if job["download"]:
+                download = job["download"]
+                if download and job.get("topic_config") is not None:
+                    # トピックが絞られているときはサマリで必要チャンク比を見て、
+                    # 大幅に減るなら丸ごとダウンロードをやめて部分読み込みにする
+                    saving = _stream_saving_fraction(
+                        blob, set(job["topic_config"].keys()),
+                        job["start_ns"], job["end_ns"], stats)
+                    if saving is not None and saving >= _AUTO_STREAM_SAVING:
+                        download = False
+                        print(f"[info] {job['name'].rsplit('/', 1)[-1]}: "
+                              f"選択トピックに不要なチャンクが {saving * 100:.0f}% → 部分読み込みに切替")
+                if download:
                     # 時間帯がファイルの大半を占めるなら一括ダウンロードの方が速い
                     if cache_dir:
                         local = cache_store_download(blob, cache_dir, stats)
@@ -1254,6 +1293,147 @@ def print_topics(sources):
             print(f"  [warn] 読み込み失敗: {e}")
 
 
+# ------------------------------------------------------------------
+# 転送量の見積もり (トピック絞り込みでどれだけダウンロードを減らせるか)
+# ------------------------------------------------------------------
+def _parse_message_indexes(buf):
+    """チャンク末尾の MessageIndex レコード群から {channel_id: [チャンク内オフセット...]} を得る。"""
+    out = defaultdict(list)
+    i = 0
+    n = len(buf)
+    while i + 9 <= n:
+        op = buf[i]
+        ln = int.from_bytes(buf[i + 1:i + 9], "little")
+        body = buf[i + 9:i + 9 + ln]
+        if op == 0x07 and len(body) >= 6:  # MessageIndex
+            ch = int.from_bytes(body[0:2], "little")
+            arr_len = int.from_bytes(body[2:6], "little")
+            j, end = 6, min(6 + arr_len, len(body))
+            while j + 16 <= end:
+                out[ch].append(int.from_bytes(body[j + 8:j + 16], "little"))
+                j += 16
+        i += 9 + ln
+    return out
+
+# メッセージインデックスの読み込み量の上限 (見積もりが高くつかないように)
+_ESTIMATE_MAX_INDEX_BYTES = 16 * 1024 * 1024
+
+
+def analyze_transfer(source, topics, start_ns=None, end_ns=None, cache_dir=None):
+    """1 ファイルについて、選択トピック抽出に必要な転送量をサマリから見積もる。
+
+    戻り値 dict:
+      total_bytes      : 時間帯内チャンクの合計 (一括ダウンロード相当の対象部分)
+      needed_bytes     : 選択トピックを含むチャンクだけの合計 (チャンクスキップ後)
+      sel_uncomp_bytes : 選択トピックのメッセージ実バイト (非圧縮換算)
+      win_uncomp_bytes : 時間帯内チャンクの非圧縮合計
+      compressions     : チャンク圧縮方式の集合 (例 {"zstd"} / {"none"})
+      cached           : キャッシュ済みか (True なら転送ゼロで読める)
+    """
+    cached = None
+    if isinstance(source, GcsMcapSource) and cache_dir:
+        cached = cache_lookup(cache_dir, source.blob.bucket.name,
+                              source.blob.name, source.size)
+    f = open(cached, "rb") if cached else source.open(chunk_size=1024 * 1024)
+    with f:
+        summary = make_reader(f).get_summary()
+        if summary is None or not summary.chunk_indexes:
+            return None
+        sel_ids = {cid for cid, ch in summary.channels.items()
+                   if topics is None or ch.topic in set(topics)}
+        total = needed = win_uncomp = sel_uncomp = idx_read = 0
+        comps = set()
+        for ci in summary.chunk_indexes:
+            if start_ns is not None and ci.message_end_time < start_ns:
+                continue
+            if end_ns is not None and ci.message_start_time >= end_ns:
+                continue
+            total += ci.chunk_length + ci.message_index_length
+            win_uncomp += ci.uncompressed_size
+            comps.add(ci.compression or "none")
+            if not any(cid in ci.message_index_offsets for cid in sel_ids):
+                continue
+            # ストリーミングはチャンクレコードだけ読む (チャンク間のメッセージ
+            # インデックスはシークで飛ばす) ため、必要量にはチャンク長のみ数える
+            needed += ci.chunk_length
+            # メッセージインデックスから選択トピックの実バイト数 (非圧縮) を推定
+            if ci.message_index_length and idx_read < _ESTIMATE_MAX_INDEX_BYTES:
+                try:
+                    f.seek(ci.chunk_start_offset + ci.chunk_length)
+                    buf = f.read(ci.message_index_length)
+                    idx_read += len(buf)
+                    offsets = _parse_message_indexes(buf)
+                    all_offs = sorted(o for offs in offsets.values() for o in offs)
+                    bounds = all_offs + [ci.uncompressed_size]
+                    pos = {o: bounds[k + 1] - o for k, o in enumerate(all_offs)}
+                    for cid in sel_ids:
+                        sel_uncomp += sum(pos.get(o, 0) for o in offsets.get(cid, []))
+                except Exception:
+                    pass
+        return {
+            "total_bytes": total,
+            "needed_bytes": needed,
+            "sel_uncomp_bytes": sel_uncomp,
+            "win_uncomp_bytes": win_uncomp,
+            "compressions": comps,
+            "cached": bool(cached),
+        }
+
+
+def estimate_transfer_report(sources, topics, start_ns=None, end_ns=None,
+                             cache_dir=None, workers=8):
+    """複数ファイルの転送量見積もりをまとめる。戻り値: (per-file リスト, 集計 dict)"""
+    def one(src):
+        try:
+            r = analyze_transfer(src, topics, start_ns, end_ns, cache_dir)
+        except Exception as e:
+            print(f"[warn] 見積もり失敗 ({src.name}): {e}")
+            return None
+        if r is not None:
+            r["name"] = src.name
+        return r
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        rows = [r for r in pool.map(one, sources) if r]
+
+    agg = {
+        "total": sum(r["total_bytes"] for r in rows),
+        "needed": sum(r["needed_bytes"] for r in rows),
+        "sel_uncomp": sum(r["sel_uncomp_bytes"] for r in rows),
+        "win_uncomp": sum(r["win_uncomp_bytes"] for r in rows),
+        "cached": sum(r["total_bytes"] for r in rows if r["cached"]),
+        "compressions": set().union(*(r["compressions"] for r in rows)) if rows else set(),
+    }
+    return rows, agg
+
+
+def print_transfer_estimate(rows, agg):
+    """見積もり結果を CLI 向けに表示する。"""
+    if not rows:
+        print("[warn] 見積もりできるファイルがありません。")
+        return
+    total, needed = agg["total"], agg["needed"]
+    print(f"\n=== 転送量の見積もり (選択トピックでの抽出) ===")
+    for r in rows:
+        pct = 100.0 * (1 - r["needed_bytes"] / r["total_bytes"]) if r["total_bytes"] else 0.0
+        mark = " [キャッシュ済→転送ゼロ]" if r["cached"] else ""
+        print(f"  {r['name'].rsplit('/', 1)[-1]:<40} 全体 {size_str(r['total_bytes']):>9} "
+              f"→ 必要 {size_str(r['needed_bytes']):>9} (削減 {pct:4.1f}%){mark}")
+    pct = 100.0 * (1 - needed / total) if total else 0.0
+    print(f"  合計: 全体 {size_str(total)} → チャンクスキップ後 {size_str(needed)} "
+          f"(削減 {pct:.1f}%, {cost_str(total)} → {cost_str(needed)})")
+    if agg["win_uncomp"]:
+        share = 100.0 * agg["sel_uncomp"] / agg["win_uncomp"]
+        print(f"  選択トピックの実データ比率: {share:.1f}% (非圧縮換算)")
+        if agg["compressions"] <= {"none", ""}:
+            print(f"  → チャンクが非圧縮のため、メッセージ単位の範囲取得を実装すれば "
+                  f"理論上 約{100 - share:.0f}% 削減の余地あり")
+        else:
+            comp = "/".join(sorted(agg["compressions"]))
+            print(f"  → チャンクは圧縮済み ({comp}) のため、チャンク単位より細かい取得は不可。"
+                  f"これ以上の削減は GCP 内での実行 (egress 無料) を検討")
+
+
 def sample_topic_columns(sources, topics, cache_dir=None, samples_per_topic=3,
                          start_ns=None, end_ns=None):
     """各トピックのメッセージを数件だけデコードし、フラット展開後の列名一覧を返す。
@@ -1375,6 +1555,8 @@ def main():
     parser.add_argument("--session-lookback", type=int, default=24, metavar="HOURS",
                         help="抽出開始時刻の何時間前までに始まったセッションを対象にするか"
                              " (default: 24)")
+    parser.add_argument("--estimate", action="store_true",
+                        help="抽出せず、選択トピックでの転送量 (課金) 見積もりだけ表示する")
     parser.add_argument("--list-only", action="store_true",
                         help="対象 mcap ファイルの一覧表示のみ (ダウンロード・デコードしない)")
     parser.add_argument("--list-topics", action="store_true",
@@ -1450,6 +1632,15 @@ def main():
         raise SystemExit("[error] 使えるデコーダがありません。"
                          " `pip install -r requirements.txt` を実行してください。")
     cache_dir = None if args.no_cache else args.cache_dir
+
+    if args.estimate:
+        topics = None if topic_config is None else list(topic_config)
+        rows, agg = estimate_transfer_report(sources, topics, start_ns, end_ns,
+                                             cache_dir=cache_dir)
+        print_transfer_estimate(rows, agg)
+        print_transfer_summary()
+        return
+
     per_topic = extract_rows(sources, topic_config, start_ns, end_ns,
                              exclude_pats=args.exclude_topics,
                              workers=args.extract_workers,

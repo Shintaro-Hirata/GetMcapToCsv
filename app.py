@@ -48,6 +48,7 @@ ss.setdefault("search_params", None)  # 検索時の (start_ns, end_ns, base 名
 ss.setdefault("search_transfer", None)  # 検索時の GCS 転送量 (bytes)
 ss.setdefault("result_transfer", None)  # 抽出時の GCS 転送量とキャッシュ利用量
 ss.setdefault("topic_columns", {})      # {topic: [フラット列名, ...]} カラム絞り込み用
+ss.setdefault("transfer_estimate", None)  # 転送量見積もりの結果
 
 
 def run_captured(fn, *args, **kwargs):
@@ -222,6 +223,7 @@ if st.button(_btn_label, type="primary", disabled=(time_needed and not time_ok))
     ss.file_defaults = None  # 新しい検索結果ではチェック状態を全選択に戻す
     ss.search_transfer = None
     ss.topic_columns = {}
+    ss.transfer_estimate = None
     core.STATS.reset()
     if is_gcs:
         try:
@@ -513,6 +515,46 @@ if ss.sources:
         out_format.startswith("mcap (元ファイル") or bool(selected_topics))
     if not can_run and selected_sources:
         st.caption("CSV / mcap(絞り込み) はトピックを 1 つ以上選択してください。")
+
+    # --- 転送量 (課金) の事前見積もり ---
+    if selected_sources and selected_topics and is_gcs:
+        if st.button("📉 転送量を見積もる (選択トピックでどれだけ減るか)"):
+            with st.spinner("サマリを読んで見積もり中... (数MB程度の読み込み)"):
+                (rows, agg), est_log = run_captured(
+                    core.estimate_transfer_report, selected_sources, selected_topics,
+                    ss.search_params["start_ns"], ss.search_params["end_ns"],
+                    cache_dir)
+            ss.transfer_estimate = (rows, agg)
+        if ss.get("transfer_estimate"):
+            rows, agg = ss.transfer_estimate
+            if rows:
+                est_df = pd.DataFrame([{
+                    "ファイル": r["name"].rsplit("/", 1)[-1],
+                    "全体": core.size_str(r["total_bytes"]),
+                    "必要チャンク": core.size_str(r["needed_bytes"]),
+                    "削減率": (f"{100 * (1 - r['needed_bytes'] / r['total_bytes']):.1f}%"
+                              if r["total_bytes"] else "-"),
+                    "キャッシュ": "済" if r["cached"] else "",
+                } for r in rows])
+                st.dataframe(est_df, hide_index=True, use_container_width=True)
+                total, needed = agg["total"], agg["needed"]
+                pct = 100.0 * (1 - needed / total) if total else 0.0
+                lines = [f"チャンクスキップ後の転送量: {core.size_str(needed)} / "
+                         f"全体 {core.size_str(total)} (削減 {pct:.1f}%, "
+                         f"{core.cost_str(total)} → {core.cost_str(needed)})"]
+                if agg["win_uncomp"]:
+                    share = 100.0 * agg["sel_uncomp"] / agg["win_uncomp"]
+                    lines.append(f"選択トピックの実データ比率: {share:.1f}% (非圧縮換算)")
+                    if agg["compressions"] <= {"none", ""}:
+                        lines.append(f"チャンクが非圧縮のため、メッセージ単位取得を実装すれば"
+                                     f"理論上 約{100 - share:.0f}% 削減の余地あり (未実装・要相談)")
+                    else:
+                        comp = "/".join(sorted(agg["compressions"]))
+                        lines.append(f"チャンクは圧縮済み ({comp}) のため、これ以上の削減は"
+                                     " GCP 内での実行 (egress 無料) が必要")
+                st.info("📉 " + "\n\n".join(lines))
+                st.caption("削減が 40% 以上見込めるファイルは、抽出時に自動で部分読み込みに"
+                           "切り替わります (それ未満は丸ごとダウンロード + キャッシュ)。")
 
     if st.button("🚀 ④ 抽出実行", type="primary", disabled=not can_run):
         params = ss.search_params
