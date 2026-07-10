@@ -264,8 +264,9 @@ GCS からのダウンロードには egress 課金（東京→インターネ�
   含まれ、圧縮方式が非圧縮ならメッセージ単位取得（未実装）でさらに削減できる余地が分かる。
   大幅削減が構造的に不可能な場合の根本策は GCP 内（同リージョン VM）での実行
   （egress 無料。zero-plotter の VM 上で CLI を動かし、小さな CSV だけ手元へ）。
-  → 手順とスクリプト: [docs/GCP_EXECUTION.md](docs/GCP_EXECUTION.md)、
-  `scripts/gcp_fetch.sh`（手元 PC から一発で VM 変換 → CSV 回収）
+  → 手順とスクリプト: [docs/GCP_EXECUTION.md](docs/GCP_EXECUTION.md)。
+  Windows PowerShell は `scripts/gcp_create_vm.ps1` / `scripts/gcp_fetch.ps1`、
+  Git Bash / WSL / macOS / Linux は同名の `.sh`（手元 PC から一発で VM 変換 → CSV 回収）
 
 単価は `get_mcap_to_csv.py` 先頭の `EGRESS_USD_PER_GB` / `USD_JPY` で調整可能（表示のみに使用）。
 

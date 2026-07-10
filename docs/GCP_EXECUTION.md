@@ -16,9 +16,20 @@ mcap は全トピックが混在した zstd 圧縮チャンクで格納されて
  GCP内: GCS ──[ mcap 1.4GB / ¥0 ]──> VM(同一リージョン) ──変換──> CSV ──[ 数MB ]──> 手元PC
 ```
 
+## Windows (PowerShell) か bash か
+
+- **Windows で PowerShell を使う** → `.ps1` スクリプトを使う（`bash` 不要）。以下の手順は
+  PowerShell 版で示す。初回だけスクリプト実行の許可が必要な場合がある:
+  ```powershell
+  Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+  ```
+  （「実行できない」と出たときのみ。1回やれば以後不要。）
+- **Git Bash / WSL / macOS / Linux** → `.sh` スクリプトを使う（`bash scripts/xxx.sh`）。
+  中身は同じ。
+
 ## いちばん簡単な手順（ゼロから VM を作る）
 
-初めてでもこの順でやれば動く。すべて手元 PC（Windows は Git Bash か WSL）で操作する。
+初めてでもこの順でやれば動く。すべて手元 PC で操作する。
 
 ### 手順 0. バケットのリージョンを確認（済んでいれば飛ばす）
 
@@ -41,10 +52,11 @@ git clone -b yatagarasu/main https://github.com/t2-auto/zero-plotter.git
 
 ### 手順 1b. 設定ファイルを用意
 
-```bash
-cp scripts/gcp.env.example scripts/gcp.env
+```powershell
+Copy-Item scripts\gcp.env.example scripts\gcp.env   # PowerShell
+# bash:  cp scripts/gcp.env.example scripts/gcp.env
 ```
-`scripts/gcp.env` を開いて最低限これだけ埋める:
+`scripts/gcp.env` を開いて最低限これだけ埋める（`.ps1` も `.sh` も同じ gcp.env を読む）:
 - `GCP_PROJECT` … 自分のプロジェクトID（`gcloud config get-value project` で確認）
 - `GCP_ZONE` … `asia-northeast1-a`（東京。そのままでよい）
 - `GCP_VM` … 好きな名前（例 `mcap-worker`）
@@ -55,8 +67,9 @@ cp scripts/gcp.env.example scripts/gcp.env
 
 ### 手順 2. VM を1台作る（1コマンド）
 
-```bash
-bash scripts/gcp_create_vm.sh
+```powershell
+.\scripts\gcp_create_vm.ps1        # PowerShell
+# bash:  bash scripts/gcp_create_vm.sh
 ```
 東京リージョンに小さな VM（4 vCPU / 16GB / ディスク100GB / バケット読み取り権限つき）を作り、
 Python まで用意する。数分で終わる。
@@ -68,13 +81,21 @@ Python まで用意する。数分で終わる。
 中に入れる・データに触れるのは自分だけになるが、IAP 用ファイアウォール作成が必要で、
 組織ポリシーによっては失敗しうる（下の「セキュリティ」参照）。
 
-### 手順 3. 抽出する（今までと同じ引数）
+### 手順 3. 抽出する
 
+```powershell
+# PowerShell (引数は -Vehicle / -Start / -End / -Topics ...)
+.\scripts\gcp_fetch.ps1 -Vehicle GIGA09 -Start "2026-07-01 20:40" -End "2026-07-01 20:45" -Topics topics.example.t2.json
+```
 ```bash
+# bash (引数は get_mcap_to_csv.py と同じ)
 bash scripts/gcp_fetch.sh --vehicle GIGA09 --start "2026-07-01 20:40" \
     --end "2026-07-01 20:45" --topics topics.example.t2.json
 ```
 重い mcap は VM の中で処理され（GCS 読み込みは無料）、手元の `out/` には CSV だけ届く。
+
+PowerShell 版の主なオプション: `-AllTopics`（全トピック）、`-IncludeSensor` / `-IncludeImage`、
+`-ExcludeTopics "/tf*","/events/*"`、その他の引数は `-ExtraArgs "--no-download"` で渡す。
 
 ### 手順 4. 使い終わったら VM を止める（課金を抑える）
 
