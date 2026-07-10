@@ -1,15 +1,16 @@
 # scripts/gcp_fetch.ps1
-# PowerShell 版の司令塔スクリプト (bash 不要)。
-#   1. ツール一式を VM へ転送 (私物パッケージ mcap-ros2idl-support 含む)
-#   2. VM 上で mcap->CSV 変換 (GCS 読み込みは VM 内 = egress 無料)
-#   3. 出来た CSV (小さい) だけを手元へダウンロード
+# PowerShell driver script (ASCII only, so Windows PowerShell 5.1 parses it
+# correctly regardless of console codepage).
+#   1. push the tool to the VM (incl. the private mcap-ros2idl-support package)
+#   2. run mcap->CSV on the VM (GCS read inside GCP = egress-free)
+#   3. download only the small CSV back
 #
-# 前提: gcloud CLI が入っていて認証済み。scripts\gcp.env を用意しておく。
-# 使い方 (PowerShell):
+# Prereq: gcloud CLI installed and authenticated. scripts\gcp.env prepared.
+# Usage:
 #   .\scripts\gcp_fetch.ps1 -Vehicle GIGA09 -Start "2026-07-01 20:40" -End "2026-07-01 20:45" -Topics topics.example.t2.json
 #   .\scripts\gcp_fetch.ps1 -Vehicle GIGA09 -Start "..." -End "..." -AllTopics -IncludeSensor
 #   .\scripts\gcp_fetch.ps1 -Vehicle GIGA09 -Start "..." -End "..." -AllTopics -ExcludeTopics "/tf*","/events/*"
-#   その他の get_mcap_to_csv.py 引数は -ExtraArgs で渡す: -ExtraArgs "--no-download"
+#   other get_mcap_to_csv.py args via -ExtraArgs: -ExtraArgs "--no-download"
 
 param(
   [string]$Vehicle,
@@ -22,9 +23,9 @@ param(
   [switch]$IncludeImage,
   [string[]]$ExtraArgs,
   [string]$EnvFile,
-  [switch]$SetupAuth,    # 手元の ADC を VM にコピーし、VM が自分の権限で GCS を読めるようにする (初回のみ)
-  [switch]$StartStop,    # 実行前に VM を起動し、終了後 (エラー時も) 必ず停止する (課金最小化)
-  [switch]$DeleteAfter   # 終了後 (エラー時も) VM をディスクごと削除する (停止中ディスク代もゼロに)
+  [switch]$SetupAuth,    # copy local ADC to the VM so it reads GCS as you (first time)
+  [switch]$StartStop,    # start before run, stop after (even on error) to minimize cost
+  [switch]$DeleteAfter   # delete the VM+disk after (even on error) so idle cost is zero
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,14 +34,14 @@ $repoDir   = Split-Path -Parent $scriptDir
 
 function Read-GcpEnv([string]$path) {
   if (-not (Test-Path $path)) {
-    throw "$path がありません。scripts\gcp.env.example からコピーして編集してください。"
+    throw "$path not found. Copy scripts\gcp.env.example to scripts\gcp.env and edit it."
   }
   $h = @{}
   foreach ($line in Get-Content -LiteralPath $path) {
     if ($line -match '^\s*#') { continue }
     if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$') {
       $k = $matches[1]; $v = $matches[2]
-      # クォート値は中身を採用 (行末コメントは無視)、非クォートは最初の # 以降を除去
+      # quoted value -> inside quotes (ignore trailing comment); unquoted -> strip from '#'
       if ($v -match '^\s*"([^"]*)"') { $v = $matches[1] }
       elseif ($v -match "^\s*'([^']*)'") { $v = $matches[1] }
       else { $v = ($v -split '#', 2)[0].Trim() }
@@ -56,11 +57,11 @@ function Cfg([string]$key, $default = $null) {
   if ($cfg.ContainsKey($key) -and $cfg[$key] -ne '') { return $cfg[$key] } else { return $default }
 }
 
-$project   = Cfg 'GCP_PROJECT'; if (-not $project) { throw 'gcp.env に GCP_PROJECT を設定してください' }
-$zone      = Cfg 'GCP_ZONE';    if (-not $zone)    { throw 'gcp.env に GCP_ZONE を設定してください' }
-$vm        = Cfg 'GCP_VM';      if (-not $vm)      { throw 'gcp.env に GCP_VM を設定してください' }
+$project   = Cfg 'GCP_PROJECT'; if (-not $project) { throw 'Set GCP_PROJECT in gcp.env' }
+$zone      = Cfg 'GCP_ZONE';    if (-not $zone)    { throw 'Set GCP_ZONE in gcp.env' }
+$vm        = Cfg 'GCP_VM';      if (-not $vm)      { throw 'Set GCP_VM in gcp.env' }
 $remoteDir = Cfg 'REMOTE_DIR' 'GetMcapToCsv'
-# 先頭の ~/ は pscp が展開できないので除去 (ホーム相対にする)
+# strip a leading ~/ (pscp cannot expand it); make it home-relative
 $remoteDir = $remoteDir -replace '^~[/\\]', ''
 $localOut  = Cfg 'LOCAL_OUT' 'out'
 $venvDir   = Cfg 'VENV_DIR'
@@ -74,29 +75,29 @@ $baseFlags = @("--project=$project", "--zone=$zone") + $sshFlags
 
 function Invoke-RemoteSsh([string]$cmd) {
   & gcloud compute ssh $vm @baseFlags --command $cmd
-  if ($LASTEXITCODE -ne 0) { throw "リモート実行に失敗しました: $cmd" }
+  if ($LASTEXITCODE -ne 0) { throw "Remote command failed: $cmd" }
 }
 function Invoke-Scp($src, $dst, [switch]$Recurse) {
   $a = @('compute', 'scp') + $(if ($Recurse) { @('--recurse') } else { @() }) + $baseFlags + @($src, $dst)
   & gcloud @a
-  if ($LASTEXITCODE -ne 0) { throw "転送に失敗しました: $src -> $dst" }
+  if ($LASTEXITCODE -ne 0) { throw "Transfer failed: $src -> $dst" }
 }
-# フォルダを tar に固めて転送し VM 側で展開する (pscp -r はリモートにフォルダを
-# 作れず失敗するため。単一ファイル scp なら pscp でも確実)。
+# Pack a folder into a tar and expand on the VM (pscp -r cannot create the remote
+# folder and fails; a single-file scp works with pscp).
 function Send-Folder($localDir, $remoteParent) {
   $name = Split-Path -Leaf $localDir
   $parent = Split-Path -Parent $localDir
   $tmp = Join-Path $env:TEMP ("gcpfetch_" + $name + ".tgz")
-  # 重い/不要なものは除外 (venv やビルド成果物が混ざっても小さく確実に送れる)
+  # exclude heavy/unneeded stuff so a locally-built copy still transfers small
   & tar -czf $tmp '--exclude=.venv' '--exclude=venv' '--exclude=__pycache__' `
       '--exclude=*.egg-info' '--exclude=build' '--exclude=dist' '--exclude=.git' `
       -C $parent $name
-  if ($LASTEXITCODE -ne 0) { throw "tar 作成に失敗しました: $localDir" }
+  if ($LASTEXITCODE -ne 0) { throw "tar failed: $localDir" }
   Invoke-Scp $tmp "${vm}:$remoteParent/$name.tgz"
   Invoke-RemoteSsh "cd $remoteParent && rm -rf $name && tar -xzf $name.tgz && rm -f $name.tgz"
   Remove-Item $tmp -ErrorAction SilentlyContinue
 }
-# bash 用に単一引用符でクォート (VM 側は bash で受ける)
+# single-quote for bash (the VM runs bash)
 function Q([string]$s) { "'" + ($s -replace "'", "'\''") + "'" }
 
 function Get-VmStatus {
@@ -104,83 +105,83 @@ function Get-VmStatus {
 }
 function Start-VmIfNeeded {
   $st = Get-VmStatus
-  if ($st -eq 'RUNNING') { Write-Host '[info] VM は起動済みです。'; return }
-  Write-Host "[info] VM を起動中... (現在: $st)"
+  if ($st -eq 'RUNNING') { Write-Host '[info] VM already running.'; return }
+  Write-Host "[info] Starting VM... (was: $st)"
   & gcloud compute instances start $vm "--project=$project" "--zone=$zone" | Out-Null
-  Write-Host '[info] SSH の準備を待機中...'
+  Write-Host '[info] Waiting for SSH...'
   for ($i = 0; $i -lt 24; $i++) {
     & gcloud compute ssh $vm @baseFlags --command 'true' 2>$null | Out-Null
     if ($LASTEXITCODE -eq 0) { return }
     Start-Sleep -Seconds 5
   }
-  Write-Warning 'SSH がまだ応答しませんが処理を続行します。'
+  Write-Warning 'SSH not responding yet; continuing anyway.'
 }
 function Stop-VmNow {
-  Write-Host '[info] VM を停止します (課金を止める)...'
+  Write-Host '[info] Stopping VM (halt billing)...'
   & gcloud compute instances stop $vm "--project=$project" "--zone=$zone" | Out-Null
-  Write-Host '[ok] VM を停止しました。'
+  Write-Host '[ok] VM stopped.'
 }
 function Remove-VmNow {
-  Write-Host '[info] VM をディスクごと削除します (以後の標準料金をゼロに)...'
+  Write-Host '[info] Deleting VM and its disk (zero standing cost)...'
   & gcloud compute instances delete $vm "--project=$project" "--zone=$zone" --quiet | Out-Null
-  Write-Host '[ok] VM を削除しました。次回は gcp_create_vm.ps1 で作り直してください。'
+  Write-Host '[ok] VM deleted. Recreate with gcp_create_vm.ps1 next time.'
 }
 
 try {
 if ($StartStop -or $DeleteAfter) { Start-VmIfNeeded }
 
-Write-Host "[info] VM ($vm / $zone) にツールを転送..."
+Write-Host "[info] Pushing tool to VM ($vm / $zone)..."
 Invoke-RemoteSsh "mkdir -p $remoteDir/scripts"
 foreach ($f in @('get_mcap_to_csv.py', 'requirements.txt', 'topics.example.t2.json', 'topics.example.apollo.json')) {
   Invoke-Scp (Join-Path $repoDir $f) "${vm}:$remoteDir/$f"
 }
 Invoke-Scp (Join-Path $repoDir 'scripts\run_on_gcp.sh') "${vm}:$remoteDir/scripts/run_on_gcp.sh"
-# Windows の Git チェックアウトで付いた CRLF を除去 (bash が pipefail\r 等で失敗するため)
+# strip CRLF added by Windows Git checkout (bash fails on pipefail\r etc.)
 Invoke-RemoteSsh "sed -i 's/\r//' $remoteDir/scripts/run_on_gcp.sh"
 
-# ユーザー指定の topics ファイルがあれば転送し、リモートではその basename を使う
+# transfer a user-specified topics file and reference it by basename on the VM
 $remoteTopics = $null
 if ($Topics) {
-  if (-not (Test-Path $Topics)) { throw "topics ファイルが見つかりません: $Topics" }
+  if (-not (Test-Path $Topics)) { throw "topics file not found: $Topics" }
   $tname = Split-Path -Leaf $Topics
   Invoke-Scp $Topics "${vm}:$remoteDir/$tname"
   $remoteTopics = $tname
 }
 
-# /t2 デコード用パッケージを VM へ転送 (VM 側 GitHub 認証を回避)
+# send the /t2 decode package to the VM (avoids GitHub auth on the VM)
 $envExport = ''
 if ($venvDir) { $envExport += "VENV_DIR=$(Q $venvDir) " }
 if ($ros2idl) {
   if (Test-Path $ros2idl) {
-    Write-Host '[info] mcap-ros2idl-support を VM へ転送...'
+    Write-Host '[info] Sending mcap-ros2idl-support to VM...'
     Send-Folder $ros2idl $remoteDir
-    # run_on_gcp.sh はリポジトリルート ($remoteDir) に cd するので、そこからの相対で渡す
+    # run_on_gcp.sh cd's to the repo root ($remoteDir), so pass a path relative to it
     $envExport += "ROS2IDL_PATH=$(Q 'mcap-ros2idl-support') "
   } else {
-    Write-Warning "ROS2IDL_LOCAL_PATH が見つかりません: $ros2idl (スキップ)"
+    Write-Warning "ROS2IDL_LOCAL_PATH not found: $ros2idl (skipping)"
   }
 }
 
-# 手元の ADC (application-default 認証) を VM にコピー。VM のサービスアカウントではなく
-# 自分の権限で GCS を読めるようになる (バケット側の IAM 変更が不要)。
+# copy local ADC (application-default creds) to the VM so it reads GCS as you,
+# not as the VM service account (no bucket IAM change needed).
 if ($SetupAuth) {
   $adc = if ($env:GOOGLE_APPLICATION_CREDENTIALS) { $env:GOOGLE_APPLICATION_CREDENTIALS }
          else { Join-Path $env:APPDATA 'gcloud\application_default_credentials.json' }
   if (-not (Test-Path $adc)) {
     throw @"
-ローカルの ADC が見つかりません: $adc
-先に PowerShell で次を実行してください (ブラウザで認証):
+Local ADC not found: $adc
+Run this first (opens a browser):
   gcloud auth application-default login
-その後もう一度 -SetupAuth 付きで実行してください。
+Then run again with -SetupAuth.
 "@
   }
-  Write-Host '[info] ローカルの認証情報 (ADC) を VM へコピー...'
+  Write-Host '[info] Copying local ADC to the VM...'
   Invoke-RemoteSsh 'mkdir -p .config/gcloud'
   Invoke-Scp $adc "${vm}:.config/gcloud/application_default_credentials.json"
-  Write-Host '[ok] 以後この VM はあなたの権限で GCS を読みます。'
+  Write-Host '[ok] VM now reads GCS with your credentials.'
 }
 
-# 抽出引数を組み立てる
+# build extraction args
 $ra = @()
 if ($Vehicle)       { $ra += @('--vehicle', $Vehicle) }
 if ($Start)         { $ra += @('--start', $Start) }
@@ -191,30 +192,30 @@ if ($ExcludeTopics) { $ra += '--exclude-topics'; $ra += $ExcludeTopics }
 if ($IncludeSensor) { $ra += '--include-sensor' }
 if ($IncludeImage)  { $ra += '--include-image' }
 if ($ExtraArgs)     { $ra += $ExtraArgs }
-if ($ra.Count -eq 0) { throw '抽出引数がありません。-Vehicle/-Start/-End/-Topics 等を指定してください。' }
+if ($ra.Count -eq 0) { throw 'No extraction args. Pass -Vehicle/-Start/-End/-Topics etc.' }
 
 $remoteArgs = ($ra | ForEach-Object { Q $_ }) -join ' '
 $runCmd = "cd $remoteDir && $envExport" + "bash scripts/run_on_gcp.sh $remoteArgs"
 
-# 一覧/確認/見積もりモードは CSV を出さないので、実行だけで終わる
+# list/topics/estimate modes produce no CSV; run only
 $noCsvMode = @('--list-only', '--list-topics', '--estimate') | Where-Object { $ra -contains $_ }
 
-Write-Host '[info] VM 上で抽出を実行 (GCS 読み込みは egress 無料)...'
+Write-Host '[info] Running extraction on the VM (GCS read is egress-free)...'
 Invoke-RemoteSsh $runCmd
 
 if ($noCsvMode) {
-  Write-Host '[ok] 完了 (一覧/見積もりモードのため CSV ダウンロードはありません)。'
+  Write-Host '[ok] Done (list/estimate mode: no CSV download).'
 }
 else {
-  Write-Host '[info] CSV を手元へダウンロード...'
+  Write-Host '[info] Downloading CSV...'
   New-Item -ItemType Directory -Force -Path $localOut | Out-Null
   $archive = Join-Path $localOut 'out_csv.tar.gz'
   Invoke-Scp "${vm}:$remoteDir/out_csv.tar.gz" $archive
-  # Windows 10+ は tar.exe 同梱
+  # Windows 10+ ships tar.exe
   & tar -xzf $archive -C $localOut
   Remove-Item $archive -ErrorAction SilentlyContinue
 
-  Write-Host "[ok] 完了。CSV は $localOut\ に展開しました:"
+  Write-Host "[ok] Done. CSVs extracted to $localOut\:"
   Get-ChildItem -Path $localOut -Filter *.csv | ForEach-Object { Write-Host "  $($_.Name)" }
 }
 

@@ -1,16 +1,14 @@
 # scripts/gcp_status.ps1
-# 「今、課金対象のリソースが残っていないか」を確認する (読み取りのみ・安全)。
-# モデルB (毎回作って消す) で、削除し忘れ・クラッシュで VM が残っていないかの点検用。
-#
-# 使い方 (PowerShell):
+# Check whether any billable worker resource is left (read-only, safe). ASCII only.
+# For Model B (create/delete each time): confirm no VM was left after a crash.
 #   .\scripts\gcp_status.ps1
-# 何も表示されなければ、この用途での課金はありません。
+# If the VM name does not appear, there is no charge for this use.
 
 $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 function Read-GcpEnv([string]$path) {
-  if (-not (Test-Path $path)) { throw "$path がありません。" }
+  if (-not (Test-Path $path)) { throw "$path not found." }
   $h = @{}
   foreach ($line in Get-Content -LiteralPath $path) {
     if ($line -match '^\s*#') { continue }
@@ -30,18 +28,18 @@ $cfg = Read-GcpEnv $envFile
 $project = $cfg['GCP_PROJECT']
 $vm = $cfg['GCP_VM']
 
-Write-Host "=== 課金対象リソースの点検 (project: $project) ==="
+Write-Host "=== Billable resource check (project: $project) ==="
 Write-Host ''
-Write-Host "--- VM インスタンス (name=$vm) ---  ※ STATUS が RUNNING なら計算課金中"
+Write-Host "--- VM instances (name=$vm) ---  (STATUS RUNNING = compute is billing)"
 & gcloud compute instances list --project=$project --filter="name=$vm" --format='table(name,zone,status)'
 Write-Host ''
-Write-Host "--- ディスク (name=$vm) ---  ※ 存在するだけで (停止中でも) 課金"
+Write-Host "--- Disks (name=$vm) ---  (billed whenever it exists, even stopped)"
 & gcloud compute disks list --project=$project --filter="name=$vm" --format='table(name,zone,sizeGb,status)'
 Write-Host ''
-Write-Host "--- 予約済み外部IP (name=$vm) ---  ※ このツールは IP を予約しないので通常は空"
+Write-Host "--- Reserved external IPs (name=$vm) ---  (this tool never reserves one; usually empty)"
 & gcloud compute addresses list --project=$project --filter="name~$vm" --format='table(name,region,address,status)'
 Write-Host ''
-Write-Host "上の各セクションに $vm の行が無ければ、この用途での課金はありません。"
-Write-Host "(共有プロジェクトでは他人の VM/IP も存在しますが、それらは無関係。触らないこと。)"
-Write-Host "残っていた場合の削除:"
+Write-Host "If none of the sections show a $vm row, there is no charge for this use."
+Write-Host "(In a shared project other people's VMs/IPs also exist; they are unrelated. Do not touch.)"
+Write-Host "To delete if left over:"
 Write-Host "  gcloud compute instances delete $vm --project=$project --zone=<ZONE>"

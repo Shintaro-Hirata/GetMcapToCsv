@@ -1,16 +1,13 @@
 # scripts/gcp_create_vm.ps1
-# PowerShell 版の VM 作成スクリプト (bash 不要)。
-# バケットと同一リージョン (東京) に mcap->CSV 変換用の小さな VM を1台作る。
-# scripts/gcp.env を読む。
+# PowerShell VM-creation script (ASCII only, so Windows PowerShell 5.1 reads it
+# correctly regardless of console codepage). Creates one small VM in the bucket's
+# region for mcap->CSV conversion. Reads scripts/gcp.env.
 #
-# 使い方 (PowerShell):
-#   Copy-Item scripts\gcp.env.example scripts\gcp.env   # 編集
+# Usage:
+#   Copy-Item scripts\gcp.env.example scripts\gcp.env   # then edit
 #   .\scripts\gcp_create_vm.ps1
-#
-# 使い終わったら停止:
-#   gcloud compute instances stop <VM> --zone <ZONE> --project <PROJECT>
 param(
-  [switch]$Yes   # 確認プロンプトを出さずに作成する (UI/自動実行から呼ぶ用)
+  [switch]$Yes   # skip the confirmation prompt (for UI / automation)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,14 +15,14 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 function Read-GcpEnv([string]$path) {
   if (-not (Test-Path $path)) {
-    throw "$path がありません。scripts\gcp.env.example からコピーして編集してください。"
+    throw "$path not found. Copy scripts\gcp.env.example to scripts\gcp.env and edit it."
   }
   $h = @{}
   foreach ($line in Get-Content -LiteralPath $path) {
     if ($line -match '^\s*#') { continue }
     if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$') {
       $k = $matches[1]; $v = $matches[2]
-      # クォート値は中身を採用 (行末コメントは無視)、非クォートは最初の # 以降を除去
+      # quoted value -> take inside quotes (ignore trailing comment); unquoted -> strip from '#'
       if ($v -match '^\s*"([^"]*)"') { $v = $matches[1] }
       elseif ($v -match "^\s*'([^']*)'") { $v = $matches[1] }
       else { $v = ($v -split '#', 2)[0].Trim() }
@@ -42,21 +39,21 @@ function Cfg([string]$key, $default = $null) {
   if ($cfg.ContainsKey($key) -and $cfg[$key] -ne '') { return $cfg[$key] } else { return $default }
 }
 
-$project = Cfg 'GCP_PROJECT'; if (-not $project) { throw 'gcp.env に GCP_PROJECT を設定してください' }
-$zone    = Cfg 'GCP_ZONE';    if (-not $zone)    { throw 'gcp.env に GCP_ZONE を設定してください' }
-$vm      = Cfg 'GCP_VM';      if (-not $vm)      { throw 'gcp.env に GCP_VM を設定してください' }
+$project = Cfg 'GCP_PROJECT'; if (-not $project) { throw 'Set GCP_PROJECT in gcp.env' }
+$zone    = Cfg 'GCP_ZONE';    if (-not $zone)    { throw 'Set GCP_ZONE in gcp.env' }
+$vm      = Cfg 'GCP_VM';      if (-not $vm)      { throw 'Set GCP_VM in gcp.env' }
 
 if ($project -eq 'your-project-id' -or $vm -eq 'your-vm-name') {
   throw @"
-gcp.env が未編集です (GCP_PROJECT / GCP_VM がサンプルのまま)。実際の値に書き換えてください。
-  現在の GCP_PROJECT = '$project'
-使えるプロジェクトの一覧:  gcloud projects list
-既定のプロジェクト確認  :  gcloud config get-value project
+gcp.env is not edited (GCP_PROJECT / GCP_VM are still the samples). Set real values.
+  current GCP_PROJECT = '$project'
+List usable projects:  gcloud projects list
+Default project     :  gcloud config get-value project
 "@
 }
 
 $machineType = Cfg 'MACHINE_TYPE' 'e2-standard-4'
-$bootDiskGb  = Cfg 'BOOT_DISK_GB' '30'   # OS + 一時ファイルに十分。停止中ディスク代を抑える (30GB≒月¥450)
+$bootDiskGb  = Cfg 'BOOT_DISK_GB' '30'   # OS + temp is plenty; keeps stopped-disk cost low (30GB ~= 450 JPY/mo)
 $imageFamily = Cfg 'IMAGE_FAMILY' 'debian-12'
 $imageProj   = Cfg 'IMAGE_PROJECT' 'debian-cloud'
 $private     = (Cfg 'PRIVATE' '0') -eq '1'
@@ -73,32 +70,32 @@ if ($private) {
   if ($sshFlags -notcontains '--tunnel-through-iap') { $sshFlags += '--tunnel-through-iap' }
 }
 
-Write-Host '[info] VM を作成します:'
-Write-Host "  プロジェクト : $project"
-Write-Host "  ゾーン       : $zone"
-Write-Host "  名前         : $vm"
-Write-Host "  マシン       : $machineType / ブートディスク ${bootDiskGb}GB / $imageFamily"
-Write-Host '  権限         : バケット読み取り (devstorage.read_only)'
+Write-Host '[info] Creating VM:'
+Write-Host "  project : $project"
+Write-Host "  zone    : $zone"
+Write-Host "  name    : $vm"
+Write-Host "  machine : $machineType / boot disk ${bootDiskGb}GB / $imageFamily"
+Write-Host '  scope   : bucket read (devstorage.read_only)'
 if ($private) {
-  Write-Host '  公開範囲     : 最小 (外部IPなし / IAP SSH / OS Login)'
+  Write-Host '  network : private (no external IP / IAP SSH / OS Login)'
 } else {
-  Write-Host '  公開範囲     : 標準 (外部IPあり / SSH は IAM で保護)'
+  Write-Host '  network : standard (external IP / SSH protected by IAM)'
 }
 if (-not $Yes) {
-  $ans = Read-Host '作成しますか? [y/N]'
-  if ($ans -ne 'y' -and $ans -ne 'Y') { Write-Host '中止しました。'; exit 0 }
+  $ans = Read-Host 'Create? [y/N]'
+  if ($ans -ne 'y' -and $ans -ne 'Y') { Write-Host 'Aborted.'; exit 0 }
 }
 
 if ($private) {
   $fwRule = Cfg 'FW_RULE' "allow-iap-ssh-$iapTag"
   & gcloud compute firewall-rules describe $fwRule --project=$project 2>$null | Out-Null
   if ($LASTEXITCODE -ne 0) {
-    Write-Host "[info] IAP SSH 用ファイアウォールを作成: $fwRule"
+    Write-Host "[info] Creating IAP SSH firewall rule: $fwRule"
     & gcloud compute firewall-rules create $fwRule --project=$project `
       --direction=INGRESS --action=ALLOW --rules=tcp:22 `
       --source-ranges=35.235.240.0/20 --target-tags=$iapTag
     if ($LASTEXITCODE -ne 0) {
-      Write-Warning 'ファイアウォール作成に失敗 (権限/組織ポリシー)。管理者に tcp:22 from 35.235.240.0/20 の許可を依頼してください。'
+      Write-Warning 'Firewall create failed (permission/org policy). Ask an admin to allow tcp:22 from 35.235.240.0/20.'
     }
   }
 }
@@ -109,21 +106,21 @@ $createArgs = @('compute', 'instances', 'create', $vm,
   "--boot-disk-size=${bootDiskGb}GB", '--boot-disk-type=pd-balanced',
   '--scopes=https://www.googleapis.com/auth/devstorage.read_only') + $netArgs
 & gcloud @createArgs
-if ($LASTEXITCODE -ne 0) { throw 'VM 作成に失敗しました。上のエラーを確認してください。' }
+if ($LASTEXITCODE -ne 0) { throw 'VM creation failed. Check the error above.' }
 
 Write-Host ''
-Write-Host '[ok] 作成しました。初回のみ Python を用意します...'
+Write-Host '[ok] Created. Installing Python (first boot)...'
 $installCmd = 'sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv python3-pip >/dev/null && python3 --version'
 $sshArgs = @('compute', 'ssh', $vm, "--project=$project", "--zone=$zone") + $sshFlags + @('--command', $installCmd)
 & gcloud @sshArgs
 
 Write-Host ''
 if ($private) {
-  Write-Host '[info] このVMは外部IPなし + IAP SSH です。gcp.env に次を入れておいてください:'
+  Write-Host '[info] This VM is private (no external IP + IAP SSH). Put this in gcp.env:'
   Write-Host '         GCLOUD_SSH_FLAGS="--tunnel-through-iap"'
 }
-Write-Host '[ok] 準備完了。抽出は次で実行できます:'
+Write-Host '[ok] Ready. Extract with:'
 Write-Host '  .\scripts\gcp_fetch.ps1 -Vehicle GIGA09 -Start "2026-07-01 20:40" -End "2026-07-01 20:45" -Topics topics.example.t2.json'
 Write-Host ''
-Write-Host '使い終わったら VM を止めて課金を抑えてください:'
+Write-Host 'When done, stop the VM to reduce cost:'
 Write-Host "  gcloud compute instances stop $vm --zone $zone --project $project"
