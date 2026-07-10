@@ -9,6 +9,9 @@
 #
 # 使い終わったら停止:
 #   gcloud compute instances stop <VM> --zone <ZONE> --project <PROJECT>
+param(
+  [switch]$Yes   # 確認プロンプトを出さずに作成する (UI/自動実行から呼ぶ用)
+)
 
 $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -81,8 +84,10 @@ if ($private) {
 } else {
   Write-Host '  公開範囲     : 標準 (外部IPあり / SSH は IAM で保護)'
 }
-$ans = Read-Host '作成しますか? [y/N]'
-if ($ans -ne 'y' -and $ans -ne 'Y') { Write-Host '中止しました。'; exit 0 }
+if (-not $Yes) {
+  $ans = Read-Host '作成しますか? [y/N]'
+  if ($ans -ne 'y' -and $ans -ne 'Y') { Write-Host '中止しました。'; exit 0 }
+}
 
 if ($private) {
   $fwRule = Cfg 'FW_RULE' "allow-iap-ssh-$iapTag"

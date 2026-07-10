@@ -74,6 +74,15 @@ t2-ft-original-data/
      1 本の mcap に生データのままコピー（デコードしないので速い）
    - **mcap（元ファイルをそのまま保存）** … 対象の 1 分刻み mcap をそのままダウンロード
 
+### 入力元「GCS (VM経由・課金最小)」
+
+① の「入力元」で **GCS (VM経由)** を選ぶと、UI から GCP 内実行（[docs/GCP_EXECUTION.md](docs/GCP_EXECUTION.md)）を
+そのまま実行できる。車両ID・時間帯・トピック・出力先を入れて「抽出実行」を押すと、
+VM 作成 → VM 上で mcap→CSV 変換 → CSV だけ回収 →（モデルB なら）VM 削除、までを
+1 ボタンで行い、ログを画面に流す。**mcap は GCP から出ないので egress 課金がほぼ 0**。
+事前に `scripts/gcp.env` の設定と `gcloud auth application-default login` が必要
+（詳細は docs/GCP_EXECUTION.md）。「課金状況を確認」ボタンで残 VM の点検もできる。
+
 プリセットは `mcap_presets.json` を編集すれば増やせる。
 「切り出し君互換」プリセットは仮のリストなので、実際の切り出し君の対象トピックに
 合わせて更新すること。

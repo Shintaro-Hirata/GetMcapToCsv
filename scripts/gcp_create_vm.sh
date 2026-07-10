@@ -10,6 +10,10 @@
 #   gcloud compute instances stop <VM> --zone <ZONE> --project <PROJECT>
 set -euo pipefail
 
+# --yes で確認プロンプトを出さずに作成 (UI/自動実行から呼ぶ用)
+YES="${YES:-0}"
+for a in "$@"; do [ "$a" = "--yes" ] && YES=1; done
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="${GCP_ENV:-$SCRIPT_DIR/gcp.env}"
 [ -f "$ENV_FILE" ] || { echo "[error] $ENV_FILE がありません。gcp.env.example からコピーしてください。"; exit 1; }
@@ -60,8 +64,10 @@ if [ "$PRIVATE" = "1" ]; then
 else
   echo "  公開範囲     : 標準 (外部IPあり / SSH は IAM で保護)"
 fi
-read -r -p "作成しますか? [y/N] " ans
-[ "$ans" = "y" ] || [ "$ans" = "Y" ] || { echo "中止しました。"; exit 0; }
+if [ "$YES" != "1" ]; then
+  read -r -p "作成しますか? [y/N] " ans
+  [ "$ans" = "y" ] || [ "$ans" = "Y" ] || { echo "中止しました。"; exit 0; }
+fi
 
 # PRIVATE 時は IAP からの SSH を許可するファイアウォールを用意 (無ければ作る。best-effort)
 if [ "$PRIVATE" = "1" ]; then
