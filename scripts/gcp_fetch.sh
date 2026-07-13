@@ -193,8 +193,10 @@ fi
 echo "[info] CSV を手元へダウンロード..."
 mkdir -p "$LOCAL_OUT"
 gcloud compute scp "${SSH_FLAGS[@]}" "$REMOTE:$REMOTE_DIR/out_csv.tar.gz" "$LOCAL_OUT/out_csv.tar.gz"
+# このランで生成された分だけを一覧・記録 (フォルダに残る過去ファイルと区別する)
+tar -tzf "$LOCAL_OUT/out_csv.tar.gz" | sed 's#^\./##' | grep '\.csv$' | sort > "$LOCAL_OUT/_last_run.txt"
 tar -xzf "$LOCAL_OUT/out_csv.tar.gz" -C "$LOCAL_OUT"
 rm -f "$LOCAL_OUT/out_csv.tar.gz"
 
-echo "[ok] 完了。CSV は $LOCAL_OUT/ に展開しました:"
-ls -1 "$LOCAL_OUT"/*.csv 2>/dev/null || echo "  (CSV が見つかりません。VM 側のログを確認してください)"
+echo "[ok] 完了。このランで生成された CSV ($(wc -l < "$LOCAL_OUT/_last_run.txt") 件) を $LOCAL_OUT/ に展開しました:"
+sed 's#^#  #' "$LOCAL_OUT/_last_run.txt"

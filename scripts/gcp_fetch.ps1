@@ -256,12 +256,19 @@ else {
   New-Item -ItemType Directory -Force -Path $localOut | Out-Null
   $archive = Join-Path $localOut 'out_csv.tar.gz'
   Invoke-Scp "${vm}:$remoteDir/out_csv.tar.gz" $archive
+  # list exactly what THIS run produced (archive contents) so old files already in
+  # the output folder are not mistaken for this run's output
+  $produced = & tar -tzf $archive |
+    ForEach-Object { ($_ -replace '^\./', '').Trim('/') } |
+    Where-Object { $_ -match '\.csv$' } | Sort-Object
   # Windows 10+ ships tar.exe
   & tar -xzf $archive -C $localOut
   Remove-Item $archive -ErrorAction SilentlyContinue
+  # manifest of this run's files (app.py reads it to show only new output)
+  Set-Content -Path (Join-Path $localOut '_last_run.txt') -Value $produced -Encoding UTF8
 
-  Write-Host "[ok] Done. CSVs extracted to $localOut\:"
-  Get-ChildItem -Path $localOut -Filter *.csv | ForEach-Object { Write-Host "  $($_.Name)" }
+  Write-Host "[ok] Done. This run produced $($produced.Count) CSV file(s) in $localOut\:"
+  $produced | ForEach-Object { Write-Host "  $_" }
 }
 
 }

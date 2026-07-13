@@ -755,13 +755,24 @@ if ss.sources:
                 st.info("② VM で抽出し、CSV を回収します...")
                 rc, _ = run_script_streaming(_vm_script_cmd("gcp_fetch", ps, sh), log_area)
                 if rc == 0:
-                    csvs = [p for p in sorted(glob.glob(os.path.join(outdir, "*.csv")))
-                            if os.path.getmtime(p) >= t_run0 - 5]
-                    st.success(f"完了: CSV {len(csvs)} 件を {outdir} に取得しました"
-                               "（mcap は GCP 内で処理したため egress 課金はほぼ 0）。")
-                    for c in csvs[:200]:
-                        st.write(f"- `{os.path.basename(c)}` "
-                                 f"({core.size_str(os.path.getsize(c))})")
+                    # gcp_fetch が書き出す「このランで生成した分」だけを表示する
+                    # (出力フォルダに残る過去ランの CSV と混同しないため)
+                    manifest = os.path.join(outdir, "_last_run.txt")
+                    names = []
+                    try:
+                        with open(manifest, encoding="utf-8-sig") as mf:
+                            names = [ln.strip() for ln in mf if ln.strip()]
+                    except OSError:
+                        names = [os.path.basename(p)
+                                 for p in sorted(glob.glob(os.path.join(outdir, "*.csv")))
+                                 if os.path.getmtime(p) >= t_run0 - 5]
+                    st.success(f"完了: このランで CSV {len(names)} 件を {outdir} に取得しました"
+                               "（mcap は GCP 内で処理したため egress 課金はほぼ 0）。"
+                               "※ フォルダには過去ランの CSV も残っています。")
+                    for n in names[:200]:
+                        p = os.path.join(outdir, n)
+                        sz = f" ({core.size_str(os.path.getsize(p))})" if os.path.exists(p) else ""
+                        st.write(f"- `{n}`{sz}")
                 else:
                     st.error("抽出に失敗しました。ログを確認してください。"
                              "（VM は自動で削除/停止済みのはずですが、"
