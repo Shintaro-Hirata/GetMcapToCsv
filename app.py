@@ -97,6 +97,27 @@ ss.setdefault("result_transfer", None)  # 抽出時の GCS 転送量とキャッ
 ss.setdefault("topic_columns", {})      # {topic: [フラット列名, ...]} カラム絞り込み用
 ss.setdefault("transfer_estimate", None)  # 転送量見積もりの結果
 
+# --- 入力条件の保持 -------------------------------------------------
+# Streamlit はその実行で描画されなかったウィジェットの状態を破棄するため、
+# 入力元の切り替え等で一時的に非表示になると値がリセットされてしまう。
+# 毎回再代入して「アプリ状態」に昇格させることで、切り替え後も値を維持する。
+_PERSISTED_KEYS = (
+    "w_vehicle", "w_date", "w_tstart", "w_tend", "w_img", "w_sen",
+    "local_pattern", "local_time_filter",
+    "csv_route", "csvvm_model", "csvvm_auth",
+)
+for _k in list(ss.keys()):
+    if _k in _PERSISTED_KEYS or str(_k).startswith("colsel_"):
+        ss[_k] = ss[_k]
+
+# 条件ウィジェットの初期値 (キー未登録のときだけ入る)
+ss.setdefault("w_vehicle", "GIGA09")
+ss.setdefault("w_date", datetime.date.today() - datetime.timedelta(days=1))
+ss.setdefault("w_tstart", "12:00:00")
+ss.setdefault("w_tend", "12:05:00")
+ss.setdefault("w_img", True)
+ss.setdefault("w_sen", False)
+
 
 def run_captured(fn, *args, **kwargs):
     """print 出力を捕まえつつ実行し (戻り値, ログ文字列) を返す。"""
@@ -161,170 +182,18 @@ def gcs_client():
 st.header("① 検索条件")
 
 input_mode = st.radio(
-    "入力元", ["GCS から検索", "ローカルの mcap", "GCS (VM経由・課金最小)"],
+    "入力元", ["GCS から検索", "ローカルの mcap"],
     horizontal=True, key="input_mode",
-    help="「GCS から検索」= ファイル・トピック・カラムを確認しながら選べる (推奨)。"
+    help="「GCS から検索」= ファイル・トピック・カラムを確認しながら選ぶ (推奨)。"
          "CSV は④で「VM 経由」を選べば mcap のダウンロード課金なしで取得できる。"
-         "「GCS (VM経由)」= 検索 UI を使わず条件だけ指定して一気に VM 実行する簡易版。"
          "「ローカルの mcap」= 手元の mcap から抽出。")
-
-# ================================================================
-# GCS (VM経由): VM を作って GCP 内で変換し CSV だけ回収する (docs/GCP_EXECUTION.md)
-# ================================================================
-if input_mode.startswith("GCS (VM"):
-    st.caption("GCP 内の VM で mcap→CSV 変換を行い、手元には軽い CSV だけダウンロードします"
-               "（重い mcap は GCP から出ないので egress 課金がほぼ 0）。")
-    cfg = read_gcp_env()
-    if not cfg.get("GCP_PROJECT") or cfg.get("GCP_PROJECT") == "your-project-id":
-        st.error("scripts/gcp.env が未設定です。docs/GCP_EXECUTION.md の手順で "
-                 "GCP_PROJECT / GCP_ZONE / GCP_VM / ROS2IDL_LOCAL_PATH を設定してください。")
-        st.stop()
-    st.caption(f"設定: project={cfg.get('GCP_PROJECT')} / zone={cfg.get('GCP_ZONE')} / "
-               f"vm={cfg.get('GCP_VM')}")
-
-    vc1, vc2, vc3, vc4 = st.columns([1, 1, 1, 1])
-    with vc1:
-        vm_vehicle = st.text_input("車両ID", value="GIGA09", key="vm_vehicle")
-    with vc2:
-        vm_date = st.date_input("日付 (JST)", key="vm_date",
-                                value=datetime.date.today() - datetime.timedelta(days=1))
-    with vc3:
-        vm_start_text = st.text_input("開始時刻", value="20:40:00", key="vm_start")
-    with vc4:
-        vm_end_text = st.text_input("終了時刻", value="20:45:00", key="vm_end")
-
-    ts = parse_time_text(vm_start_text)
-    te = parse_time_text(vm_end_text)
-    if ts is None or te is None:
-        st.error("時刻を解釈できません（例: 20:40 / 20:40:15）。")
-        st.stop()
-    vm_start_dt = datetime.datetime.combine(vm_date, ts, tzinfo=core.JST)
-    vm_end_dt = datetime.datetime.combine(vm_date, te, tzinfo=core.JST)
-    if vm_end_dt <= vm_start_dt:
-        vm_end_dt += datetime.timedelta(days=1)
-    st.caption(f"🕐 {vm_start_dt:%Y-%m-%d %H:%M:%S} 〜 {vm_end_dt:%Y-%m-%d %H:%M:%S} (JST)")
-
-    presets = {}
-    try:
-        presets = {k: v for k, v in json.load(open(PRESET_FILE, encoding="utf-8")).items()
-                   if not k.startswith("_")}
-    except Exception:
-        pass
-
-    tcol1, tcol2 = st.columns([1, 2])
-    with tcol1:
-        topic_mode = st.radio("トピック", ["全トピック", "プリセット", "topics JSON"],
-                              key="vm_topic_mode")
-    topics_file = None
-    exclude_topics = []
-    with tcol2:
-        if topic_mode == "プリセット":
-            pname = st.selectbox("プリセット", list(presets.keys()) or ["(なし)"],
-                                 key="vm_preset")
-            # プリセットは一時 JSON に書き出して VM へ渡す
-            if presets:
-                tmp = os.path.join(APP_DIR, "out", "_vm_topics.json")
-                os.makedirs(os.path.dirname(tmp), exist_ok=True)
-                pats = presets[pname]
-                json.dump({p: {"suffix": p.strip("/").replace("/", "_"), "fields": []}
-                           for p in pats if p.startswith("/")}, open(tmp, "w", encoding="utf-8"))
-                topics_file = tmp
-        elif topic_mode == "topics JSON":
-            topics_file = st.text_input("topics JSON パス", value="topics.example.t2.json",
-                                        key="vm_topics_file")
-        else:
-            ex = st.text_input("除外トピック（スペース区切り・任意）", value="", key="vm_exclude",
-                               help='例: /tf* /events/* /t2/positioning_driver/internal/*')
-            exclude_topics = ex.split()
-
-    oc1, oc2, oc3 = st.columns(3)
-    with oc1:
-        vm_include_image = st.checkbox("record_debug_image も含める", value=False, key="vm_img")
-    with oc2:
-        vm_include_sensor = st.checkbox("record_sensor も含める", value=False, key="vm_sen")
-    with oc3:
-        vm_outdir = st.text_input("出力フォルダ", value=os.path.join(APP_DIR, "out"), key="vm_out")
-
-    mc1, mc2 = st.columns([2, 1])
-    with mc1:
-        vm_model = st.radio(
-            "運用モデル",
-            ["B: 毎回作って消す（standing ¥0）", "A: 既存/常設VMを使う（start→stop）"],
-            key="vm_model",
-            help="B は使わない間 ¥0（毎回 VM 作成で数分）。A は小さな VM を残す（月 ~¥450）が速い。")
-    with mc2:
-        vm_setup_auth = st.checkbox("認証を VM に入れる（初回/新規VMは必須）", value=True,
-                                    key="vm_setup_auth",
-                                    help="手元の gcloud auth application-default login の認証を VM へコピー。")
-
-    model_b = vm_model.startswith("B")
-
-    bcol1, bcol2 = st.columns([1, 3])
-    with bcol1:
-        do_status = st.button("🔍 課金状況を確認")
-    with bcol2:
-        do_run = st.button("🚀 抽出実行（VMで変換→CSV回収）", type="primary")
-
-    log_area = st.empty()
-
-    if do_status:
-        cmd = _vm_script_cmd("gcp_status", [], [])
-        with st.spinner("確認中..."):
-            run_script_streaming(cmd, log_area)
-
-    if do_run:
-        # 共通の抽出引数を PowerShell / bash 両形式で用意
-        s_local = f"{vm_start_dt:%Y-%m-%d %H:%M:%S}"
-        e_local = f"{vm_end_dt:%Y-%m-%d %H:%M:%S}"
-        ps = ["-Vehicle", vm_vehicle, "-Start", s_local, "-End", e_local]
-        sh = ["--vehicle", vm_vehicle, "--start", s_local, "--end", e_local]
-        if topic_mode == "全トピック":
-            ps.append("-AllTopics"); sh.append("--all-topics")
-            if exclude_topics:
-                ps += ["-ExcludeTopics"] + exclude_topics
-                sh += ["--exclude-topics"] + exclude_topics
-        elif topics_file:
-            ps += ["-Topics", topics_file]; sh += ["--topics", topics_file]
-        if vm_include_image:
-            ps.append("-IncludeImage"); sh.append("--include-image")
-        if vm_include_sensor:
-            ps.append("-IncludeSensor"); sh.append("--include-sensor")
-        if vm_setup_auth:
-            ps.append("-SetupAuth"); sh.append("--setup-auth")
-        if model_b:
-            ps.append("-DeleteAfter"); sh.append("--delete-after")
-        else:
-            ps.append("-StartStop"); sh.append("--start-stop")
-
-        try:
-            if model_b:
-                st.info("① VM を作成します（数分）...")
-                rc, _ = run_script_streaming(
-                    _vm_script_cmd("gcp_create_vm", ["-Yes"], ["--yes"]), log_area)
-                if rc != 0:
-                    st.error("VM 作成に失敗しました。ログを確認してください。")
-                    st.stop()
-            st.info("② VM で抽出し、CSV を回収します...")
-            rc, _ = run_script_streaming(_vm_script_cmd("gcp_fetch", ps, sh), log_area)
-            if rc == 0:
-                st.success("完了しました。")
-                csvs = sorted(glob.glob(os.path.join(vm_outdir, "*.csv")))
-                st.caption(f"出力 CSV: {len(csvs)} 件（{vm_outdir}）")
-                for c in csvs[:200]:
-                    st.write(f"- {os.path.basename(c)}")
-            else:
-                st.error("抽出に失敗しました。ログを確認してください。")
-        except Exception as e:
-            st.error(f"実行に失敗しました: {e}")
-
-    st.stop()
 
 is_gcs = input_mode.startswith("GCS から")
 
 if is_gcs:
     col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
     with col1:
-        vehicle = st.text_input("車両ID", value="GIGA09", help="例: GIGA07, GIGA09")
+        vehicle = st.text_input("車両ID", key="w_vehicle", help="例: GIGA07, GIGA09")
 else:
     vehicle = ""
     local_pattern = st.text_input(
@@ -339,12 +208,12 @@ else:
     col2, col3, col4 = st.columns([1, 1, 1])
 
 with col2:
-    date = st.date_input("日付 (JST)", value=datetime.date.today() - datetime.timedelta(days=1))
+    date = st.date_input("日付 (JST)", key="w_date")
 with col3:
-    t_start_text = st.text_input("開始時刻 (HH:MM:SS)", value="12:00:00",
+    t_start_text = st.text_input("開始時刻 (HH:MM:SS)", key="w_tstart",
                                  help="秒まで指定可。例: 20:40 / 20:40:15 / 204015")
 with col4:
-    t_end_text = st.text_input("終了時刻 (HH:MM:SS)", value="12:05:00",
+    t_end_text = st.text_input("終了時刻 (HH:MM:SS)", key="w_tend",
                                help="秒まで指定可。例: 20:45 / 20:45:30 / 204530")
 
 time_needed = is_gcs or st.session_state.get("local_time_filter", True)
@@ -364,11 +233,11 @@ if is_gcs:
     icol1, icol2, _ = st.columns([1, 1, 2])
     with icol1:
         include_image = st.checkbox(
-            "record_debug_image も含める", value=True,
+            "record_debug_image も含める", key="w_img",
             help="develop と同じ連番の image ファイルも対象に加える。"
                  "CSV 抽出だけが目的なら、オフにすると GCS 転送量 (課金) を大きく減らせます。")
     with icol2:
-        include_sensor = st.checkbox("record_sensor も含める", value=False,
+        include_sensor = st.checkbox("record_sensor も含める", key="w_sen",
                                      help="develop と同じ連番の sensor ファイルも対象に加える (サイズ大)")
 
 with st.expander("詳細オプション"):
@@ -813,6 +682,8 @@ if ss.sources:
                 st.caption("削減が 40% 以上見込めるファイルは、抽出時に自動で部分読み込みに"
                            "切り替わります (それ未満は丸ごとダウンロード + キャッシュ)。")
 
+    st.caption("⏳ 実行中にページ内の他のボタンや入力を操作すると処理が中断されます"
+               "（Streamlit の仕様）。完了表示が出るまでそのままお待ちください。")
     if st.button("🚀 ④ 抽出実行", type="primary", disabled=not can_run):
         params = ss.search_params
         os.makedirs(outdir, exist_ok=True)

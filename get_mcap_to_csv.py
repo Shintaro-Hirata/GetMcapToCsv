@@ -1495,20 +1495,39 @@ def sample_topic_columns(sources, topics, cache_dir=None, samples_per_topic=3,
                 f = src.open(chunk_size=4 * 1024 * 1024)
             with f:
                 reader = make_reader(f, decoder_factories=factories)
-                it = reader.iter_decoded_messages(
+                # iter_decoded_messages だと必要数が揃うまで全メッセージを
+                # デコードしてしまい重い (ros2idl の Python デコードは CPU 高負荷)。
+                # 生メッセージで受け、各トピック samples_per_topic 件だけデコードする。
+                decoders = {}  # channel.id -> デコード関数 (None = デコーダなし)
+
+                def _decoder_for(schema, channel):
+                    if channel.id not in decoders:
+                        d = None
+                        for fac in factories:
+                            d = fac.decoder_for(channel.message_encoding, schema)
+                            if d is not None:
+                                break
+                        decoders[channel.id] = d
+                    return decoders[channel.id]
+
+                it = reader.iter_messages(
                     topics=sorted(remaining), start_time=start_ns, end_time=end_ns)
                 while remaining:
                     try:
-                        tup = next(it)
+                        schema, channel, message = next(it)
                     except StopIteration:
                         break
                     except Exception:
-                        continue  # 個別メッセージのデコード失敗はスキップ
-                    topic = tup.channel.topic
+                        continue  # 個別メッセージの読み込み失敗はスキップ
+                    topic = channel.topic
                     if topic not in cols or counts[topic] >= samples_per_topic:
-                        continue
+                        continue  # 既に揃ったトピックはデコードせず読み飛ばす (安価)
                     try:
-                        for k in flatten(tup.decoded_message):
+                        dec = _decoder_for(schema, channel)
+                        if dec is None:
+                            remaining.discard(topic)  # デコーダが無ければ待っても無駄
+                            continue
+                        for k in flatten(dec(message.data)):
                             cols[topic][k] = True
                         counts[topic] += 1
                     except Exception:

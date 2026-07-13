@@ -74,14 +74,16 @@ t2-ft-original-data/
      1 本の mcap に生データのままコピー（デコードしないので速い）
    - **mcap（元ファイルをそのまま保存）** … 対象の 1 分刻み mcap をそのままダウンロード
 
-### 入力元「GCS (VM経由・課金最小)」
+### CSV の抽出ルート「VM 経由（課金最小・推奨）」
 
-① の「入力元」で **GCS (VM経由)** を選ぶと、UI から GCP 内実行（[docs/GCP_EXECUTION.md](docs/GCP_EXECUTION.md)）を
-そのまま実行できる。車両ID・時間帯・トピック・出力先を入れて「抽出実行」を押すと、
+④ 出力で CSV を選ぶと「**CSV の抽出ルート**」が出る。**VM 経由**を選ぶと、
+①〜③で決めた時間帯・トピック・カラム絞り込みをそのまま GCP 内の VM に渡し、
 VM 作成 → VM 上で mcap→CSV 変換 → CSV だけ回収 →（モデルB なら）VM 削除、までを
-1 ボタンで行い、ログを画面に流す。**mcap は GCP から出ないので egress 課金がほぼ 0**。
+1 ボタンで行い、ログを画面に流す。**mcap は GCP から出ないので egress 課金がほぼ 0**
+（実行前に「この PC で直接抽出した場合の課金＝節約見込み」も表示される）。
 事前に `scripts/gcp.env` の設定と `gcloud auth application-default login` が必要
-（詳細は docs/GCP_EXECUTION.md）。「課金状況を確認」ボタンで残 VM の点検もできる。
+（詳細は [docs/GCP_EXECUTION.md](docs/GCP_EXECUTION.md)）。
+「課金状況を確認」ボタンで残 VM の点検もできる。
 
 プリセットは `mcap_presets.json` を編集すれば増やせる。
 「切り出し君互換」プリセットは仮のリストなので、実際の切り出し君の対象トピックに
