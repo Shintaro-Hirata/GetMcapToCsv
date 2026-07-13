@@ -104,7 +104,7 @@ ss.setdefault("transfer_estimate", None)  # 転送量見積もりの結果
 _PERSISTED_KEYS = (
     "w_vehicle", "w_date", "w_tstart", "w_tend", "w_img", "w_sen",
     "local_pattern", "local_time_filter",
-    "csv_route", "csvvm_model", "csvvm_auth",
+    "csv_route", "csvvm_model", "csvvm_auth", "csvvm_sensor",
 )
 for _k in list(ss.keys()):
     if _k in _PERSISTED_KEYS or str(_k).startswith("colsel_"):
@@ -238,7 +238,10 @@ if is_gcs:
                  "CSV 抽出だけが目的なら、オフにすると GCS 転送量 (課金) を大きく減らせます。")
     with icol2:
         include_sensor = st.checkbox("record_sensor も含める", key="w_sen",
-                                     help="develop と同じ連番の sensor ファイルも対象に加える (サイズ大)")
+                                     help="develop と同じ連番の sensor ファイルも対象に加える (サイズ大)。"
+                                          "sensor には develop と別のトピックが入っているので、"
+                                          "sensor 由来のトピックを③で選びたい場合はオンにする。"
+                                          "CSV を VM 経由で取る場合は④側でも sensor を読めます。")
 
 with st.expander("詳細オプション"):
     oc1, oc2, oc3 = st.columns(3)
@@ -627,9 +630,17 @@ if ss.sources:
             with vmc2:
                 st.checkbox("認証を VM に入れる（新規 VM は必須）", value=True, key="csvvm_auth",
                             help="手元の gcloud auth application-default login の認証を VM へコピー。")
-            if include_image:
-                st.caption("※ VM 経由の CSV 抽出では record_debug_image は読みません"
-                           "（CSV に画像データは入らないため。処理時間の節約）。")
+            # develop と sensor は収録トピックが別。選んだトピックが develop に無いと
+            # 0 行になるため、sensor 由来のトピックも拾えるよう既定でオンにする。
+            # （不要なチャンクはスキップされるので develop のみ目的でも大きな遅延はない）
+            st.checkbox(
+                "sensor の mcap も読む（develop に無いトピックは sensor から取得）",
+                value=True, key="csvvm_sensor",
+                help="develop と sensor では入っているトピックが異なります。"
+                     "選んだトピックが develop に無い場合（0 行になる場合）は sensor 側に"
+                     "あることが多いので、基本オンのままにしてください。"
+                     "develop のトピックだけで足りると分かっていればオフにすると少し速くなります。")
+            st.caption("※ CSV 抽出では record_debug_image は読みません（画像は CSV に入らないため）。")
             if st.button("🔍 課金状況を確認（VM が残っていないか）", key="csvvm_status"):
                 with st.spinner("確認中..."):
                     run_script_streaming(_vm_script_cmd("gcp_status", [], []), st.empty())
@@ -708,7 +719,7 @@ if ss.sources:
                   "-Topics", topics_path, "-LocalOut", outdir]
             sh = ["--vehicle", vehicle, "--start", s_str, "--end", e_str,
                   "--topics", topics_path, "--local-out", outdir]
-            if include_sensor:
+            if st.session_state.get("csvvm_sensor", True):
                 ps.append("-IncludeSensor"); sh.append("--include-sensor")
             if st.session_state.get("csvvm_auth", True):
                 ps.append("-SetupAuth"); sh.append("--setup-auth")
@@ -743,6 +754,10 @@ if ss.sources:
                     st.error("抽出に失敗しました。ログを確認してください。"
                              "（VM は自動で削除/停止済みのはずですが、"
                              "「課金状況を確認」でも確認できます）")
+                    if not st.session_state.get("csvvm_sensor", True):
+                        st.warning("ログに『メッセージが 1 件も見つかりませんでした』とある場合、"
+                                   "選んだトピックは sensor 由来かもしれません。"
+                                   "「sensor の mcap も読む」をオンにして再実行してください。")
             st.stop()
 
         prog = st.progress(0.0, text="準備中...")
