@@ -104,7 +104,7 @@ ss.setdefault("transfer_estimate", None)  # 転送量見積もりの結果
 _PERSISTED_KEYS = (
     "w_vehicle", "w_date", "w_tstart", "w_tend", "w_img", "w_sen",
     "local_pattern", "local_time_filter",
-    "csv_route", "csvvm_model", "csvvm_auth", "csvvm_sensor",
+    "csv_route", "csvvm_model", "csvvm_auth",
 )
 for _k in list(ss.keys()):
     if _k in _PERSISTED_KEYS or str(_k).startswith("colsel_"):
@@ -619,7 +619,7 @@ if ss.sources:
                     f"(egress {core.cost_str(dl_direct)})\n"
                     f"- VM 経由: mcap は GCP 内で処理。手元に来るのは CSV だけ"
                     f"（通常数 MB〜数十 MB ≈ ¥1 前後）\n"
-                    f"- 別途 VM 稼働費: 約 ¥35/時（実行中のみ。10 分なら ¥6 前後、"
+                    f"- 別途 VM 稼働費: 約 ¥50/時（8vCPU・実行中のみ。10 分なら ¥8 前後、"
                     f"Spot 設定ならさらに約 1/3）")
                 st.caption(
                     "※ この金額は「選んだ**ファイル**の合計サイズ」で決まり、"
@@ -637,17 +637,9 @@ if ss.sources:
             with vmc2:
                 st.checkbox("認証を VM に入れる（新規 VM は必須）", value=True, key="csvvm_auth",
                             help="手元の gcloud auth application-default login の認証を VM へコピー。")
-            # sensor ファイルは 1 本 2〜3GB と巨大。既定オンにすると develop トピック目的
-            # でも毎回十数 GB 読んでしまうので、①検索で sensor を含めた場合のみ既定オン。
-            # （sensor 由来のトピックが必要なときだけ明示的に読む）
-            st.checkbox(
-                "sensor の mcap も読む（sensor 由来のトピックが必要な場合のみ）",
-                value=bool(include_sensor), key="csvvm_sensor",
-                help="develop と sensor では入っているトピックが異なります。"
-                     "sensor ファイルは 1 本数 GB と大きく読み込みに時間がかかるため、"
-                     "sensor にしか無いトピックが欲しいときだけオンにしてください。"
-                     "/t2/* の多くは develop 側にあります。")
-            st.caption("※ CSV 抽出では record_debug_image は読みません（画像は CSV に入らないため）。")
+            st.caption("※ VM は **②で選択したファイルだけ**を読みます（develop/sensor の"
+                       "別も②の選択どおり。image は CSV に使わないため自動で除外）。"
+                       "結合 CSV (_all.csv) の有無も上のチェックに従います。")
             if st.button("🔍 課金状況を確認（VM が残っていないか）", key="csvvm_status"):
                 with st.spinner("確認中..."):
                     run_script_streaming(_vm_script_cmd("gcp_status", [], []), st.empty())
@@ -720,14 +712,27 @@ if ss.sources:
             with open(topics_path, "w", encoding="utf-8") as f:
                 json.dump(topic_config, f, ensure_ascii=False, indent=1)
 
+            # ②で選択したファイルをそのまま VM に渡す (VM 側の再検索をスキップ)。
+            # image は CSV に使わないので除外して転送量・時間を節約する。
+            image_kind = image_subdir[len("record_"):] if image_subdir.startswith("record_") \
+                else image_subdir
+            vm_files = [s.name for s in selected_sources
+                        if source_kind(s.name) != image_kind]
+            n_img = len(selected_sources) - len(vm_files)
+            if n_img:
+                st.caption(f"（image ファイル {n_img} 件は CSV に使わないため除外しました）")
+            files_path = os.path.join(outdir, "_vm_files.json")
+            with open(files_path, "w", encoding="utf-8") as f:
+                json.dump(vm_files, f, ensure_ascii=False, indent=1)
+
             s_str = f"{datetime.datetime.fromtimestamp(params['start_ns'] / 1e9, core.JST):%Y-%m-%d %H:%M:%S}"
             e_str = f"{datetime.datetime.fromtimestamp(params['end_ns'] / 1e9, core.JST):%Y-%m-%d %H:%M:%S}"
             ps = ["-Vehicle", vehicle, "-Start", s_str, "-End", e_str,
-                  "-Topics", topics_path, "-LocalOut", outdir]
+                  "-Topics", topics_path, "-GcsFiles", files_path, "-LocalOut", outdir]
             sh = ["--vehicle", vehicle, "--start", s_str, "--end", e_str,
-                  "--topics", topics_path, "--local-out", outdir]
-            if st.session_state.get("csvvm_sensor", True):
-                ps.append("-IncludeSensor"); sh.append("--include-sensor")
+                  "--topics", topics_path, "--gcs-files", files_path, "--local-out", outdir]
+            if not merged_csv:
+                ps.append("-NoMerged"); sh.append("--no-merged")
             if st.session_state.get("csvvm_auth", True):
                 ps.append("-SetupAuth"); sh.append("--setup-auth")
             vm_model_b = str(st.session_state.get("csvvm_model", "B")).startswith("B")
@@ -767,9 +772,9 @@ if ss.sources:
                         "がある場合、手元の zero-plotter が古く apex_json トピック "
                         "(/t2/main_mabx/*, /t2/control/demand* など) を解けません。"
                         "`cd zero-plotter && git pull` で最新 (yatagarasu/main) に更新して再実行してください。\n\n"
-                        "2. **sensor 由来のトピック**: develop に無いトピックは sensor 側にあります。"
-                        "「sensor の mcap も読む」をオンにして再実行してください"
-                        "（sensor は数 GB あり読み込みに時間がかかります）。")
+                        "2. **トピックの入っているファイルを②で外している**: sensor 由来の"
+                        "トピックなら sensor ファイルを、develop 由来なら develop ファイルを"
+                        "②で選択して再実行してください。")
             st.stop()
 
         prog = st.progress(0.0, text="準備中...")

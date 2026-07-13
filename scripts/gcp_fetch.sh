@@ -45,18 +45,22 @@ SETUP_AUTH=0
 START_STOP=0
 DELETE_AFTER=0
 TOPICS_FILE=""
+GCS_FILES_FILE=""
 POS_ARGS=()
 EXPECT_LOCAL_OUT=0
 EXPECT_TOPICS=0
+EXPECT_GCS_FILES=0
 for a in "$@"; do
   if [ "$EXPECT_LOCAL_OUT" = "1" ]; then LOCAL_OUT="$a"; EXPECT_LOCAL_OUT=0; continue; fi
   if [ "$EXPECT_TOPICS" = "1" ]; then TOPICS_FILE="$a"; EXPECT_TOPICS=0; continue; fi
+  if [ "$EXPECT_GCS_FILES" = "1" ]; then GCS_FILES_FILE="$a"; EXPECT_GCS_FILES=0; continue; fi
   case "$a" in
     --setup-auth) SETUP_AUTH=1 ;;
     --start-stop) START_STOP=1 ;;
     --delete-after) DELETE_AFTER=1 ;;
     --local-out) EXPECT_LOCAL_OUT=1 ;;
-    --topics) EXPECT_TOPICS=1 ;;  # 手元の topics JSON は VM へ転送してから basename で渡す
+    --topics) EXPECT_TOPICS=1 ;;      # 手元の topics JSON は VM へ転送してから basename で渡す
+    --gcs-files) EXPECT_GCS_FILES=1 ;;  # ②選択のファイル一覧 JSON も同様に転送する
     *) POS_ARGS+=("$a") ;;
   esac
 done
@@ -110,6 +114,14 @@ if [ -n "$TOPICS_FILE" ]; then
   TNAME="$(basename "$TOPICS_FILE")"
   gcloud compute scp "${SSH_FLAGS[@]}" "$TOPICS_FILE" "$REMOTE:$REMOTE_DIR/$TNAME"
   set -- "$@" --topics "$TNAME"
+fi
+
+# ②選択のファイル一覧 JSON も同様に転送する (VM の再検索をスキップし選択と一致させる)
+if [ -n "$GCS_FILES_FILE" ]; then
+  [ -f "$GCS_FILES_FILE" ] || { echo "[error] gcs-files JSON がありません: $GCS_FILES_FILE"; exit 1; }
+  GNAME="$(basename "$GCS_FILES_FILE")"
+  gcloud compute scp "${SSH_FLAGS[@]}" "$GCS_FILES_FILE" "$REMOTE:$REMOTE_DIR/$GNAME"
+  set -- "$@" --gcs-files "$GNAME"
 fi
 
 # /t2 デコード用の私物パッケージを手元から VM へ転送 (VM での GitHub 認証を回避)

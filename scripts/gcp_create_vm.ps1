@@ -52,7 +52,9 @@ Default project     :  gcloud config get-value project
 "@
 }
 
-$machineType = Cfg 'MACHINE_TYPE' 'e2-standard-4'
+# 8 vCPU: python decode (apex_json etc.) is CPU-bound and parallelism = vCPU-1,
+# so wall time roughly halves vs 4 vCPU while per-run cost stays about the same.
+$machineType = Cfg 'MACHINE_TYPE' 'e2-standard-8'
 $bootDiskGb  = Cfg 'BOOT_DISK_GB' '30'   # OS + temp is plenty; keeps stopped-disk cost low (30GB ~= 450 JPY/mo)
 $imageFamily = Cfg 'IMAGE_FAMILY' 'debian-12'
 $imageProj   = Cfg 'IMAGE_PROJECT' 'debian-cloud'

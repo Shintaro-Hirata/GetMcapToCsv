@@ -64,8 +64,10 @@ if [ -n "${ROS2IDL_PATH:-}" ] && [ -e "$ROS2IDL_PATH" ]; then
   # 古いビルド成果物は使わない (念のため物理削除)
   rm -rf "$ROS2IDL_PATH"/build "$ROS2IDL_PATH"/dist "$ROS2IDL_PATH"/*.egg-info 2>/dev/null || true
   # 依存だけ入れる (mcap は上で導入済み)。本体は下の PYTHONPATH で直接読む。
-  echo "[info] installing mcap-ros2idl-support deps (lark, typing-extensions)..."
-  $PIP "lark" "typing-extensions"
+  if ! "$PYTHON" -c "import lark, typing_extensions" 2>/dev/null; then
+    echo "[info] installing mcap-ros2idl-support deps (lark, typing-extensions)..."
+    $PIP "lark" "typing-extensions"
+  fi
   # 転送ソースのルートを PYTHONPATH 先頭へ → import は必ずこの新ソースを使う
   ROS2IDL_SRC_ROOT="$(cd "$ROS2IDL_PATH" && pwd)"
   export PYTHONPATH="$ROS2IDL_SRC_ROOT:${PYTHONPATH:-}"

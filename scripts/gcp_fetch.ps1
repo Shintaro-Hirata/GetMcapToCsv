@@ -23,6 +23,8 @@ param(
   [switch]$IncludeImage,
   [string[]]$ExtraArgs,
   [string]$EnvFile,
+  [string]$GcsFiles,     # JSON list of gs:// mcap paths; skips discovery, extracts exactly these
+  [switch]$NoMerged,     # do not write the merged _all.csv
   [string]$LocalOut,     # local folder to receive the CSVs (overrides LOCAL_OUT in gcp.env)
   [switch]$SetupAuth,    # copy local ADC to the VM so it reads GCS as you (first time)
   [switch]$StartStop,    # start before run, stop after (even on error) to minimize cost
@@ -167,6 +169,15 @@ if ($Topics) {
   $remoteTopics = $tname
 }
 
+# transfer the explicit file list (UI selection) the same way
+$remoteGcsFiles = $null
+if ($GcsFiles) {
+  if (-not (Test-Path $GcsFiles)) { throw "gcs-files list not found: $GcsFiles" }
+  $gname = Split-Path -Leaf $GcsFiles
+  Invoke-Scp $GcsFiles "${vm}:$remoteDir/$gname"
+  $remoteGcsFiles = $gname
+}
+
 # send the /t2 decode package to the VM (avoids GitHub auth on the VM)
 $envExport = ''
 if ($venvDir) { $envExport += "VENV_DIR=$(Q $venvDir) " }
@@ -220,9 +231,11 @@ if ($Start)         { $ra += @('--start', $Start) }
 if ($End)           { $ra += @('--end', $End) }
 if ($AllTopics)     { $ra += '--all-topics' }
 if ($remoteTopics)  { $ra += @('--topics', $remoteTopics) }
+if ($remoteGcsFiles) { $ra += @('--gcs-files', $remoteGcsFiles) }
 if ($ExcludeTopics) { $ra += '--exclude-topics'; $ra += $ExcludeTopics }
 if ($IncludeSensor) { $ra += '--include-sensor' }
 if ($IncludeImage)  { $ra += '--include-image' }
+if ($NoMerged)      { $ra += '--no-merged' }
 if ($ExtraArgs)     { $ra += $ExtraArgs }
 if ($ra.Count -eq 0) { throw 'No extraction args. Pass -Vehicle/-Start/-End/-Topics etc.' }
 

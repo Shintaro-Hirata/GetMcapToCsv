@@ -1611,6 +1611,12 @@ def main():
                              "--exclude-topics \"/tf*\" \"/t2/positioning_driver/internal/*\"")
     parser.add_argument("--no-download", action="store_true",
                         help="一括ダウンロードせず常にチャンク単位の部分読み込みを使う")
+    parser.add_argument("--gcs-files", metavar="JSON",
+                        help="抽出対象の GCS mcap 一覧 JSON (gs://bucket/path の配列)。"
+                             "指定するとファイル検索をスキップし、この一覧だけを処理する"
+                             " (UI の②選択と完全に一致させる用)")
+    parser.add_argument("--no-merged", action="store_true",
+                        help="結合 CSV (_all.csv) を出力しない")
     parser.add_argument("--cache-dir", default=DEFAULT_CACHE_DIR, metavar="DIR",
                         help="一括ダウンロードのローカルキャッシュ先。同じファイルの"
                              f"再ダウンロード (= 再課金) を防ぐ (default: {DEFAULT_CACHE_DIR})")
@@ -1673,16 +1679,33 @@ def main():
         base = f"{vehicle}_{start_dt:%Y%m%d_%H%M%S}-{end_dt:%H%M%S}"
 
         client = gcs_client()
-        try:
-            sources = find_gcs_sources(
-                client, args.bucket, vehicle, start_dt, end_dt,
-                subdir=args.subdir, lookback_hours=args.session_lookback,
-                workers=args.workers, include_sensor=args.include_sensor,
-                sensor_subdir=args.sensor_subdir,
-                include_image=args.include_image,
-                image_subdir=args.image_subdir)
-        except LookupError as e:
-            raise SystemExit(f"[error] {e}")
+        if args.gcs_files:
+            # UI の②で選択されたファイル一覧をそのまま使う (検索・兄弟探索なし)
+            with open(args.gcs_files, encoding="utf-8") as f:
+                uris = json.load(f)
+            sources = []
+            buckets = {}
+            for uri in uris:
+                path = uri[len("gs://"):] if uri.startswith("gs://") else f"{args.bucket}/{uri}"
+                bname, blob_name = path.split("/", 1)
+                bkt = buckets.setdefault(bname, client.bucket(bname))
+                blob = bkt.get_blob(blob_name)  # サイズ等のメタデータを取得
+                if blob is None:
+                    print(f"[warn] 見つかりません (スキップ): {uri}")
+                    continue
+                sources.append(GcsMcapSource(blob))
+            print(f"[info] --gcs-files 指定: {len(sources)} 件 (ファイル検索をスキップ)")
+        else:
+            try:
+                sources = find_gcs_sources(
+                    client, args.bucket, vehicle, start_dt, end_dt,
+                    subdir=args.subdir, lookback_hours=args.session_lookback,
+                    workers=args.workers, include_sensor=args.include_sensor,
+                    sensor_subdir=args.sensor_subdir,
+                    include_image=args.include_image,
+                    image_subdir=args.image_subdir)
+            except LookupError as e:
+                raise SystemExit(f"[error] {e}")
 
     if not sources:
         raise SystemExit("[error] 指定時間帯に重なる mcap がありません。")
@@ -1725,7 +1748,7 @@ def main():
                              workers=args.extract_workers,
                              no_download=args.no_download,
                              cache_dir=cache_dir)
-    write_csvs(per_topic, topic_config, args.outdir, base)
+    write_csvs(per_topic, topic_config, args.outdir, base, merged=not args.no_merged)
     if cache_dir:
         prune_cache(cache_dir, args.cache_max_gb)
     print_transfer_summary()

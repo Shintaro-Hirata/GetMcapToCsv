@@ -33,7 +33,9 @@ if [ "$GCP_PROJECT" = "your-project-id" ] || [ "$GCP_VM" = "your-vm-name" ]; the
 fi
 
 # 既定値 (必要なら gcp.env で上書き可能)
-MACHINE_TYPE="${MACHINE_TYPE:-e2-standard-4}"     # 4 vCPU / 16GB。並列デコードに十分
+# 8 vCPU: apex_json など Python デコードは CPU 律速で、並列数 (vCPU-1) が実行時間に直結。
+# 時間単価は 4vCPU の約2倍だが実行時間が約半分になるため、1回あたりの料金はほぼ同じ。
+MACHINE_TYPE="${MACHINE_TYPE:-e2-standard-8}"
 BOOT_DISK_GB="${BOOT_DISK_GB:-30}"                # OS + 一時ファイルに十分。停止中ディスク代を抑える (30GB≒月¥450)
 IMAGE_FAMILY="${IMAGE_FAMILY:-debian-12}"
 IMAGE_PROJECT="${IMAGE_PROJECT:-debian-cloud}"
