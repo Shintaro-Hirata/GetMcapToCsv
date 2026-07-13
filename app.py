@@ -759,7 +759,7 @@ if ss.sources:
                 st.info("② VM で抽出し、CSV を回収します...")
                 with st.expander("② 抽出・CSV 回収ログ（クリックで開閉）", expanded=True):
                     fetch_log = st.empty()
-                rc, _ = run_script_streaming(_vm_script_cmd("gcp_fetch", ps, sh), fetch_log)
+                rc, fetch_out = run_script_streaming(_vm_script_cmd("gcp_fetch", ps, sh), fetch_log)
                 if rc == 0:
                     # gcp_fetch が書き出す「このランで生成した分」だけを表示する
                     # (出力フォルダに残る過去ランの CSV と混同しないため)
@@ -780,18 +780,41 @@ if ss.sources:
                         sz = f" ({core.size_str(os.path.getsize(p))})" if os.path.exists(p) else ""
                         st.write(f"- `{n}`{sz}")
                 else:
+                    # 抽出の途中で SSH 接続が切れた = VM が実行中に消えた/落ちた兆候。
+                    # Spot VM の中断 (プリエンプション) が代表的で、その場合はただ再実行すればよい。
+                    dropped = any(s in (fetch_out or "") for s in (
+                        "unexpectedly closed", "Connection reset",
+                        "Connection to", "connection closed", "Broken pipe"))
+                    spot_on = str(read_gcp_env().get("SPOT", "")).strip() == "1"
                     st.error("抽出に失敗しました。ログを確認してください。"
                              "（VM は自動で削除/停止済みのはずですが、"
                              "「課金状況を確認」でも確認できます）")
-                    st.warning(
-                        "0 行 (メッセージが見つからない) で失敗した場合、主な原因は次の 2 つです:\n\n"
-                        "1. **apex_json 非対応**: ログに『Unknown schema encoding: apex_json』"
-                        "がある場合、手元の zero-plotter が古く apex_json トピック "
-                        "(/t2/main_mabx/*, /t2/control/demand* など) を解けません。"
-                        "`cd zero-plotter && git pull` で最新 (yatagarasu/main) に更新して再実行してください。\n\n"
-                        "2. **トピックの入っているファイルを②で外している**: sensor 由来の"
-                        "トピックなら sensor ファイルを、develop 由来なら develop ファイルを"
-                        "②で選択して再実行してください。")
+                    if dropped:
+                        msg = ("実行の**途中で VM への接続が切れました**"
+                               "（ログ末尾に『unexpectedly closed』等）。処理中に VM が"
+                               "消えた/落ちたときの症状です。\n\n")
+                        if spot_on:
+                            msg += ("**最有力は Spot VM の中断です**（`SPOT=1`）。Spot は"
+                                    "GCP の都合でまれに強制終了されます。害はなく、"
+                                    "**もう一度「抽出実行」を押すだけ**で通常は成功します。"
+                                    "頻発するなら scripts/gcp.env の `SPOT=1` を外して"
+                                    "（確実な通常 VM に）ください。")
+                        else:
+                            msg += ("一時的なネットワーク断か、VM のリソース不足の可能性が"
+                                    "あります。まず**再実行**してください。続くようなら対象"
+                                    "ファイル数を減らすか、マシンを大きく（gcp.env の "
+                                    "`MACHINE_TYPE`）してください。")
+                        st.warning(msg)
+                    else:
+                        st.warning(
+                            "0 行 (メッセージが見つからない) で失敗した場合、主な原因は次の 2 つです:\n\n"
+                            "1. **apex_json 非対応**: ログに『Unknown schema encoding: apex_json』"
+                            "がある場合、手元の zero-plotter が古く apex_json トピック "
+                            "(/t2/main_mabx/*, /t2/control/demand* など) を解けません。"
+                            "`cd zero-plotter && git pull` で最新 (yatagarasu/main) に更新して再実行してください。\n\n"
+                            "2. **トピックの入っているファイルを②で外している**: sensor 由来の"
+                            "トピックなら sensor ファイルを、develop 由来なら develop ファイルを"
+                            "②で選択して再実行してください。")
             st.stop()
 
         prog = st.progress(0.0, text="準備中...")
