@@ -172,7 +172,20 @@ $envExport = ''
 if ($venvDir) { $envExport += "VENV_DIR=$(Q $venvDir) " }
 if ($ros2idl) {
   if (Test-Path $ros2idl) {
-    Write-Host '[info] Sending mcap-ros2idl-support to VM...'
+    $ros2idlFull = (Resolve-Path $ros2idl).Path
+    Write-Host "[info] Sending mcap-ros2idl-support to VM from: $ros2idlFull"
+    # client-side check: is THIS local folder apex_json-capable? (points out a wrong/old path)
+    $facLocal = Get-ChildItem -Path $ros2idlFull -Recurse -Filter decode_factory.py -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($facLocal) {
+      if (Select-String -Path $facLocal.FullName -Pattern 'apex_json' -Quiet) {
+        Write-Host '[info] local source supports apex_json (good).'
+      } else {
+        Write-Warning "This local mcap-ros2idl-support is OLD (no apex_json): $($facLocal.FullName)"
+        Write-Warning 'Update it (git pull in that repo) or fix ROS2IDL_LOCAL_PATH in gcp.env.'
+      }
+    } else {
+      Write-Warning "decode_factory.py not found under $ros2idlFull (is ROS2IDL_LOCAL_PATH correct?)"
+    }
     Send-Folder $ros2idl $remoteDir
     # run_on_gcp.sh cd's to the repo root ($remoteDir), so pass a path relative to it
     $envExport += "ROS2IDL_PATH=$(Q 'mcap-ros2idl-support') "

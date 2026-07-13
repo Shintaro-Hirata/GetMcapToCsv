@@ -116,7 +116,15 @@ fi
 ROS2IDL_REMOTE=""
 if [ -n "${ROS2IDL_LOCAL_PATH:-}" ]; then
   if [ -d "$ROS2IDL_LOCAL_PATH" ]; then
-    echo "[info] mcap-ros2idl-support を VM へ転送..."
+    echo "[info] mcap-ros2idl-support を VM へ転送 (元: $ROS2IDL_LOCAL_PATH)"
+    # ローカル側の apex_json 対応チェック (古い/別フォルダを指していると気づける)
+    FAC_LOCAL=$(find "$ROS2IDL_LOCAL_PATH" -name decode_factory.py 2>/dev/null | head -1)
+    if [ -n "$FAC_LOCAL" ] && grep -q 'apex_json' "$FAC_LOCAL"; then
+      echo "[info] ローカルソースは apex_json 対応です。"
+    else
+      echo "[warn] このローカル mcap-ros2idl-support は apex_json 非対応 (古い) です: ${FAC_LOCAL:-decode_factory.py 見つからず}"
+      echo "       そのリポジトリで git pull するか、gcp.env の ROS2IDL_LOCAL_PATH を修正してください。"
+    fi
     run_ssh "rm -rf $REMOTE_DIR/mcap-ros2idl-support"
     gcloud compute scp --recurse "${SSH_FLAGS[@]}" "$ROS2IDL_LOCAL_PATH" \
       "$REMOTE:$REMOTE_DIR/mcap-ros2idl-support"

@@ -48,15 +48,42 @@ if ! "$PYTHON" -c "import mcap, mcap_protobuf, google.cloud.storage" 2>/dev/null
 fi
 
 # mcap-ros2idl-support (/t2/* デコード用) は ROS2IDL_PATH でローカルパスを渡すと入る。
-if ! "$PYTHON" -c "import mcap_ros2idl_support" 2>/dev/null; then
-  if [ -n "${ROS2IDL_PATH:-}" ] && [ -e "$ROS2IDL_PATH" ]; then
-    echo "[info] installing mcap-ros2idl-support: $ROS2IDL_PATH"
-    $PIP "$ROS2IDL_PATH"
+# apex_json 対応の有無で挙動が変わるため、転送されたソースと導入後の版を必ず検証する。
+if [ -n "${ROS2IDL_PATH:-}" ] && [ -e "$ROS2IDL_PATH" ]; then
+  # 転送されたソース自体が apex_json 対応か (対応してなければローカルの元フォルダが古い/別物)
+  SRC_FACTORY=$(find "$ROS2IDL_PATH" -name decode_factory.py 2>/dev/null | head -1)
+  if [ -n "$SRC_FACTORY" ] && grep -q 'apex_json' "$SRC_FACTORY"; then
+    echo "[verify] 転送されたソースは apex_json 対応です: $SRC_FACTORY"
   else
-    echo "[warn] mcap-ros2idl-support not installed; /t2/* topics cannot be decoded."
-    echo "       Set ROS2IDL_LOCAL_PATH in gcp.env to your zero-plotter/mcap-ros2idl-support."
+    echo "[verify][WARN] 転送されたソースが apex_json 非対応です (ローカルの ROS2IDL_LOCAL_PATH が"
+    echo "               更新済みフォルダを指しているか確認してください): ${SRC_FACTORY:-decode_factory.py が見つからない}"
   fi
+  # 転送ソースに古いビルド成果物が混ざっていても拾わないよう掃除する
+  rm -rf "$ROS2IDL_PATH"/build "$ROS2IDL_PATH"/dist "$ROS2IDL_PATH"/*.egg-info 2>/dev/null || true
+  # まず依存込みで導入 (lark / typing-extensions 等)
+  echo "[info] installing mcap-ros2idl-support: $ROS2IDL_PATH"
+  $PIP "$ROS2IDL_PATH"
+  # 本体コードだけ強制再導入 (キャッシュや同一バージョン判定で古い版が残るのを排除)
+  $PIP --force-reinstall --no-deps --no-cache-dir "$ROS2IDL_PATH"
+else
+  echo "[warn] mcap-ros2idl-support not installed; /t2/* topics cannot be decoded."
+  echo "       Set ROS2IDL_LOCAL_PATH in gcp.env to your zero-plotter/mcap-ros2idl-support."
 fi
+
+# 実際に import される版が apex_json 対応かを最終確認 (ここが False なら 0 行になる)
+"$PYTHON" - <<'PYEOF' || true
+import inspect
+try:
+    import mcap_ros2idl_support as m
+    from mcap_ros2idl_support import Ros2DecodeFactory
+    ok = "apex_json" in inspect.getsource(Ros2DecodeFactory._build_reader)
+    print(f"[verify] installed module: {m.__file__}")
+    print(f"[verify] installed apex_json support: {ok}")
+    if not ok:
+        print("[verify][WARN] 導入された版が apex_json 非対応です。apex_json トピックは 0 行になります。")
+except Exception as e:
+    print(f"[verify][WARN] mcap_ros2idl_support の確認に失敗: {e}")
+PYEOF
 
 # 一覧・トピック確認・見積もりモードは CSV を出さない (成功扱いで抜ける)
 NO_CSV=0
