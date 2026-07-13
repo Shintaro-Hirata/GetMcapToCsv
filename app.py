@@ -741,19 +741,25 @@ if ss.sources:
             else:
                 ps.append("-StartStop"); sh.append("--start-stop")
 
-            log_area = st.empty()
             t_run0 = time.time()
             ok = True
+            # 各フェーズのログは独立した expander に流す。こうすると②が①を
+            # 上書きせず、両方のログが最後まで残る。見出しをクリックすると
+            # そのフェーズのログを開閉できる（配布時にも全ログを追える）。
             if vm_model_b:
                 st.info("① VM を作成します（1〜2 分）...")
+                with st.expander("① VM 作成ログ（クリックで開閉）", expanded=True):
+                    create_log = st.empty()
                 rc, _ = run_script_streaming(
-                    _vm_script_cmd("gcp_create_vm", ["-Yes"], ["--yes"]), log_area)
+                    _vm_script_cmd("gcp_create_vm", ["-Yes"], ["--yes"]), create_log)
                 ok = rc == 0
                 if not ok:
-                    st.error("VM 作成に失敗しました。ログを確認してください。")
+                    st.error("VM 作成に失敗しました。上の「① VM 作成ログ」を確認してください。")
             if ok:
                 st.info("② VM で抽出し、CSV を回収します...")
-                rc, _ = run_script_streaming(_vm_script_cmd("gcp_fetch", ps, sh), log_area)
+                with st.expander("② 抽出・CSV 回収ログ（クリックで開閉）", expanded=True):
+                    fetch_log = st.empty()
+                rc, _ = run_script_streaming(_vm_script_cmd("gcp_fetch", ps, sh), fetch_log)
                 if rc == 0:
                     # gcp_fetch が書き出す「このランで生成した分」だけを表示する
                     # (出力フォルダに残る過去ランの CSV と混同しないため)
