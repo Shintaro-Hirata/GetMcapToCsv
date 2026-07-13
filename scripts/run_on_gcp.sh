@@ -47,24 +47,29 @@ if ! "$PYTHON" -c "import mcap, mcap_protobuf, google.cloud.storage" 2>/dev/null
   $PIP "mcap>=1.3.0" "mcap-protobuf-support>=0.5.3" "google-cloud-storage>=2.14.0"
 fi
 
-# mcap-ros2idl-support (/t2/* デコード用) は ROS2IDL_PATH でローカルパスを渡すと入る。
-# apex_json 対応の有無で挙動が変わるため、転送されたソースと導入後の版を必ず検証する。
+# mcap-ros2idl-support (/t2/* デコード用) は純 Python パッケージ。
+# pip install だと転送フォルダに紛れた古い build/lib を setuptools がタイムスタンプ判定で
+# wheel に取り込み、apex_json 非対応の古い版が入る事故が起きる。これを避けるため
+# 「依存だけ pip で入れて、本体コードは転送ソースを PYTHONPATH で直接使う」方式にする。
 if [ -n "${ROS2IDL_PATH:-}" ] && [ -e "$ROS2IDL_PATH" ]; then
-  # 転送されたソース自体が apex_json 対応か (対応してなければローカルの元フォルダが古い/別物)
-  SRC_FACTORY=$(find "$ROS2IDL_PATH" -name decode_factory.py 2>/dev/null | head -1)
+  # 転送されたソース自体が apex_json 対応か (非対応ならローカルの元フォルダが古い/別物)
+  SRC_FACTORY=$(find "$ROS2IDL_PATH" -path '*/mcap_ros2idl_support/decode_factory.py' \
+                     ! -path '*/build/*' 2>/dev/null | head -1)
   if [ -n "$SRC_FACTORY" ] && grep -q 'apex_json' "$SRC_FACTORY"; then
     echo "[verify] 転送されたソースは apex_json 対応です: $SRC_FACTORY"
   else
     echo "[verify][WARN] 転送されたソースが apex_json 非対応です (ローカルの ROS2IDL_LOCAL_PATH が"
     echo "               更新済みフォルダを指しているか確認してください): ${SRC_FACTORY:-decode_factory.py が見つからない}"
   fi
-  # 転送ソースに古いビルド成果物が混ざっていても拾わないよう掃除する
+  # 古いビルド成果物は使わない (念のため物理削除)
   rm -rf "$ROS2IDL_PATH"/build "$ROS2IDL_PATH"/dist "$ROS2IDL_PATH"/*.egg-info 2>/dev/null || true
-  # まず依存込みで導入 (lark / typing-extensions 等)
-  echo "[info] installing mcap-ros2idl-support: $ROS2IDL_PATH"
-  $PIP "$ROS2IDL_PATH"
-  # 本体コードだけ強制再導入 (キャッシュや同一バージョン判定で古い版が残るのを排除)
-  $PIP --force-reinstall --no-deps --no-cache-dir "$ROS2IDL_PATH"
+  # 依存だけ入れる (mcap は上で導入済み)。本体は下の PYTHONPATH で直接読む。
+  echo "[info] installing mcap-ros2idl-support deps (lark, typing-extensions)..."
+  $PIP "lark" "typing-extensions"
+  # 転送ソースのルートを PYTHONPATH 先頭へ → import は必ずこの新ソースを使う
+  ROS2IDL_SRC_ROOT="$(cd "$ROS2IDL_PATH" && pwd)"
+  export PYTHONPATH="$ROS2IDL_SRC_ROOT:${PYTHONPATH:-}"
+  echo "[info] using mcap-ros2idl-support from source: $ROS2IDL_SRC_ROOT"
 else
   echo "[warn] mcap-ros2idl-support not installed; /t2/* topics cannot be decoded."
   echo "       Set ROS2IDL_LOCAL_PATH in gcp.env to your zero-plotter/mcap-ros2idl-support."
