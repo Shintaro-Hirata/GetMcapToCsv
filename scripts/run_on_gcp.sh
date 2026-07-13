@@ -16,6 +16,10 @@ cd "$(dirname "$0")/.."   # リポジトリルート
 OUT_DIR="${OUT_DIR:-out}"
 PYTHON="${PYTHON:-python3}"
 
+# VM はバケットと同一リージョンにあり GCS 読み込みは egress 無料。
+# get_mcap_to_csv.py の集計表示が誤って課金額を出さないよう知らせる。
+export GETMCAP_INREGION=1
+
 # --- 依存関係の用意 (自己完結。VM 作成時のインストールに依存しない) ---
 # VENV_DIR を明示指定した場合のみ venv を使う (既存 venv の流用向け)。
 # 既定は使い捨て VM なので system python に直接入れる (python3-venv 不要)。

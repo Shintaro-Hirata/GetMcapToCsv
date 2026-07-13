@@ -50,6 +50,16 @@ git clone -b yatagarasu/main https://github.com/t2-auto/zero-plotter.git
 # → ~/Desktop/Dev/zero-plotter/mcap-ros2idl-support ができる
 ```
 
+> **重要（apex_json トピック）**: `/t2/main_mabx/*` や `/t2/control/demand*` などは
+> `apex_json` エンコードで、これを解けるのは**新しめの** mcap-ros2idl-support だけです。
+> clone してから時間が経っている場合は必ず更新してください:
+> ```bash
+> cd ~/Desktop/Dev/zero-plotter && git pull
+> ```
+> 古いままだと、抽出ログに `Unknown schema encoding: apex_json` が出て、その
+> トピックだけ 0 行になります（トピック一覧には名前が出るのにデータが取れない、
+> という症状はこれが原因）。
+
 ### 手順 1b. 設定ファイルを用意
 
 ```powershell

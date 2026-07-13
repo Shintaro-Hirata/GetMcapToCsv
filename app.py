@@ -606,8 +606,9 @@ if ss.sources:
                 st.error("scripts/gcp.env が未設定のため VM 経由は使えません。"
                          "docs/GCP_EXECUTION.md の手順で設定してください。")
             if selected_sources:
-                # 直接ルートで発生するダウンロード量 = 選択ファイル合計
-                # (見積もり済みならチャンクスキップ後の量を採用)
+                # 直接ルートで発生するダウンロード量 = 選択ファイル合計。
+                # mcap はチャンク単位でしか読めず、トピック/カラムを絞っても
+                # ダウンロード量はほぼ変わらない (この量は選択ファイルで決まる)。
                 dl_direct = sel_size
                 est = ss.get("transfer_estimate")
                 if est and est[1].get("needed"):
@@ -620,6 +621,12 @@ if ss.sources:
                     f"（通常数 MB〜数十 MB ≈ ¥1 前後）\n"
                     f"- 別途 VM 稼働費: 約 ¥35/時（実行中のみ。10 分なら ¥6 前後、"
                     f"Spot 設定ならさらに約 1/3）")
+                st.caption(
+                    "※ この金額は「選んだ**ファイル**の合計サイズ」で決まり、"
+                    "トピックを 1 個にしても全部にしても変わりません。mcap は圧縮チャンク"
+                    "単位でしか読めず、トピック/カラムの絞り込みは GCS ダウンロード量を"
+                    "減らさないためです（絞り込みで小さくなるのは出力 CSV の方）。"
+                    "ファイル自体を②で減らす・sensor を外すと、この金額が下がります。")
             vmc1, vmc2 = st.columns([2, 1])
             with vmc1:
                 st.radio("VM 運用",
@@ -630,16 +637,16 @@ if ss.sources:
             with vmc2:
                 st.checkbox("認証を VM に入れる（新規 VM は必須）", value=True, key="csvvm_auth",
                             help="手元の gcloud auth application-default login の認証を VM へコピー。")
-            # develop と sensor は収録トピックが別。選んだトピックが develop に無いと
-            # 0 行になるため、sensor 由来のトピックも拾えるよう既定でオンにする。
-            # （不要なチャンクはスキップされるので develop のみ目的でも大きな遅延はない）
+            # sensor ファイルは 1 本 2〜3GB と巨大。既定オンにすると develop トピック目的
+            # でも毎回十数 GB 読んでしまうので、①検索で sensor を含めた場合のみ既定オン。
+            # （sensor 由来のトピックが必要なときだけ明示的に読む）
             st.checkbox(
-                "sensor の mcap も読む（develop に無いトピックは sensor から取得）",
-                value=True, key="csvvm_sensor",
+                "sensor の mcap も読む（sensor 由来のトピックが必要な場合のみ）",
+                value=bool(include_sensor), key="csvvm_sensor",
                 help="develop と sensor では入っているトピックが異なります。"
-                     "選んだトピックが develop に無い場合（0 行になる場合）は sensor 側に"
-                     "あることが多いので、基本オンのままにしてください。"
-                     "develop のトピックだけで足りると分かっていればオフにすると少し速くなります。")
+                     "sensor ファイルは 1 本数 GB と大きく読み込みに時間がかかるため、"
+                     "sensor にしか無いトピックが欲しいときだけオンにしてください。"
+                     "/t2/* の多くは develop 側にあります。")
             st.caption("※ CSV 抽出では record_debug_image は読みません（画像は CSV に入らないため）。")
             if st.button("🔍 課金状況を確認（VM が残っていないか）", key="csvvm_status"):
                 with st.spinner("確認中..."):
@@ -754,10 +761,15 @@ if ss.sources:
                     st.error("抽出に失敗しました。ログを確認してください。"
                              "（VM は自動で削除/停止済みのはずですが、"
                              "「課金状況を確認」でも確認できます）")
-                    if not st.session_state.get("csvvm_sensor", True):
-                        st.warning("ログに『メッセージが 1 件も見つかりませんでした』とある場合、"
-                                   "選んだトピックは sensor 由来かもしれません。"
-                                   "「sensor の mcap も読む」をオンにして再実行してください。")
+                    st.warning(
+                        "0 行 (メッセージが見つからない) で失敗した場合、主な原因は次の 2 つです:\n\n"
+                        "1. **apex_json 非対応**: ログに『Unknown schema encoding: apex_json』"
+                        "がある場合、手元の zero-plotter が古く apex_json トピック "
+                        "(/t2/main_mabx/*, /t2/control/demand* など) を解けません。"
+                        "`cd zero-plotter && git pull` で最新 (yatagarasu/main) に更新して再実行してください。\n\n"
+                        "2. **sensor 由来のトピック**: develop に無いトピックは sensor 側にあります。"
+                        "「sensor の mcap も読む」をオンにして再実行してください"
+                        "（sensor は数 GB あり読み込みに時間がかかります）。")
             st.stop()
 
         prog = st.progress(0.0, text="準備中...")

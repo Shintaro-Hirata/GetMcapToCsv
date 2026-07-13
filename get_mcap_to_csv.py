@@ -232,6 +232,21 @@ def cache_total_size(cache_dir):
 # ------------------------------------------------------------------
 # デコーダ (入っているものを全部使う)
 # ------------------------------------------------------------------
+def _apex_json_capable(factory_cls):
+    """インストール済み mcap-ros2idl-support が apex_json エンコードを解けるか。
+
+    古い版は decode_factory が apex_json を分岐せず "Unknown schema encoding" になる。
+    schema 構築ロジックのソースに "apex_json" が現れるかで判定する。
+    判定不能なら None (未知として警告は出さない)。
+    """
+    try:
+        import inspect
+        src = inspect.getsource(factory_cls._build_reader)
+        return "apex_json" in src
+    except Exception:
+        return None
+
+
 def build_decoder_factories(quiet=False):
     """利用可能な mcap デコーダファクトリを集める。"""
     factories = []
@@ -241,6 +256,11 @@ def build_decoder_factories(quiet=False):
         from mcap_ros2idl_support import Ros2DecodeFactory  # ros2idl (/t2 トピック用)
         factories.append(Ros2DecodeFactory())
         names.append("ros2idl (mcap-ros2idl-support)")
+        if not quiet and _apex_json_capable(Ros2DecodeFactory) is False:
+            print("[warn] mcap-ros2idl-support が古く apex_json 非対応です。"
+                  " apex_json のトピック (例: /t2/main_mabx/*, /t2/control/demand*) は"
+                  " デコードできず 0 行になります。zero-plotter を最新 (yatagarasu/main) に"
+                  " 更新してください: cd zero-plotter && git pull")
     except ImportError:
         if not quiet:
             print("[warn] mcap-ros2idl-support が見つかりません。"
@@ -1547,7 +1567,13 @@ def print_transfer_summary():
     gcs_b, cache_b = STATS.snapshot()
     if not gcs_b and not cache_b:
         return
-    msg = f"[info] GCS 読み込み量: {size_str(gcs_b)} (egress {cost_str(gcs_b)})"
+    # 同一リージョンの VM 内実行 (run_on_gcp.sh が設定) では GCS 読み込みは egress 無料。
+    # egress 課金額を出すと誤解を招くため、無料である旨を表示する。
+    if os.environ.get("GETMCAP_INREGION") == "1":
+        cost_note = "同一リージョン実行のため egress 無料"
+    else:
+        cost_note = f"egress {cost_str(gcs_b)}"
+    msg = f"[info] GCS 読み込み量: {size_str(gcs_b)} ({cost_note})"
     if cache_b:
         msg += f" / キャッシュ利用: {size_str(cache_b)} (節約 {cost_str(cache_b)})"
     print(msg)
