@@ -698,16 +698,22 @@ if ss.sources:
         params = ss.search_params
         os.makedirs(outdir, exist_ok=True)
 
-        # --- VM 経由 (CSV のみ): 検索 UI で決めた条件を topics JSON にして VM へ渡す ---
-        if out_format.startswith("CSV") and csv_route_vm:
-            topic_config = {}
+        def build_topic_config():
+            """③の選択トピックとカラム絞り込みから CLI 用のトピック設定を作る。
+            一部の列だけ選ばれていれば絞り込む (全選択/空選択は全カラム扱い)。"""
+            config = {}
             for t in selected_topics:
                 cfg_t = {"suffix": t.strip("/").replace("/", "_"), "fields": []}
                 opts = ss.topic_columns.get(t)
                 sel = st.session_state.get(f"colsel_{t}")
                 if opts and sel and 0 < len(sel) < len(opts):
                     cfg_t["columns"] = list(sel)
-                topic_config[t] = cfg_t
+                config[t] = cfg_t
+            return config
+
+        # --- VM 経由 (CSV のみ): 検索 UI で決めた条件を topics JSON にして VM へ渡す ---
+        if out_format.startswith("CSV") and csv_route_vm:
+            topic_config = build_topic_config()
             topics_path = os.path.join(outdir, "_vm_topics.json")
             with open(topics_path, "w", encoding="utf-8") as f:
                 json.dump(topic_config, f, ensure_ascii=False, indent=1)
@@ -821,15 +827,7 @@ if ss.sources:
         core.STATS.reset()
         try:
             if out_format.startswith("CSV"):
-                topic_config = {}
-                for t in selected_topics:
-                    cfg = {"suffix": t.strip("/").replace("/", "_"), "fields": []}
-                    opts = ss.topic_columns.get(t)
-                    sel = st.session_state.get(f"colsel_{t}")
-                    # 一部の列だけ選ばれていれば絞り込む (全選択/空選択は全カラム扱い)
-                    if opts and sel and 0 < len(sel) < len(opts):
-                        cfg["columns"] = list(sel)
-                    topic_config[t] = cfg
+                topic_config = build_topic_config()
 
                 def on_file_done(done, total, name):
                     prog.progress(done / total,
