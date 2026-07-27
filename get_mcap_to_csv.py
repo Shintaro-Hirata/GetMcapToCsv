@@ -43,7 +43,6 @@ import json
 import os
 import re
 import shutil
-import sys
 import tempfile
 import time
 import threading
@@ -1466,7 +1465,7 @@ def print_transfer_estimate(rows, agg):
         print("[warn] 見積もりできるファイルがありません。")
         return
     total, needed = agg["total"], agg["needed"]
-    print(f"\n=== 転送量の見積もり (選択トピックでの抽出) ===")
+    print("\n=== 転送量の見積もり (選択トピックでの抽出) ===")
     for r in rows:
         pct = 100.0 * (1 - r["needed_bytes"] / r["total_bytes"]) if r["total_bytes"] else 0.0
         mark = " [キャッシュ済→転送ゼロ]" if r["cached"] else ""
