@@ -127,6 +127,11 @@ gcloud auth login                          # gcloud コマンド用
 gcloud auth application-default login      # ツールがデータを読むときの認証 (ADC)
 ```
 
+> この 2 つのログインには**有効期限があり、日をまたぐと切れます**（会社のセキュリティ
+> ポリシーによるもので正常な動作です）。期限が切れた状態で抽出を実行すると、UI が
+> 自動的に再ログインの画面を開くので、ブラウザでログインし直せばそのまま続行されます
+> （→ [9-2](#9-2-権限がない系のエラー)）。
+
 ### 3-5. VM 経由ルートの設定ファイルを作る
 
 CSV 抽出の推奨ルート「VM 経由」を使うための設定です（初回のみ）。
@@ -322,6 +327,7 @@ VM 運用の詳細（モデル A/B、Spot、コスト内訳、既存 VM への�
 
 | 症状 | 対処 |
 |------|------|
+| VM 作成時に `Reauthentication failed. cannot prompt during non-interactive execution` | 手元 gcloud の**ログイン期限切れ**（日をまたぐと切れる。正常な動作）。UI が自動で再ログイン画面を開くので、ブラウザで会社アカウントにログインすればそのまま続行される。画面が開かない場合は PowerShell で `gcloud auth login` を実行してから再実行 |
 | 検索時に認証エラー | `gcloud auth application-default login` を実行し直す |
 | 検索時に 403（バケットが読めない） | 自分のアカウントに `t2-ft-original-data` の読み取り権限がない。GCP 管理者に「バケット t2-ft-original-data の読み取り権限（roles/storage.objectViewer）を付与してほしい」と依頼 |
 | VM 作成が `PERMISSION_DENIED` | そのプロジェクトで VM を作る権限がない。①`gcp.env` の `GCP_PROJECT` を権限のあるプロジェクト（例: `t2-remote-devbox`）に変える、または ②管理者に「Compute Engine API の有効化と roles/compute.instanceAdmin.v1 の付与」を依頼 |

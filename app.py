@@ -79,6 +79,73 @@ def run_script_streaming(cmd, log_area):
     proc.wait()
     return proc.returncode, "\n".join(lines)
 
+
+def gcloud_token_ok(adc=False):
+    """gcloud の認証トークンが今も有効か（再認証切れでないか）を静かに確認する。
+
+    adc=False は gcloud CLI 用の認証 (gcloud auth login)、adc=True は
+    Application Default Credentials (gcloud auth application-default login)。
+    両者は別物で、組織のセッションポリシーによりそれぞれ独立に期限切れになる。
+    """
+    sub = "application-default print-access-token" if adc else "print-access-token"
+    try:
+        # shell=True: Windows では gcloud が gcloud.cmd のため、シェル経由で解決する
+        r = subprocess.run(f"gcloud auth {sub}", shell=True,
+                           capture_output=True, text=True, timeout=60)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def launch_gcloud_login(adc=False):
+    """gcloud のログイン (ブラウザ認証) を起動する。
+
+    この UI のプロセス内で実行すると gcloud から「端末がない = 非対話環境」に
+    見えて失敗するため、Windows では新しいコンソールウィンドウとして起動する。
+    """
+    cmd = "gcloud auth application-default login" if adc else "gcloud auth login"
+    if sys.platform == "win32":
+        subprocess.Popen(["powershell", "-NoProfile", "-Command", cmd],
+                         creationflags=subprocess.CREATE_NEW_CONSOLE)
+    else:
+        subprocess.Popen(cmd, shell=True)
+
+
+def ensure_gcloud_auth(placeholder, need_adc):
+    """VM 経由ルートの実行前に gcloud 認証の生死を確認し、必要ならその場で再ログインさせる。
+
+    gcloud のログインには有効期限があり（組織のセッションポリシー。切れるのが正常）、
+    切れた状態で UI からスクリプトを実行すると gcloud が
+    「Reauthentication failed. cannot prompt during non-interactive execution」で
+    即失敗する。ここで先に検知し、ログイン画面を自動で開いて完了を待ってから続行する。
+    戻り値: 認証が有効なら True（呼び出し側はそのまま処理を続けてよい）。
+    """
+    checks = [(False, "gcloud auth login", "gcloud CLI の認証")]
+    if need_adc:
+        checks.append((True, "gcloud auth application-default login",
+                       "データ読み取り用の認証 (ADC)"))
+    for adc, login_cmd, label in checks:
+        placeholder.info(f"🔑 {label}を確認中...")
+        if gcloud_token_ok(adc):
+            continue
+        launch_gcloud_login(adc)
+        placeholder.warning(
+            f"🔐 **{label}の期限が切れています。**再ログインの画面を起動しました\n\n"
+            "- 開いたブラウザで**会社の Google アカウント**にログインしてください\n"
+            "- 完了すると自動で検知して続行します（このページは操作せずお待ちください）\n"
+            f"- ブラウザが開かない場合は PowerShell で `{login_cmd}` を実行してください")
+        for _ in range(60):  # ログイン完了を最大 5 分待つ
+            time.sleep(5)
+            if gcloud_token_ok(adc):
+                break
+        else:
+            placeholder.error(
+                f"{label}のログイン完了を確認できませんでした。PowerShell で "
+                f"`{login_cmd}` を実行してから、もう一度ボタンを押してください。")
+            return False
+    placeholder.empty()
+    return True
+
 st.set_page_config(page_title="GetMcapToCsv", page_icon="🚚", layout="wide")
 st.title("🚚 GetMcapToCsv — 走行データ mcap 抽出ツール")
 
@@ -641,8 +708,9 @@ if ss.sources:
                        "別も②の選択どおり。image は CSV に使わないため自動で除外）。"
                        "結合 CSV (_all.csv) の有無も上のチェックに従います。")
             if st.button("🔍 課金状況を確認（VM が残っていないか）", key="csvvm_status"):
-                with st.spinner("確認中..."):
-                    run_script_streaming(_vm_script_cmd("gcp_status", [], []), st.empty())
+                if ensure_gcloud_auth(st.empty(), need_adc=False):
+                    with st.spinner("確認中..."):
+                        run_script_streaming(_vm_script_cmd("gcp_status", [], []), st.empty())
 
     can_run = bool(selected_sources) and (
         out_format.startswith("mcap (元ファイル") or bool(selected_topics))
@@ -713,6 +781,11 @@ if ss.sources:
 
         # --- VM 経由 (CSV のみ): 検索 UI で決めた条件を topics JSON にして VM へ渡す ---
         if out_format.startswith("CSV") and csv_route_vm:
+            # gcloud 認証が期限切れのまま進むと VM 作成が必ず失敗するので、先に確認する。
+            # ADC は「認証を VM に入れる」をオンにしたときだけ使うので、そのときだけ見る。
+            if not ensure_gcloud_auth(
+                    st.empty(), need_adc=st.session_state.get("csvvm_auth", True)):
+                st.stop()
             topic_config = build_topic_config()
             topics_path = os.path.join(outdir, "_vm_topics.json")
             with open(topics_path, "w", encoding="utf-8") as f:
