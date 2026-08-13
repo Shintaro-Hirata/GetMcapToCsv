@@ -5,6 +5,10 @@
 
 ローカルに保存済みの mcap ファイルの処理（`extract.py` 相当）にも対応している。
 
+> **初めて使う人へ**: セットアップから CSV 取得までを時系列で追える
+> [利用マニュアル (docs/MANUAL.md)](docs/MANUAL.md) を先に読むのがおすすめ。
+> この README は CLI オプション等のリファレンス寄りの内容。
+
 ## 参考にした extract.py が動かなかった理由（おそらく）
 
 `t2-ft-original-data` に保管されている mcap は **ROS2 (ros2idl) エンコードの
