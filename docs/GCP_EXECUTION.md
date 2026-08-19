@@ -304,7 +304,18 @@ gcp.env の VM 名の行が出なければ課金はゼロ。残っていたら�
 
 ## VM 作成でつまずくとき
 
-### `プロジェクト : your-project-id` のまま / PERMISSION_DENIED
+### `Reauthentication failed. cannot prompt during non-interactive execution`
+
+手元 gcloud のログイン期限切れ。gcloud の認証には有効期限があり（組織のセッション
+ポリシー。日をまたぐと切れるのが正常）、切れると gcloud は端末での再ログインを
+求めるが、UI からの実行では端末が無いためこのエラーで即失敗する。何度再実行しても
+同じ箇所で失敗するのが特徴。
+
+- **UI から実行している場合**: 抽出実行時に UI が期限切れを検知して再ログイン画面を
+  自動で開く。ブラウザで会社アカウントにログインすればそのまま続行される。
+- **スクリプトを直接実行している場合**: PowerShell で `gcloud auth login` を実行して
+  から再実行する。ADC 側（`gcloud auth application-default login`）も別に期限切れに
+  なるので、`-SetupAuth` を使う場合はそちらも入れ直す。
 
 `gcp.env` の `GCP_PROJECT` を**実際のプロジェクトID**に書き換えていないと起きる。
 自分が使えるプロジェクトを確認:

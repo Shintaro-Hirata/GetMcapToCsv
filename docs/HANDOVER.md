@@ -58,6 +58,7 @@ GetDruidUser に取り込んで BigQuery 欠損の穴埋め・統計比較に使
 | apex_json トピックだけ 0 行 | ①手元 zero-plotter が古い（`git pull`）②古い `build/lib` を setuptools が拾う → **pip ビルドせず、転送ソースを PYTHONPATH で直接使う方式に変更済み**（run_on_gcp.sh） |
 | 適用したのに 0 行・時刻不一致系 | BigQuery/pandas の **datetime64[us] と [ns] の混在**。`dt.as_unit("ns")` で必ず ns に揃える |
 | Spot 中断 | `Remote side unexpectedly closed` → 再実行するだけ。UI が案内を出す |
+| VM 作成が `Reauthentication failed. cannot prompt during non-interactive execution` | gcloud ログインの期限切れ（組織のセッションポリシー）。UI 経由だと端末が無く再認証プロンプトを出せない → app.py の `ensure_gcloud_auth` が実行前にトークンの生死を確認し、切れていれば新しいコンソールで `gcloud auth login` を自動起動して完了を待つ（CLI 認証と ADC は別々に期限が切れる点に注意） |
 
 ## 5. 未了事項・次のタスク候補
 
