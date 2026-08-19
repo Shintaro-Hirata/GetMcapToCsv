@@ -182,7 +182,7 @@ ss.setdefault("last_selected_topics", [])  # ③で最後に選択されたト�
 # 入力元の切り替え等で一時的に非表示になると値がリセットされてしまう。
 # 毎回再代入して「アプリ状態」に昇格させることで、切り替え後も値を維持する。
 _PERSISTED_KEYS = (
-    "w_vehicle", "w_date", "w_tstart", "w_tend", "w_img", "w_sen",
+    "w_vehicle", "w_date", "w_date_end", "w_tstart", "w_tend", "w_img", "w_sen",
     "local_pattern", "local_time_filter",
     "w_bucket", "w_subdir", "w_imgsub", "w_sensub",
     "w_lookback", "w_metaw", "w_extw",
@@ -197,6 +197,7 @@ for _k in list(ss.keys()):
 # 条件ウィジェットの初期値 (キー未登録のときだけ入る)
 ss.setdefault("w_vehicle", "GIGA09")
 ss.setdefault("w_date", datetime.date.today() - datetime.timedelta(days=1))
+ss.setdefault("w_date_end", datetime.date.today() - datetime.timedelta(days=1))
 ss.setdefault("w_tstart", "12:00:00")
 ss.setdefault("w_tend", "12:05:00")
 ss.setdefault("w_img", True)
@@ -296,6 +297,7 @@ def gather_settings():
         "input_mode_gcs": g("input_mode", INPUT_MODE_OPTIONS[0]) == INPUT_MODE_OPTIONS[0],
         "vehicle": g("w_vehicle", ""),
         "date": str(g("w_date", "")),
+        "date_end": str(g("w_date_end", "")),
         "time_start": g("w_tstart", ""),
         "time_end": g("w_tend", ""),
         "include_image": bool(g("w_img", True)),
@@ -348,6 +350,13 @@ def apply_settings(data):
     try:
         if data.get("date"):
             ss["w_date"] = datetime.date.fromisoformat(str(data["date"]))
+            # 終了日付を持たない古い設定ファイルは「開始と同日」として読む
+            ss["w_date_end"] = ss["w_date"]
+    except ValueError:
+        pass
+    try:
+        if data.get("date_end"):
+            ss["w_date_end"] = datetime.date.fromisoformat(str(data["date_end"]))
     except ValueError:
         pass
     put("w_tstart", data.get("time_start"))
@@ -457,7 +466,7 @@ input_mode = st.radio(
 is_gcs = input_mode.startswith("GCS から")
 
 if is_gcs:
-    col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+    col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 1])
     with col1:
         vehicle = st.text_input("車両ID", key="w_vehicle", help="例: GIGA07, GIGA09")
 else:
@@ -471,14 +480,17 @@ else:
     local_time_filter = st.checkbox(
         "時間帯で絞り込む", value=True, key="local_time_filter",
         help="オフにするとフォルダ内の全ファイルの全時間帯を対象にします。")
-    col2, col3, col4 = st.columns([1, 1, 1])
+    col2, col3, col4, col5 = st.columns([1, 1, 1, 1])
 
 with col2:
-    date = st.date_input("日付 (JST)", key="w_date")
+    date = st.date_input("開始日付 (JST)", key="w_date")
 with col3:
     t_start_text = st.text_input("開始時刻 (HH:MM:SS)", key="w_tstart",
                                  help="秒まで指定可。例: 20:40 / 20:40:15 / 204015")
 with col4:
+    date_end = st.date_input("終了日付 (JST)", key="w_date_end",
+                             help="日付をまたぐ実験は翌日以降を指定。")
+with col5:
     t_end_text = st.text_input("終了時刻 (HH:MM:SS)", key="w_tend",
                                help="秒まで指定可。例: 20:45 / 20:45:30 / 204530")
 
@@ -547,16 +559,28 @@ with st.expander("詳細オプション"):
 cache_dir = cache_dir_input if cache_enable else None
 
 start_dt = datetime.datetime.combine(date, t_start, tzinfo=core.JST)
-end_dt = datetime.datetime.combine(date, t_end, tzinfo=core.JST)
+end_dt = datetime.datetime.combine(date_end, t_end, tzinfo=core.JST)
+range_ok = True
 if end_dt <= start_dt:
-    end_dt += datetime.timedelta(days=1)  # 終了が開始より前なら深夜跨ぎとみなす
-    if time_ok and time_needed:
-        st.info(f"終了時刻が開始時刻以前のため翌日扱いにします: 終了 = {end_dt:%m/%d %H:%M:%S}")
-if time_ok and time_needed:
-    st.caption(f"🕐 抽出時間帯: {start_dt:%Y-%m-%d %H:%M:%S} 〜 {end_dt:%Y-%m-%d %H:%M:%S} (JST)")
+    if date_end == date:
+        end_dt += datetime.timedelta(days=1)  # 同日で終了が開始より前なら深夜跨ぎとみなす
+        if time_ok and time_needed:
+            st.info(f"終了時刻が開始時刻以前のため翌日扱いにします: 終了 = {end_dt:%m/%d %H:%M:%S}")
+    else:
+        range_ok = False
+        if time_ok and time_needed:
+            st.error("終了日時が開始日時以前になっています。開始/終了の日付と時刻を確認してください。")
+if time_ok and time_needed and range_ok:
+    dur_h = (end_dt - start_dt).total_seconds() / 3600
+    st.caption(f"🕐 抽出時間帯: {start_dt:%Y-%m-%d %H:%M:%S} 〜 {end_dt:%Y-%m-%d %H:%M:%S} "
+               f"(JST, 約 {dur_h:.1f} 時間)")
+    if dur_h > 24:
+        st.caption("⚠ 24 時間を超える範囲です。対象ファイル数・処理時間・費用が大きくなる"
+                   "ことがあるため、②の合計サイズを確認してから進んでください。")
 
 _btn_label = "🔍 ① 候補ファイルを検索" if is_gcs else "📂 ① ローカル mcap を読み込み"
-if st.button(_btn_label, type="primary", disabled=(time_needed and not time_ok)):
+if st.button(_btn_label, type="primary",
+             disabled=(time_needed and (not time_ok or not range_ok))):
     ss.sources = None
     ss.topics_info = None
     ss.result_files = None
@@ -578,10 +602,13 @@ if st.button(_btn_label, type="primary", disabled=(time_needed and not time_ok))
             ss.search_id += 1
             ss.search_log = log
             ss.search_transfer = core.STATS.snapshot()
+            # 日付をまたぐ範囲は、出力ファイル名の終了側にも日付を入れて曖昧さを無くす
+            end_fmt = "%Y%m%d_%H%M%S" if end_dt.date() != start_dt.date() else "%H%M%S"
             ss.search_params = {
                 "start_ns": core.to_ns(start_dt),
                 "end_ns": core.to_ns(end_dt),
-                "base": f"{vehicle.strip().upper()}_{start_dt:%Y%m%d_%H%M%S}-{end_dt:%H%M%S}",
+                "base": f"{vehicle.strip().upper()}_{start_dt:%Y%m%d_%H%M%S}-"
+                        f"{end_dt.strftime(end_fmt)}",
                 "extract_workers": int(extract_workers) or None,
             }
         except LookupError as e:
@@ -618,7 +645,8 @@ if st.button(_btn_label, type="primary", disabled=(time_needed and not time_ok))
                     ss.search_id += 1
                     ss.search_log = log
                     folder = os.path.basename(os.path.dirname(os.path.abspath(paths[0]))) or "local"
-                    base = (f"{folder}_{start_dt:%Y%m%d_%H%M%S}-{end_dt:%H%M%S}"
+                    end_fmt = "%Y%m%d_%H%M%S" if end_dt.date() != start_dt.date() else "%H%M%S"
+                    base = (f"{folder}_{start_dt:%Y%m%d_%H%M%S}-{end_dt.strftime(end_fmt)}"
                             if use_filter else folder)
                     ss.search_params = {
                         "start_ns": core.to_ns(start_dt) if use_filter else None,
