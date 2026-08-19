@@ -34,6 +34,18 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PRESET_FILE = os.path.join(APP_DIR, "mcap_presets.json")
 SCRIPTS_DIR = os.path.join(APP_DIR, "scripts")
 
+# 選択肢ラベルの定数。設定 JSON にはラベル文字列ではなく bool / index で保存し、
+# 読み込み時にここへ引き当てるので、文言を変えても古い設定ファイルが壊れない。
+INPUT_MODE_OPTIONS = ["GCS から検索", "ローカルの mcap"]
+OUT_FORMAT_OPTIONS = [
+    "CSV (トピック別)",
+    "mcap (時間帯クロップ + トピック絞り込み → 1 ファイル)",
+    "mcap (元ファイルをそのまま保存, 1 分刻み)",
+]
+CSV_ROUTE_OPTIONS = ["🌐 VM 経由（課金最小・推奨）", "💻 この PC で直接（mcap を全量ダウンロード）"]
+VM_MODEL_OPTIONS = ["B: 毎回作って消す（待機費 ¥0）", "A: 既存 VM を start→stop"]
+SETTINGS_TYPE = "GetMcapToCsv UI settings"  # 設定 JSON の識別子
+
 
 def read_gcp_env():
     """scripts/gcp.env を読む (インラインコメント・クォート除去)。無ければ {}。"""
@@ -163,6 +175,7 @@ ss.setdefault("search_transfer", None)  # 検索時の GCS 転送量 (bytes)
 ss.setdefault("result_transfer", None)  # 抽出時の GCS 転送量とキャッシュ利用量
 ss.setdefault("topic_columns", {})      # {topic: [フラット列名, ...]} カラム絞り込み用
 ss.setdefault("transfer_estimate", None)  # 転送量見積もりの結果
+ss.setdefault("last_selected_topics", [])  # ③で最後に選択されたトピック (設定保存用)
 
 # --- 入力条件の保持 -------------------------------------------------
 # Streamlit はその実行で描画されなかったウィジェットの状態を破棄するため、
@@ -171,6 +184,10 @@ ss.setdefault("transfer_estimate", None)  # 転送量見積もりの結果
 _PERSISTED_KEYS = (
     "w_vehicle", "w_date", "w_tstart", "w_tend", "w_img", "w_sen",
     "local_pattern", "local_time_filter",
+    "w_bucket", "w_subdir", "w_imgsub", "w_sensub",
+    "w_lookback", "w_metaw", "w_extw",
+    "cache_enable", "cache_dir", "cache_max_gb",
+    "w_outfmt", "w_outdir", "w_merged",
     "csv_route", "csvvm_model", "csvvm_auth",
 )
 for _k in list(ss.keys()):
@@ -184,6 +201,18 @@ ss.setdefault("w_tstart", "12:00:00")
 ss.setdefault("w_tend", "12:05:00")
 ss.setdefault("w_img", True)
 ss.setdefault("w_sen", False)
+ss.setdefault("w_bucket", core.DEFAULT_BUCKET)
+ss.setdefault("w_subdir", core.DEFAULT_SUBDIR)
+ss.setdefault("w_imgsub", "record_debug_image")
+ss.setdefault("w_sensub", "record_sensor")
+ss.setdefault("w_lookback", 24)
+ss.setdefault("w_metaw", 16)
+ss.setdefault("w_extw", 0)
+ss.setdefault("cache_enable", True)
+ss.setdefault("cache_dir", os.path.abspath(core.DEFAULT_CACHE_DIR))
+ss.setdefault("cache_max_gb", float(core.DEFAULT_CACHE_MAX_GB))
+ss.setdefault("w_outdir", os.path.abspath("out"))
+ss.setdefault("w_merged", False)
 
 
 def run_captured(fn, *args, **kwargs):
@@ -244,12 +273,182 @@ def gcs_client():
 
 
 # ==================================================================
+# 設定の保存・読み込み (①〜④の条件と選択を JSON 1 ファイルで往復させる)
+# ==================================================================
+
+def gather_settings():
+    """現在の画面の条件・選択を、JSON 化できる dict として集める。
+
+    値はセッション状態から読む (直前の操作までの内容が入っている)。
+    選択肢ラベルは bool / index で持ち、文言変更に対して安定にする。
+    """
+    g = ss.get
+    columns_selected = {}
+    for t in (ss.get("topic_columns") or {}):
+        sel = g(f"colsel_{t}")
+        if sel:
+            columns_selected[t] = list(sel)
+    fmt = g("w_outfmt", OUT_FORMAT_OPTIONS[0])
+    return {
+        "_type": SETTINGS_TYPE,
+        "version": 1,
+        "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "input_mode_gcs": g("input_mode", INPUT_MODE_OPTIONS[0]) == INPUT_MODE_OPTIONS[0],
+        "vehicle": g("w_vehicle", ""),
+        "date": str(g("w_date", "")),
+        "time_start": g("w_tstart", ""),
+        "time_end": g("w_tend", ""),
+        "include_image": bool(g("w_img", True)),
+        "include_sensor": bool(g("w_sen", False)),
+        "local_pattern": g("local_pattern", ""),
+        "local_time_filter": bool(g("local_time_filter", True)),
+        "advanced": {
+            "bucket": g("w_bucket", core.DEFAULT_BUCKET),
+            "subdir": g("w_subdir", core.DEFAULT_SUBDIR),
+            "image_subdir": g("w_imgsub", "record_debug_image"),
+            "sensor_subdir": g("w_sensub", "record_sensor"),
+            "lookback": int(g("w_lookback", 24)),
+            "meta_workers": int(g("w_metaw", 16)),
+            "extract_workers": int(g("w_extw", 0)),
+        },
+        "cache": {
+            "enable": bool(g("cache_enable", True)),
+            "dir": g("cache_dir", os.path.abspath(core.DEFAULT_CACHE_DIR)),
+            "max_gb": float(g("cache_max_gb", float(core.DEFAULT_CACHE_MAX_GB))),
+        },
+        "file_selection": {k: bool(v) for k, v in (ss.get("file_defaults") or {}).items()},
+        "topics": list(ss.get("last_selected_topics") or []),
+        "topic_columns": {t: list(v) for t, v in (ss.get("topic_columns") or {}).items()},
+        "columns_selected": columns_selected,
+        "output": {
+            "format_index": OUT_FORMAT_OPTIONS.index(fmt) if fmt in OUT_FORMAT_OPTIONS else 0,
+            "outdir": g("w_outdir", os.path.abspath("out")),
+            "merged_csv": bool(g("w_merged", False)),
+            "route_vm": g("csv_route", CSV_ROUTE_OPTIONS[0]) == CSV_ROUTE_OPTIONS[0],
+            "vm_model_b": str(g("csvvm_model", VM_MODEL_OPTIONS[0])).startswith("B"),
+            "vm_auth": bool(g("csvvm_auth", True)),
+        },
+    }
+
+
+def apply_settings(data):
+    """設定 JSON をセッション状態へ反映する。
+
+    この関数はページ上部 (①〜④のウィジェット生成前) で呼ばれる前提。同じラン内で
+    後続のウィジェットが復元値で描画される。②のファイル選択と③のトピック選択は
+    検索結果に依存するため pending_* に積み、結果が揃った時点で名前を突き合わせて
+    反映する。知らないキー・壊れた値は黙って読み飛ばし、適用できる分だけ適用する。
+    """
+    def put(key, value):
+        if value is not None:
+            ss[key] = value
+
+    put("input_mode", INPUT_MODE_OPTIONS[0 if data.get("input_mode_gcs", True) else 1])
+    put("w_vehicle", data.get("vehicle"))
+    try:
+        if data.get("date"):
+            ss["w_date"] = datetime.date.fromisoformat(str(data["date"]))
+    except ValueError:
+        pass
+    put("w_tstart", data.get("time_start"))
+    put("w_tend", data.get("time_end"))
+    if "include_image" in data:
+        ss["w_img"] = bool(data["include_image"])
+    if "include_sensor" in data:
+        ss["w_sen"] = bool(data["include_sensor"])
+    put("local_pattern", data.get("local_pattern"))
+    if "local_time_filter" in data:
+        ss["local_time_filter"] = bool(data["local_time_filter"])
+
+    adv = data.get("advanced") or {}
+    put("w_bucket", adv.get("bucket"))
+    put("w_subdir", adv.get("subdir"))
+    put("w_imgsub", adv.get("image_subdir"))
+    put("w_sensub", adv.get("sensor_subdir"))
+    for key, name in (("w_lookback", "lookback"), ("w_metaw", "meta_workers"),
+                      ("w_extw", "extract_workers")):
+        try:
+            if name in adv:
+                ss[key] = int(adv[name])
+        except (TypeError, ValueError):
+            pass
+    cache = data.get("cache") or {}
+    if "enable" in cache:
+        ss["cache_enable"] = bool(cache["enable"])
+    put("cache_dir", cache.get("dir"))
+    try:
+        if "max_gb" in cache:
+            ss["cache_max_gb"] = float(cache["max_gb"])
+    except (TypeError, ValueError):
+        pass
+
+    out = data.get("output") or {}
+    idx = out.get("format_index")
+    if isinstance(idx, int) and 0 <= idx < len(OUT_FORMAT_OPTIONS):
+        ss["w_outfmt"] = OUT_FORMAT_OPTIONS[idx]
+    put("w_outdir", out.get("outdir"))
+    if "merged_csv" in out:
+        ss["w_merged"] = bool(out["merged_csv"])
+    if "route_vm" in out:
+        ss["csv_route"] = CSV_ROUTE_OPTIONS[0 if out["route_vm"] else 1]
+    if "vm_model_b" in out:
+        ss["csvvm_model"] = VM_MODEL_OPTIONS[0 if out["vm_model_b"] else 1]
+    if "vm_auth" in out:
+        ss["csvvm_auth"] = bool(out["vm_auth"])
+
+    # カラム候補 (topic_columns) を先に復元し、カラム選択は候補内に絞って復元する
+    # (multiselect は選択値が options に無いとエラーになるため)
+    tcols = {str(t): [str(c) for c in v]
+             for t, v in (data.get("topic_columns") or {}).items() if isinstance(v, list)}
+    if tcols:
+        ss.topic_columns = {**(ss.get("topic_columns") or {}), **tcols}
+        # 検索実行は topic_columns をリセットするため、読み込み直後の 1 回に限り
+        # 復元したカラム候補を検索後へ引き継ぐ (検索ハンドラ側で pop される)
+        ss.restored_topic_columns = dict(tcols)
+    for t, sel in (data.get("columns_selected") or {}).items():
+        opts = (ss.get("topic_columns") or {}).get(t)
+        if opts and isinstance(sel, list):
+            ss[f"colsel_{t}"] = [c for c in sel if c in opts]
+
+    if data.get("file_selection"):
+        ss.pending_file_selection = {str(k): bool(v)
+                                     for k, v in data["file_selection"].items()}
+    if isinstance(data.get("topics"), list):
+        ss.pending_topic_selection = [str(t) for t in data["topics"]]
+        ss.topics_id += 1  # 取得済みのトピック表があれば作り直して選択を反映
+
+
+with st.expander("💾 設定の保存・読み込み（①〜④の条件・選択を JSON で保存/復元）"):
+    sv1, sv2 = st.columns([1, 2])
+    with sv1:
+        st.download_button(
+            "⬇ 現在の設定を保存",
+            data=json.dumps(gather_settings(), ensure_ascii=False, indent=1),
+            file_name=f"mcap_ui_settings_{datetime.datetime.now():%Y%m%d_%H%M%S}.json",
+            mime="application/json",
+            help="①の検索条件、②のファイル選択、③のトピック・カラム選択、"
+                 "④の出力設定を JSON 1 ファイルに保存します。")
+        st.caption("UI を再起動しても、この JSON を読み込めば同じ条件を再現できます。")
+    with sv2:
+        up = st.file_uploader("設定 JSON を読み込み", type=["json"], key="settings_upload")
+        if up is not None and st.button("📥 この設定を適用", key="settings_apply"):
+            try:
+                data = json.loads(up.getvalue().decode("utf-8-sig"))
+                if data.get("_type") != SETTINGS_TYPE:
+                    st.warning("このツールの設定ファイルではないようです。読める範囲で適用します。")
+                apply_settings(data)
+                st.success("設定を適用しました。②のファイル選択と③のトピック選択は、"
+                           "「候補ファイルを検索」「トピック一覧を取得」のあとに自動で反映されます。")
+            except Exception as e:
+                st.error(f"設定ファイルを読み込めませんでした: {e}")
+
+# ==================================================================
 # ① 検索条件
 # ==================================================================
 st.header("① 検索条件")
 
 input_mode = st.radio(
-    "入力元", ["GCS から検索", "ローカルの mcap"],
+    "入力元", INPUT_MODE_OPTIONS,
     horizontal=True, key="input_mode",
     help="「GCS から検索」= ファイル・トピック・カラムを確認しながら選ぶ (推奨)。"
          "CSV は④で「VM 経由」を選べば mcap のダウンロード課金なしで取得できる。"
@@ -313,26 +512,27 @@ if is_gcs:
 with st.expander("詳細オプション"):
     oc1, oc2, oc3 = st.columns(3)
     with oc1:
-        bucket = st.text_input("GCS バケット", value=core.DEFAULT_BUCKET)
-        subdir = st.text_input("基準サブディレクトリ", value=core.DEFAULT_SUBDIR)
+        bucket = st.text_input("GCS バケット", key="w_bucket")
+        subdir = st.text_input("基準サブディレクトリ", key="w_subdir")
     with oc2:
-        image_subdir = st.text_input("image サブディレクトリ名", value="record_debug_image")
-        sensor_subdir = st.text_input("sensor サブディレクトリ名", value="record_sensor")
+        image_subdir = st.text_input("image サブディレクトリ名", key="w_imgsub")
+        sensor_subdir = st.text_input("sensor サブディレクトリ名", key="w_sensub")
     with oc3:
-        lookback = st.number_input("セッション遡り時間 (h)", value=24, min_value=1, max_value=96)
-        meta_workers = st.number_input("メタデータ並列数", value=16, min_value=1, max_value=64)
-        extract_workers = st.number_input("抽出並列数 (0=自動)", value=0, min_value=0, max_value=16)
+        lookback = st.number_input("セッション遡り時間 (h)", min_value=1, max_value=96,
+                                   key="w_lookback")
+        meta_workers = st.number_input("メタデータ並列数", min_value=1, max_value=64,
+                                       key="w_metaw")
+        extract_workers = st.number_input("抽出並列数 (0=自動)", min_value=0, max_value=16,
+                                          key="w_extw")
 
     st.markdown("**ローカルキャッシュ**（同じ mcap の再ダウンロード = 再課金を防ぐ）")
     cc1, cc2, cc3 = st.columns([1, 2, 1])
     with cc1:
-        cache_enable = st.checkbox("キャッシュを使う", value=True, key="cache_enable")
+        cache_enable = st.checkbox("キャッシュを使う", key="cache_enable")
     with cc2:
-        cache_dir_input = st.text_input("キャッシュフォルダ",
-                                        value=os.path.abspath(core.DEFAULT_CACHE_DIR),
-                                        key="cache_dir")
+        cache_dir_input = st.text_input("キャッシュフォルダ", key="cache_dir")
     with cc3:
-        cache_max_gb = st.number_input("上限 (GB)", value=float(core.DEFAULT_CACHE_MAX_GB),
+        cache_max_gb = st.number_input("上限 (GB)",
                                        min_value=1.0, max_value=500.0, step=5.0,
                                        key="cache_max_gb")
     csize = core.cache_total_size(cache_dir_input)
@@ -362,7 +562,7 @@ if st.button(_btn_label, type="primary", disabled=(time_needed and not time_ok))
     ss.result_files = None
     ss.file_defaults = None  # 新しい検索結果ではチェック状態を全選択に戻す
     ss.search_transfer = None
-    ss.topic_columns = {}
+    ss.topic_columns = ss.pop("restored_topic_columns", None) or {}
     ss.transfer_estimate = None
     core.STATS.reset()
     if is_gcs:
@@ -451,6 +651,19 @@ if ss.sources:
     if ss.get("file_defaults") is None or set(ss.file_defaults) != set(names):
         ss.file_defaults = {n: True for n in names}
         ss.file_ver += 1
+
+    # 設定ファイルから読み込んだファイル選択があれば、今回の候補と名前で突き合わせて反映
+    pend_files = ss.pop("pending_file_selection", None)
+    if pend_files:
+        hit = 0
+        for n in names:
+            if n in pend_files:
+                ss.file_defaults[n] = bool(pend_files[n])
+                hit += 1
+        ss.file_ver += 1
+        if hit < len(pend_files):
+            st.caption(f"⚠ 読み込んだ設定のファイル選択のうち {len(pend_files) - hit} 件は"
+                       "今回の候補に存在しないため無視しました。")
 
     current = dict(ss.file_defaults)  # {パス: 抽出対象か}
 
@@ -566,7 +779,17 @@ if ss.sources:
             st.write("")
             use_all = st.checkbox("全トピック選択", value=False)
 
-        if use_all:
+        # 設定ファイルから読み込んだトピック選択が最優先 (一度反映したら通常動作に戻る)
+        pending_topics = ss.pop("pending_topic_selection", None)
+        if pending_topics is not None:
+            pend_set = set(pending_topics)
+            default_set = {t for t in all_topic_names if t in pend_set}
+            missing_saved = sorted(pend_set - default_set)
+            if missing_saved:
+                st.caption("⚠ 読み込んだ設定にあってデータに存在しないトピック: "
+                           + ", ".join(missing_saved[:10])
+                           + (" ..." if len(missing_saved) > 10 else ""))
+        elif use_all:
             default_set = set(all_topic_names)
         elif preset_name != "(手動選択)":
             wanted = presets[preset_name]
@@ -599,6 +822,7 @@ if ss.sources:
             key=f"topic_editor_{ss.topics_id}_{preset_name}_{use_all}",
         )
         selected_topics = list(edited_topics[edited_topics["選択"]]["トピック"])
+        ss.last_selected_topics = selected_topics  # 設定保存 (gather_settings) で参照する
         st.caption(f"✅ 選択中: {len(selected_topics)} / {len(all_topic_names)} トピック")
         if selected_topics:
             with st.expander("選択中のトピックを確認"):
@@ -641,14 +865,10 @@ if ss.sources:
     st.header("④ 出力")
     ocol1, ocol2 = st.columns([1, 1])
     with ocol1:
-        out_format = st.radio("出力形式", [
-            "CSV (トピック別)",
-            "mcap (時間帯クロップ + トピック絞り込み → 1 ファイル)",
-            "mcap (元ファイルをそのまま保存, 1 分刻み)",
-        ])
+        out_format = st.radio("出力形式", OUT_FORMAT_OPTIONS, key="w_outfmt")
     with ocol2:
-        outdir = st.text_input("出力フォルダ", value=os.path.abspath("out"))
-        merged_csv = st.checkbox("結合 CSV (_all.csv) も出力", value=False,
+        outdir = st.text_input("出力フォルダ", key="w_outdir")
+        merged_csv = st.checkbox("結合 CSV (_all.csv) も出力", key="w_merged",
                                  help="選択した全トピックを時刻順に 1 本へ結合 (CSV のみ)")
 
     # --- CSV の抽出ルート (GCS のみ): この PC で直接 or GCP 内の VM 経由 ---
@@ -658,8 +878,7 @@ if ss.sources:
     vm_route_ready = True
     if is_gcs and out_format.startswith("CSV"):
         route = st.radio(
-            "CSV の抽出ルート",
-            ["🌐 VM 経由（課金最小・推奨）", "💻 この PC で直接（mcap を全量ダウンロード）"],
+            "CSV の抽出ルート", CSV_ROUTE_OPTIONS,
             horizontal=True, key="csv_route",
             help="VM 経由: GCP 内に VM を用意し、そこで mcap→CSV 変換して CSV だけ回収"
                  "（重い mcap は GCP から出ないため egress 課金がほぼ 0。準備に数分）。"
@@ -696,8 +915,7 @@ if ss.sources:
                     "ファイル自体を②で減らす・sensor を外すと、この金額が下がります。")
             vmc1, vmc2 = st.columns([2, 1])
             with vmc1:
-                st.radio("VM 運用",
-                         ["B: 毎回作って消す（待機費 ¥0）", "A: 既存 VM を start→stop"],
+                st.radio("VM 運用", VM_MODEL_OPTIONS,
                          horizontal=True, key="csvvm_model",
                          help="B は使わない間 ¥0（毎回 VM 作成で数分）。"
                               "A は VM を残す（停止中もディスク代 月 ~¥450）が立ち上がりが速い。")
