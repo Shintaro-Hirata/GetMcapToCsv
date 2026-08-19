@@ -4,8 +4,9 @@
 解決済みの落とし穴・未了事項をまとめる。**新しいセッションを始めるときは、
 このファイルと README.md / docs/GCP_EXECUTION.md を読ませれば文脈が復元できる。**
 
-- 開発ブランチ: `claude/mcap-csv-extraction-jlkg6d`（全作業がここに入っている）
-- 関連リポジトリ: `Shintaro-Hirata/GetDruidUser`（同名ブランチ。取得した CSV の取り込み先）
+- 開発の本流: `main`（初期開発ブランチ `claude/mcap-csv-extraction-jlkg6d` は PR #2 で
+  マージ済み。以後は作業ブランチ → main への PR 運用）
+- 関連リポジトリ: `Shintaro-Hirata/GetDruidUser`（取得した CSV の取り込み先）
 - 利用者: hirata.s@t2.auto（Windows / PowerShell 5.1 / VS Code。VM やインフラの専門家ではない
   前提で、エラーメッセージと手順は具体的に書く方針）
 
@@ -18,7 +19,9 @@ GetDruidUser に取り込んで BigQuery 欠損の穴埋め・統計比較に使
 構成:
 - `get_mcap_to_csv.py` — CLI 本体（検索・時刻絞り込み・抽出・CSV/mcap 出力・見積もり・キャッシュ）
 - `app.py` — Streamlit UI（検索 → ファイル選択 → トピック/カラム選択 → 出力。
-  CSV は「この PC で直接」と「VM 経由（課金最小）」の 2 ルート）
+  CSV は「この PC で直接」と「VM 経由（課金最小）」の 2 ルート。①〜④の条件・選択は
+  ページ上部から JSON で保存・復元できる。gcloud ログイン期限切れは実行前に検知して
+  再ログインを自動起動する = `ensure_gcloud_auth`）
 - `scripts/` — GCP 内実行（VM）用。`.ps1`（Windows 用・**ASCII のみ**）と `.sh` の両方を常に同時整備
 - `docs/GCP_EXECUTION.md` — VM 運用の完全な手順書（コスト表・トラブルシュート込み）
 
@@ -67,8 +70,9 @@ GetDruidUser に取り込んで BigQuery 欠損の穴埋め・統計比較に使
    作成後は gcp.env の GCP_PROJECT を書き換えるだけ。
 2. **「切り出し君互換」プリセット**: `mcap_presets.json` のリストは仮。実物の対象トピックに
    合わせて更新が必要（ユーザーがリストを持ってくる）。
-3. **配布準備**: ユーザーは社内配布を計画。README のセットアップ手順は一通りあるが、
-   配布パッケージ化（zip 等）や gcloud 未導入者向け手順は未整備。
+3. **配布準備**: ユーザーは社内配布を計画。初見者向けの docs/MANUAL.md は整備済み
+   （時系列手順 + トラブルシューティング）。配布パッケージ化（zip 等）は未着手。
+   複数人利用時は gcp.env の GCP_VM を人ごとに変える（同名 VM の同時作成が衝突するため）。
 4. UI 実行中の操作でストリーム処理が中断されるのは Streamlit の仕様（注意書きで対応済み。
    根本対応するなら subprocess をバックグラウンド化して進捗をポーリングする作りに変える）。
 
@@ -90,4 +94,4 @@ GetDruidUser に取り込んで BigQuery 欠損の穴埋め・統計比較に使
 
 > GetMcapToCsv と GetDruidUser を扱います。まず両リポジトリの docs/ にある
 > HANDOVER/HANDOFF ドキュメントを読んで文脈を把握してください。
-> 開発ブランチはどちらも `claude/mcap-csv-extraction-jlkg6d` です。
+> どちらも main が本流です（作業はブランチを切って PR で main へ）。
