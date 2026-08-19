@@ -7,3 +7,5 @@ mcap_cache/
 *.mcap
 *.csv
 scripts/gcp.env
+# 配布 zip 作成時に同梱する mcap-ros2idl-support のローカルコピー (リポジトリには含めない)
+/mcap-ros2idl-support/

@@ -68,13 +68,46 @@ Windows + PowerShell を前提に書きます（Mac/Linux の場合の違いは�
 
 ### 3-1. 必要なものをインストールする
 
-以下の 3 つが PC に入っている必要があります。無ければインストールしてください。
+以下が PC に入っている必要があります。無ければインストールしてください。
 
 | ソフト | 用途 | 入手先 |
 |--------|------|--------|
 | Python 3.10 以上 | ツール本体の実行 | https://www.python.org/downloads/ |
-| git | 社内パッケージの取得 | https://git-scm.com/downloads |
 | gcloud CLI | GCP（データ置き場）へのアクセス | https://cloud.google.com/sdk/docs/install |
+| git | リポジトリ・社内パッケージの取得 | https://git-scm.com/downloads |
+
+> **git について**: ツール一式を **zip で受け取った場合は git は不要**です
+> （→ [3-2 の B](#3-2-このツールを入手して依存パッケージを入れる)）。
+> GitHub から自分で取得する場合のみ必要です。
+
+#### Python のインストール手順（Windows）
+
+1. https://www.python.org/downloads/ を開き、黄色の「Download Python 3.x.x」を
+   クリックしてインストーラをダウンロード
+2. インストーラを実行。**最初の画面で必ず「Add python.exe to PATH」にチェック**を
+   入れてから「Install Now」を押す（このチェックを忘れると後の手順でコマンドが
+   見つからずエラーになります。忘れた場合は一度アンインストールしてやり直すのが早い）
+3. 確認: **新しく** PowerShell を開いて次を実行し、バージョンが表示されれば OK
+   ```powershell
+   python --version
+   ```
+   `Python` とだけ表示されて Microsoft Store が開いてしまう場合は、
+   「設定 → アプリ → アプリ実行エイリアス」で `python.exe` / `python3.exe` をオフにする
+
+#### gcloud CLI のインストール手順（Windows）
+
+1. https://cloud.google.com/sdk/docs/install を開き、Windows 用インストーラ
+   （`GoogleCloudSDKInstaller.exe`）をダウンロードして実行
+2. 選択肢は**すべて既定のまま**「Next」で進めてよい
+3. 完了画面に「Run `gcloud init`」等のチェックが出たら、**チェックを外して**終了してよい
+   （初期化は不要。このツールで使うログインは [3-4](#3-4-gcp-にログインする) で行います）
+4. 確認: **新しく** PowerShell を開いて次を実行し、バージョンが表示されれば OK
+   ```powershell
+   gcloud --version
+   ```
+
+> どちらも「コマンドが見つからない」と出る場合は、インストール後に**新しく開いた**
+> PowerShell で実行しているかを確認してください（PATH は開き直さないと反映されません）。
 
 また、GCP 側の**権限**として以下が必要です。無い場合は GCP 管理者に依頼してください
 （依頼文の例は [9-2](#9-2-権限がない系のエラー) 参照）:
@@ -85,18 +118,50 @@ Windows + PowerShell を前提に書きます（Mac/Linux の場合の違いは�
 
 ### 3-2. このツールを入手して依存パッケージを入れる
 
+入手方法は 2 つあります。どちらか一方でよいです。
+
+**A. GitHub から取得する（git が必要）**
+
 ```powershell
 git clone https://github.com/Shintaro-Hirata/GetMcapToCsv.git
 cd GetMcapToCsv
 ```
 
-依存パッケージのインストールは、エクスプローラで **`install_deps.bat` をダブルクリック**
-（または `pip install -r requirements.txt`）。
+**B. zip で受け取った場合（git 不要）**
 
-> `mcap-ros2idl-support` の行でエラーになった場合は次の 3-3 で手動インストールできるので、
-> ここでは先に進んで構いません。
+配布された zip を好きな場所（例: デスクトップ）に**展開するだけ**です。
+zip に `mcap-ros2idl-support` フォルダが同梱されていれば、
+**次の 3-3（zero-plotter の取得）も丸ごと不要**になります。
+
+> 同梱版の注意: `mcap-ros2idl-support` は更新され続けているパッケージなので、
+> 将来「一部のトピックだけ 0 行」（→ [9-4](#9-4-抽出結果が-0-行空になる)）が出たら、
+> 配布元に新しい zip をもらってください（同梱版は `git pull` での自己更新ができません）。
+
+**共通: 依存パッケージのインストール**
+
+エクスプローラで **`install_deps.bat` をダブルクリック**します。
+zip 版で `mcap-ros2idl-support` が同梱されている場合は自動で検出され、
+git なしでインストールされます。
+
+> A の場合に `mcap-ros2idl-support` の行でエラーになったときは、次の 3-3 で
+> 手動インストールできるので、ここでは先に進んで構いません。
+
+<details>
+<summary>（配る側向け）配布用 zip の作り方</summary>
+
+1. `GetMcapToCsv` フォルダ一式をコピーする（`.git` / `out` / `mcap_cache` /
+   `scripts/gcp.env` は含めない）
+2. clone 済みの `zero-plotter/mcap-ros2idl-support` フォルダを、コピーした
+   `GetMcapToCsv` フォルダの**直下**に丸ごとコピーする（`git pull` で最新にしてから）
+3. フォルダごと zip 圧縮して配布する
+
+</details>
 
 ### 3-3. zero-plotter（デコード用パッケージ）を用意する
+
+> **zip 配布で `mcap-ros2idl-support` が同梱されていた場合、この手順は不要です。**
+> [3-5](#3-5-vm-経由ルートの設定ファイルを作る) の `ROS2IDL_LOCAL_PATH` には
+> 同梱フォルダ（`GetMcapToCsv\mcap-ros2idl-support`）のフルパスを指定してください。
 
 `/t2/*` トピックのデコードには社内パッケージ `mcap-ros2idl-support`
 （zero-plotter リポジトリの一部）が必要です。**好きな場所に clone** してください:
@@ -147,7 +212,7 @@ Copy-Item scripts\gcp.env.example scripts\gcp.env
 | `GCP_PROJECT` | VM を作れる自分のプロジェクトID（`gcloud projects list` で確認。表示名ではなく ID） |
 | `GCP_ZONE` | `asia-northeast1-a` のままでよい（データと同じ東京リージョン） |
 | `GCP_VM` | VM の名前。好きな名前でよい（例: `mcap-worker-yamada`） |
-| `ROS2IDL_LOCAL_PATH` | 3-3 で clone した中の `zero-plotter/mcap-ros2idl-support` フォルダのフルパス |
+| `ROS2IDL_LOCAL_PATH` | 3-3 で clone した中の `zero-plotter/mcap-ros2idl-support` フォルダのフルパス（zip 配布の同梱版なら `GetMcapToCsv\mcap-ros2idl-support` のフルパス） |
 
 さらに、コストを最小にしたい場合は `SPOT=1` の行のコメント（先頭の `#`）を外すのが
 おすすめです（VM 稼働費が約 1/3 に。まれに実行が中断されますが、再実行すれば済みます
