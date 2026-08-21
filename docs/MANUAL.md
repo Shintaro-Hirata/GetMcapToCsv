@@ -411,7 +411,8 @@ VM 運用の詳細（モデル A/B、Spot、コスト内訳、既存 VM への�
 | `install_deps.bat` で「Python が見つかりません」 | Python をインストール。インストーラで「Add python.exe to PATH」にチェックを入れる |
 | `pip install` が `mcap-ros2idl-support` の行で失敗 | private リポジトリの認証の問題。[3-3](#3-3-zero-plotterデコード用パッケージを用意する) の手動インストールで解決 |
 | `.ps1` スクリプトが「実行できない」と言われる | PowerShell で一度だけ `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned` を実行 |
-| UI がブラウザで開かない | `start_ui.bat` のコンソールに出ている URL（`http://localhost:8501` 等）を手動でブラウザに入力 |
+| UI がブラウザで開かない | コンソールに出ている URL（`http://localhost:8501` 等）を手動でブラウザに入力（Linux / WSL では自動で開かないことが多い） |
+| 起動時に `FutureWarning`（Python バージョンのサポート予告）や `UserWarning: ... without a quota project` が出る | **エラーではなく警告で、対応不要**。ログに `You can now view your Streamlit app in your browser` が出ていれば UI は正常に起動しているので、そのままブラウザで URL を開く。quota project の警告を消したい場合のみ `gcloud auth application-default set-quota-project t2-integration` を実行（任意） |
 | UI で「scripts/gcp.env が未設定のため VM 経由は使えません」 | [3-5](#3-5-vm-経由ルートの設定ファイルを作る) を実施。特に `GCP_VM` が `your-vm-name` のまま（または古い gcp.env で `GCP_PROJECT` が `your-project-id` のまま）だと使えない |
 
 ### 9-2. 権限がない系のエラー
