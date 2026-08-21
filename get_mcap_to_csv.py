@@ -1009,11 +1009,85 @@ def topic_columns(fields, rows):
     return list(cols.keys())
 
 
-def write_csvs(per_topic, topic_config, outdir, base, merged=True):
+def _grid_label(grid_sec):
+    """グリッド周期のファイル名用ラベル (0.1 → '100ms', 1.0 → '1s')。"""
+    ms = round(grid_sec * 1000)
+    if ms < 1000:
+        return f"{ms}ms"
+    return f"{grid_sec:g}s"
+
+
+def write_merged_grid_csv(per_topic, topic_config, outdir, base, grid_sec, hold_sec):
+    """全トピックを一定周期の共通時間軸に揃えた結合 CSV を 1 本書き出す。
+
+    周波数が異なるトピックをそのまま時刻順に並べると他トピックの列が歯抜けになり
+    解析・図示に向かないため、grid_sec 間隔の時刻グリッドを作り、各セルには
+    「その時刻までに観測された最新値」を入れる (前値ホールド / zero-order hold。
+    計測ツールの一般的な揃え方)。hold_sec (秒) を超えて更新が無い区間は空欄にして、
+    実際のデータ欠損が古い値で埋まって見えないようにする (hold_sec<=0 で無制限)。
+    列名は「<トピック suffix>.<列名>」とし、トピック間の同名列の衝突を避ける。
+    戻り値: 書き出したファイルパスのリスト。
+    """
+    all_t = [r["t_ns"] for rows in per_topic.values() for r in rows]
+    if not all_t:
+        return []
+    grid_ns = max(int(round(grid_sec * 1e9)), 1)
+    hold_ns = None if not hold_sec or hold_sec <= 0 else int(round(hold_sec * 1e9))
+    t_start = (min(all_t) // grid_ns) * grid_ns  # グリッドを周期の倍数に吸着
+    t_end = max(all_t)
+    n_grid = int((t_end - t_start) // grid_ns) + 1
+
+    # 列定義と、トピックごとの時刻順データを用意
+    col_defs = []   # (topic, 列キー, ヘッダ名)
+    rows_by_topic = {}
+    for topic in topic_config.keys():
+        rows = sorted(per_topic.get(topic, []), key=lambda r: r["t_ns"])
+        if not rows:
+            continue
+        rows_by_topic[topic] = rows
+        suffix = topic_config[topic]["suffix"]
+        for c in topic_columns(topic_config[topic]["fields"], rows):
+            col_defs.append((topic, c, f"{suffix}.{c}"))
+    if not col_defs:
+        return []
+
+    os.makedirs(outdir, exist_ok=True)
+    out = os.path.join(outdir, f"{base}_all_{_grid_label(grid_sec)}.csv")
+    cursor = {t: 0 for t in rows_by_topic}   # 次に消費する行番号
+    latest = {t: None for t in rows_by_topic}  # グリッド時刻までの最新行
+    with open(out, "w", newline="", encoding="utf-8-sig") as g:
+        w = csv.writer(g)
+        w.writerow(["time_jst", "t_sec", "t_ns"] + [h for _, _, h in col_defs])
+        for k in range(n_grid):
+            gt = t_start + k * grid_ns
+            for topic, rows in rows_by_topic.items():
+                i = cursor[topic]
+                while i < len(rows) and rows[i]["t_ns"] <= gt:
+                    latest[topic] = rows[i]
+                    i += 1
+                cursor[topic] = i
+            vals = []
+            for topic, c, _h in col_defs:
+                cur = latest[topic]
+                if cur is None or (hold_ns is not None and gt - cur["t_ns"] > hold_ns):
+                    vals.append("")
+                else:
+                    vals.append(cur.get(c, ""))
+            w.writerow([fmt_jst(gt), round((gt - t_start) / 1e9, 3), gt] + vals)
+    hold_str = "無制限" if hold_ns is None else f"{hold_sec:g}s"
+    print(f"[ok] wrote {out}  ({n_grid} rows, 周期 {_grid_label(grid_sec)}, "
+          f"前値ホールド上限 {hold_str})")
+    return [out]
+
+
+def write_csvs(per_topic, topic_config, outdir, base, merged=True,
+               merged_grid=None, merged_hold=5.0):
     """トピック別 CSV と (トピック指定時のみ) 全トピック結合 CSV を書き出す。
 
     topic_config が None のときは全トピックモード。トピックごとに CSV を 1 本ずつ
     出力し、列数が膨大になる結合 CSV は作らない。merged=False でも結合 CSV を省く。
+    merged_grid (秒) を指定すると、結合 CSV は時刻順のメッセージ行の代わりに
+    共通時間軸へ揃えた形式 (write_merged_grid_csv) で出力する。
     """
     all_topics = topic_config is None
     all_t = [r["t_ns"] for rows in per_topic.values() for r in rows]
@@ -1065,6 +1139,12 @@ def write_csvs(per_topic, topic_config, outdir, base, merged=True):
         if all_topics:
             print(f"[info] 全トピックモードのため結合 CSV (_all.csv) は作成しません "
                   f"(トピック別 CSV を {len(written)} 本出力)。")
+        return written
+
+    # (2a) 共通時間軸へ揃えた結合 CSV (周期指定時)
+    if merged_grid:
+        written += write_merged_grid_csv(per_topic, topic_config, outdir, base,
+                                         merged_grid, merged_hold)
         return written
 
     # (2) 全トピック結合 CSV (時刻順 / 値が無い列は空欄)
@@ -1616,6 +1696,13 @@ def main():
                              " (UI の②選択と完全に一致させる用)")
     parser.add_argument("--no-merged", action="store_true",
                         help="結合 CSV (_all.csv) を出力しない")
+    parser.add_argument("--merged-grid", type=float, default=None, metavar="SEC",
+                        help="結合 CSV を一定周期 (秒) の共通時間軸に揃えて出力する (例: 0.1)。"
+                             "各セルはその時刻までの最新値 (前値ホールド)。"
+                             "省略時は従来のメッセージ到着順の結合 CSV")
+    parser.add_argument("--merged-hold", type=float, default=5.0, metavar="SEC",
+                        help="--merged-grid で前値を保持する最大秒数。"
+                             "これを超えて更新が無い区間は空欄になる (0=無制限, 既定 5)")
     parser.add_argument("--cache-dir", default=DEFAULT_CACHE_DIR, metavar="DIR",
                         help="一括ダウンロードのローカルキャッシュ先。同じファイルの"
                              f"再ダウンロード (= 再課金) を防ぐ (default: {DEFAULT_CACHE_DIR})")
@@ -1747,7 +1834,8 @@ def main():
                              workers=args.extract_workers,
                              no_download=args.no_download,
                              cache_dir=cache_dir)
-    write_csvs(per_topic, topic_config, args.outdir, base, merged=not args.no_merged)
+    write_csvs(per_topic, topic_config, args.outdir, base, merged=not args.no_merged,
+               merged_grid=args.merged_grid, merged_hold=args.merged_hold)
     if cache_dir:
         prune_cache(cache_dir, args.cache_max_gb)
     print_transfer_summary()
