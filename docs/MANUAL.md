@@ -68,35 +68,101 @@ Windows + PowerShell を前提に書きます（Mac/Linux の場合の違いは�
 
 ### 3-1. 必要なものをインストールする
 
-以下の 3 つが PC に入っている必要があります。無ければインストールしてください。
+以下が PC に入っている必要があります。無ければインストールしてください。
 
 | ソフト | 用途 | 入手先 |
 |--------|------|--------|
 | Python 3.10 以上 | ツール本体の実行 | https://www.python.org/downloads/ |
-| git | 社内パッケージの取得 | https://git-scm.com/downloads |
 | gcloud CLI | GCP（データ置き場）へのアクセス | https://cloud.google.com/sdk/docs/install |
+| git | リポジトリ・社内パッケージの取得 | https://git-scm.com/downloads |
+
+> **git について**: ツール一式を **zip で受け取った場合は git は不要**です
+> （→ [3-2 の B](#3-2-このツールを入手して依存パッケージを入れる)）。
+> GitHub から自分で取得する場合のみ必要です。
+
+#### Python のインストール手順（Windows）
+
+1. https://www.python.org/downloads/ を開き、黄色の「Download Python 3.x.x」を
+   クリックしてインストーラをダウンロード
+2. インストーラを実行。**最初の画面で必ず「Add python.exe to PATH」にチェック**を
+   入れてから「Install Now」を押す（このチェックを忘れると後の手順でコマンドが
+   見つからずエラーになります。忘れた場合は一度アンインストールしてやり直すのが早い）
+3. 確認: **新しく** PowerShell を開いて次を実行し、バージョンが表示されれば OK
+   ```powershell
+   python --version
+   ```
+   `Python` とだけ表示されて Microsoft Store が開いてしまう場合は、
+   「設定 → アプリ → アプリ実行エイリアス」で `python.exe` / `python3.exe` をオフにする
+
+#### gcloud CLI のインストール手順（Windows）
+
+1. https://cloud.google.com/sdk/docs/install を開き、Windows 用インストーラ
+   （`GoogleCloudSDKInstaller.exe`）をダウンロードして実行
+2. 選択肢は**すべて既定のまま**「Next」で進めてよい
+3. 完了画面に「Run `gcloud init`」等のチェックが出たら、**チェックを外して**終了してよい
+   （初期化は不要。このツールで使うログインは [3-4](#3-4-gcp-にログインする) で行います）
+4. 確認: **新しく** PowerShell を開いて次を実行し、バージョンが表示されれば OK
+   ```powershell
+   gcloud --version
+   ```
+
+> どちらも「コマンドが見つからない」と出る場合は、インストール後に**新しく開いた**
+> PowerShell で実行しているかを確認してください（PATH は開き直さないと反映されません）。
 
 また、GCP 側の**権限**として以下が必要です。無い場合は GCP 管理者に依頼してください
 （依頼文の例は [9-2](#9-2-権限がない系のエラー) 参照）:
 
 - バケット `t2-ft-original-data` の読み取り権限（自分の Google アカウントに対して）
-- VM 経由ルートを使う場合: どこかのプロジェクトで VM を作れる権限
-  （`roles/compute.instanceAdmin.v1`。個人作業用なら `t2-remote-devbox` が第一候補）
+- VM 経由ルートを使う場合: プロジェクト **`t2-integration`** で VM を作れる権限
+  （`roles/compute.instanceAdmin.v1`。このツールでは t2-integration に VM を作る運用が
+  標準です。権限が無い場合の代替は [9-2](#9-2-権限がない系のエラー)）
 
 ### 3-2. このツールを入手して依存パッケージを入れる
+
+入手方法は 2 つあります。どちらか一方でよいです。
+
+**A. GitHub から取得する（git が必要）**
 
 ```powershell
 git clone https://github.com/Shintaro-Hirata/GetMcapToCsv.git
 cd GetMcapToCsv
 ```
 
-依存パッケージのインストールは、エクスプローラで **`install_deps.bat` をダブルクリック**
-（または `pip install -r requirements.txt`）。
+**B. zip で受け取った場合（git 不要）**
 
-> `mcap-ros2idl-support` の行でエラーになった場合は次の 3-3 で手動インストールできるので、
-> ここでは先に進んで構いません。
+配布された zip を好きな場所（例: デスクトップ）に**展開するだけ**です。
+zip に `mcap-ros2idl-support` フォルダが同梱されていれば、
+**次の 3-3（zero-plotter の取得）も丸ごと不要**になります。
+
+> 同梱版の注意: `mcap-ros2idl-support` は更新され続けているパッケージなので、
+> 将来「一部のトピックだけ 0 行」（→ [9-4](#9-4-抽出結果が-0-行空になる)）が出たら、
+> 配布元に新しい zip をもらってください（同梱版は `git pull` での自己更新ができません）。
+
+**共通: 依存パッケージのインストール**
+
+エクスプローラで **`install_deps.bat` をダブルクリック**します。
+zip 版で `mcap-ros2idl-support` が同梱されている場合は自動で検出され、
+git なしでインストールされます。
+
+> A の場合に `mcap-ros2idl-support` の行でエラーになったときは、次の 3-3 で
+> 手動インストールできるので、ここでは先に進んで構いません。
+
+<details>
+<summary>（配る側向け）配布用 zip の作り方</summary>
+
+1. `GetMcapToCsv` フォルダ一式をコピーする（`.git` / `out` / `mcap_cache` /
+   `scripts/gcp.env` は含めない）
+2. clone 済みの `zero-plotter/mcap-ros2idl-support` フォルダを、コピーした
+   `GetMcapToCsv` フォルダの**直下**に丸ごとコピーする（`git pull` で最新にしてから）
+3. フォルダごと zip 圧縮して配布する
+
+</details>
 
 ### 3-3. zero-plotter（デコード用パッケージ）を用意する
+
+> **zip 配布で `mcap-ros2idl-support` が同梱されていた場合、この手順は不要です。**
+> [3-5](#3-5-vm-経由ルートの設定ファイルを作る) の `ROS2IDL_LOCAL_PATH` には
+> 同梱フォルダ（`GetMcapToCsv\mcap-ros2idl-support`）のフルパスを指定してください。
 
 `/t2/*` トピックのデコードには社内パッケージ `mcap-ros2idl-support`
 （zero-plotter リポジトリの一部）が必要です。**好きな場所に clone** してください:
@@ -140,14 +206,15 @@ CSV 抽出の推奨ルート「VM 経由」を使うための設定です（初�
 Copy-Item scripts\gcp.env.example scripts\gcp.env
 ```
 
-作成された `scripts/gcp.env` をメモ帳等で開き、次の 4 つを埋めます:
+作成された `scripts/gcp.env` をメモ帳等で開き、次の 4 つを確認・記入します
+（自分で書くのは実質 `GCP_VM` と `ROS2IDL_LOCAL_PATH` の 2 つだけです）:
 
 | 設定 | 何を書くか |
 |------|-----------|
-| `GCP_PROJECT` | VM を作れる自分のプロジェクトID（`gcloud projects list` で確認。表示名ではなく ID） |
+| `GCP_PROJECT` | **`t2-integration` のままでよい**（社内標準。ここで VM 作成の権限エラーが出る場合は → [9-2](#9-2-権限がない系のエラー)） |
 | `GCP_ZONE` | `asia-northeast1-a` のままでよい（データと同じ東京リージョン） |
-| `GCP_VM` | VM の名前。好きな名前でよい（例: `mcap-worker-yamada`） |
-| `ROS2IDL_LOCAL_PATH` | 3-3 で clone した中の `zero-plotter/mcap-ros2idl-support` フォルダのフルパス |
+| `GCP_VM` | VM の名前。**人ごとに別の名前**にする（例: `mcap-worker-yamada`。同名だと他の人と同時実行したとき衝突します） |
+| `ROS2IDL_LOCAL_PATH` | 3-3 で clone した中の `zero-plotter/mcap-ros2idl-support` フォルダのフルパス（zip 配布の同梱版なら `GetMcapToCsv\mcap-ros2idl-support` のフルパス） |
 
 さらに、コストを最小にしたい場合は `SPOT=1` の行のコメント（先頭の `#`）を外すのが
 おすすめです（VM 稼働費が約 1/3 に。まれに実行が中断されますが、再実行すれば済みます
@@ -344,8 +411,10 @@ VM 運用の詳細（モデル A/B、Spot、コスト内訳、既存 VM への�
 | `install_deps.bat` で「Python が見つかりません」 | Python をインストール。インストーラで「Add python.exe to PATH」にチェックを入れる |
 | `pip install` が `mcap-ros2idl-support` の行で失敗 | private リポジトリの認証の問題。[3-3](#3-3-zero-plotterデコード用パッケージを用意する) の手動インストールで解決 |
 | `.ps1` スクリプトが「実行できない」と言われる | PowerShell で一度だけ `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned` を実行 |
-| UI がブラウザで開かない | `start_ui.bat` のコンソールに出ている URL（`http://localhost:8501` 等）を手動でブラウザに入力 |
-| UI で「scripts/gcp.env が未設定のため VM 経由は使えません」 | [3-5](#3-5-vm-経由ルートの設定ファイルを作る) を実施。特に `GCP_PROJECT` が `your-project-id` のままだと使えない |
+| UI がブラウザで開かない | コンソールに出ている URL（`http://localhost:8501` 等）を手動でブラウザに入力（Linux / WSL では自動で開かないことが多い） |
+| 起動時に `FutureWarning`（Python バージョンのサポート予告）や `UserWarning: ... without a quota project` が出る | **エラーではなく警告で、対応不要**。ログに `You can now view your Streamlit app in your browser` が出ていれば UI は正常に起動しているので、そのままブラウザで URL を開く。quota project の警告を消したい場合のみ `gcloud auth application-default set-quota-project t2-integration` を実行（任意） |
+| 画面は表示されるが「候補ファイルを検索」等のボタンを押しても何も起きない | ボタンを押した直後に、**起動したターミナルに `[ui] 検索開始: ...` が出るか**を見る。**(a) 出る場合**: クリックは届いており処理中か失敗。ターミナルのエラーメッセージを確認し、該当する項目（認証は 9-2、0 件は 9-4）を見る。**(b) 出ない場合**: ブラウザとサーバーの通信（WebSocket）が切れている。SSH・VS Code のポート転送やリモートデスクトップ越しで起きやすい。まずページを再読み込み（F5）し、ダメなら開始時刻欄に `abc` と入れてみる（赤いエラーが出れば通信は正常）。リモートの場合はアプリを動かしている PC 自身のブラウザで開くか、`streamlit run app.py --server.address=0.0.0.0` で起動して表示される Network URL を開く |
+| UI で「scripts/gcp.env が未設定のため VM 経由は使えません」 | [3-5](#3-5-vm-経由ルートの設定ファイルを作る) を実施。特に `GCP_VM` が `your-vm-name` のまま（または古い gcp.env で `GCP_PROJECT` が `your-project-id` のまま）だと使えない |
 
 ### 9-2. 権限がない系のエラー
 
@@ -354,7 +423,7 @@ VM 運用の詳細（モデル A/B、Spot、コスト内訳、既存 VM への�
 | VM 作成時に `Reauthentication failed. cannot prompt during non-interactive execution` | 手元 gcloud の**ログイン期限切れ**（日をまたぐと切れる。正常な動作）。UI が自動で再ログイン画面を開くので、ブラウザで会社アカウントにログインすればそのまま続行される。画面が開かない場合は PowerShell で `gcloud auth login` を実行してから再実行 |
 | 検索時に認証エラー | `gcloud auth application-default login` を実行し直す |
 | 検索時に 403（バケットが読めない） | 自分のアカウントに `t2-ft-original-data` の読み取り権限がない。GCP 管理者に「バケット t2-ft-original-data の読み取り権限（roles/storage.objectViewer）を付与してほしい」と依頼 |
-| VM 作成が `PERMISSION_DENIED` | そのプロジェクトで VM を作る権限がない。①`gcp.env` の `GCP_PROJECT` を権限のあるプロジェクト（例: `t2-remote-devbox`）に変える、または ②管理者に「Compute Engine API の有効化と roles/compute.instanceAdmin.v1 の付与」を依頼 |
+| VM 作成が `PERMISSION_DENIED` | `t2-integration`（gcp.env の `GCP_PROJECT`）で VM を作る権限がない。①管理者に「t2-integration での Compute Engine 利用（roles/compute.instanceAdmin.v1）の付与」を依頼（標準運用に揃うのでおすすめ）、または ②`GCP_PROJECT` を権限のある別プロジェクト（例: `t2-remote-devbox`）に変える |
 | VM での抽出時に `403 ... does not have storage.objects.list access` | VM に自分の認証が入っていない。④ の「認証を VM に入れる」にチェックして再実行（CLI なら `-SetupAuth`） |
 
 ### 9-3. VM 経由の抽出が途中で失敗する
