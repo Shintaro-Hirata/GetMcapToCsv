@@ -44,6 +44,12 @@ OUT_FORMAT_OPTIONS = [
 ]
 CSV_ROUTE_OPTIONS = ["🌐 VM 経由（課金最小・推奨）", "💻 この PC で直接（mcap を全量ダウンロード）"]
 VM_MODEL_OPTIONS = ["B: 毎回作って消す（待機費 ¥0）", "A: 既存 VM を start→stop"]
+MERGED_MODE_OPTIONS = [
+    "⏱ 時間軸をそろえる（一定周期・解析/図示向け）",
+    "📜 メッセージ到着順（従来形式）",
+]
+MERGED_GRID_CHOICES = {"10ms": 0.01, "20ms": 0.02, "50ms": 0.05, "100ms": 0.1,
+                       "200ms": 0.2, "500ms": 0.5, "1s": 1.0}
 SETTINGS_TYPE = "GetMcapToCsv UI settings"  # 設定 JSON の識別子
 
 
@@ -188,6 +194,7 @@ _PERSISTED_KEYS = (
     "w_lookback", "w_metaw", "w_extw",
     "cache_enable", "cache_dir", "cache_max_gb",
     "w_outfmt", "w_outdir", "w_merged",
+    "w_merged_mode", "w_merged_grid", "w_merged_hold",
     "csv_route", "csvvm_model", "csvvm_auth",
 )
 for _k in list(ss.keys()):
@@ -214,6 +221,9 @@ ss.setdefault("cache_dir", os.path.abspath(core.DEFAULT_CACHE_DIR))
 ss.setdefault("cache_max_gb", float(core.DEFAULT_CACHE_MAX_GB))
 ss.setdefault("w_outdir", os.path.abspath("out"))
 ss.setdefault("w_merged", False)
+ss.setdefault("w_merged_mode", MERGED_MODE_OPTIONS[0])
+ss.setdefault("w_merged_grid", "100ms")
+ss.setdefault("w_merged_hold", 5.0)
 
 
 def run_captured(fn, *args, **kwargs):
@@ -326,6 +336,10 @@ def gather_settings():
             "format_index": OUT_FORMAT_OPTIONS.index(fmt) if fmt in OUT_FORMAT_OPTIONS else 0,
             "outdir": g("w_outdir", os.path.abspath("out")),
             "merged_csv": bool(g("w_merged", False)),
+            "merged_grid_mode": (g("w_merged_mode", MERGED_MODE_OPTIONS[0])
+                                 == MERGED_MODE_OPTIONS[0]),
+            "merged_grid": g("w_merged_grid", "100ms"),
+            "merged_hold": float(g("w_merged_hold", 5.0)),
             "route_vm": g("csv_route", CSV_ROUTE_OPTIONS[0]) == CSV_ROUTE_OPTIONS[0],
             "vm_model_b": str(g("csvvm_model", VM_MODEL_OPTIONS[0])).startswith("B"),
             "vm_auth": bool(g("csvvm_auth", True)),
@@ -398,6 +412,15 @@ def apply_settings(data):
     put("w_outdir", out.get("outdir"))
     if "merged_csv" in out:
         ss["w_merged"] = bool(out["merged_csv"])
+    if "merged_grid_mode" in out:
+        ss["w_merged_mode"] = MERGED_MODE_OPTIONS[0 if out["merged_grid_mode"] else 1]
+    if out.get("merged_grid") in MERGED_GRID_CHOICES:
+        ss["w_merged_grid"] = out["merged_grid"]
+    try:
+        if "merged_hold" in out:
+            ss["w_merged_hold"] = float(out["merged_hold"])
+    except (TypeError, ValueError):
+        pass
     if "route_vm" in out:
         ss["csv_route"] = CSV_ROUTE_OPTIONS[0 if out["route_vm"] else 1]
     if "vm_model_b" in out:
@@ -900,8 +923,36 @@ if ss.sources:
         out_format = st.radio("出力形式", OUT_FORMAT_OPTIONS, key="w_outfmt")
     with ocol2:
         outdir = st.text_input("出力フォルダ", key="w_outdir")
-        merged_csv = st.checkbox("結合 CSV (_all.csv) も出力", key="w_merged",
-                                 help="選択した全トピックを時刻順に 1 本へ結合 (CSV のみ)")
+        merged_csv = st.checkbox("結合 CSV も出力 (全トピックを 1 ファイルに)", key="w_merged",
+                                 help="選択した全トピックを 1 本の CSV に結合 (CSV のみ)。"
+                                      "形式は下の「結合 CSV の形式」で選ぶ。")
+
+    # 結合 CSV の形式: 周波数が違うトピックの混在に備え、共通時間軸へ揃える形式を既定にする
+    merged_grid_sec = None
+    merged_hold_sec = None
+    if merged_csv and out_format.startswith("CSV"):
+        mm1, mm2, mm3 = st.columns([2, 1, 1])
+        with mm1:
+            merged_mode = st.radio(
+                "結合 CSV の形式", MERGED_MODE_OPTIONS, horizontal=True, key="w_merged_mode",
+                help="「時間軸をそろえる」= 一定周期の時刻グリッドを作り、各セルにその時刻"
+                     "までの最新値を入れる (前値ホールド)。周波数が異なるトピックを混ぜても"
+                     "歯抜けにならず、そのまま Excel 等でグラフ化できる。列名は"
+                     "「トピック.列名」。「メッセージ到着順」= 1 メッセージ 1 行の従来形式"
+                     " (他トピックの列は空欄になる)。")
+        if merged_mode == MERGED_MODE_OPTIONS[0]:
+            with mm2:
+                grid_label = st.selectbox("周期", list(MERGED_GRID_CHOICES.keys()),
+                                          key="w_merged_grid",
+                                          help="出力する時刻グリッドの間隔。データより細かく"
+                                               "しても情報は増えない (前値が並ぶだけ)。")
+            with mm3:
+                hold = st.number_input("前値保持の上限 (秒)", min_value=0.0, step=1.0,
+                                       key="w_merged_hold",
+                                       help="この秒数を超えて更新が無い区間は空欄にする"
+                                            " (実際のデータ欠損が見えるように)。0 で無制限。")
+            merged_grid_sec = MERGED_GRID_CHOICES[grid_label]
+            merged_hold_sec = float(hold)
 
     # --- CSV の抽出ルート (GCS のみ): この PC で直接 or GCP 内の VM 経由 ---
     # ここで決めた時間帯・トピック・カラムをそのまま VM に渡せるので、
@@ -960,7 +1011,7 @@ if ss.sources:
                             help="手元の gcloud auth application-default login の認証を VM へコピー。")
             st.caption("※ VM は **②で選択したファイルだけ**を読みます（develop/sensor の"
                        "別も②の選択どおり。image は CSV に使わないため自動で除外）。"
-                       "結合 CSV (_all.csv) の有無も上のチェックに従います。")
+                       "結合 CSV の有無・形式も上の設定に従います。")
             if st.button("🔍 課金状況を確認（VM が残っていないか）", key="csvvm_status"):
                 if ensure_gcloud_auth(st.empty(), need_adc=False):
                     with st.spinner("確認中..."):
@@ -1068,6 +1119,11 @@ if ss.sources:
                   "--topics", topics_path, "--gcs-files", files_path, "--local-out", outdir]
             if not merged_csv:
                 ps.append("-NoMerged"); sh.append("--no-merged")
+            elif merged_grid_sec:
+                ps += ["-MergedGrid", f"{merged_grid_sec:g}",
+                       "-MergedHold", f"{merged_hold_sec:g}"]
+                sh += ["--merged-grid", f"{merged_grid_sec:g}",
+                       "--merged-hold", f"{merged_hold_sec:g}"]
             if st.session_state.get("csvvm_auth", True):
                 ps.append("-SetupAuth"); sh.append("--setup-auth")
             vm_model_b = str(st.session_state.get("csvvm_model", "B")).startswith("B")
@@ -1174,7 +1230,10 @@ if ss.sources:
                         progress=on_file_done,
                         cache_dir=cache_dir)
                     return core.write_csvs(per_topic, topic_config, outdir,
-                                           params["base"], merged=merged_csv)
+                                           params["base"], merged=merged_csv,
+                                           merged_grid=merged_grid_sec,
+                                           merged_hold=(merged_hold_sec
+                                                        if merged_hold_sec is not None else 5.0))
                 files, log = run_captured(run)
             elif out_format.startswith("mcap (時間帯"):
                 out_path = os.path.join(outdir, f"{params['base']}_cropped.mcap")
