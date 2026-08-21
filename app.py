@@ -914,11 +914,15 @@ if ss.sources:
         csv_route_vm = route.startswith("🌐")
         if csv_route_vm:
             gcp_cfg = read_gcp_env()
-            vm_route_ready = bool(gcp_cfg.get("GCP_PROJECT")) and \
-                gcp_cfg.get("GCP_PROJECT") != "your-project-id"
+            vm_route_ready = (
+                bool(gcp_cfg.get("GCP_PROJECT"))
+                and gcp_cfg.get("GCP_PROJECT") != "your-project-id"
+                and bool(gcp_cfg.get("GCP_VM"))
+                and gcp_cfg.get("GCP_VM") != "your-vm-name")
             if not vm_route_ready:
                 st.error("scripts/gcp.env が未設定のため VM 経由は使えません。"
-                         "docs/GCP_EXECUTION.md の手順で設定してください。")
+                         "GCP_VM に自分用の VM 名（例: mcap-worker-yamada）を設定するなど、"
+                         "docs/MANUAL.md 3-5 の手順で設定してください。")
             if selected_sources:
                 # 直接ルートで発生するダウンロード量 = 選択ファイル合計。
                 # mcap はチャンク単位でしか読めず、トピック/カラムを絞っても

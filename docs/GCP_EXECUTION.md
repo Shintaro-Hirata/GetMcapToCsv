@@ -67,7 +67,8 @@ Copy-Item scripts\gcp.env.example scripts\gcp.env   # PowerShell
 # bash:  cp scripts/gcp.env.example scripts/gcp.env
 ```
 `scripts/gcp.env` を開いて最低限これだけ埋める（`.ps1` も `.sh` も同じ gcp.env を読む）:
-- `GCP_PROJECT` … 自分のプロジェクトID（`gcloud config get-value project` で確認）
+- `GCP_PROJECT` … `t2-integration` のままでよい（このツールの標準運用。
+  そこで VM を作る権限が無い場合は「VM 作成でつまずくとき」参照）
 - `GCP_ZONE` … `asia-northeast1-a`（東京。そのままでよい）
 - `GCP_VM` … 好きな名前（例 `mcap-worker`）
 - `ROS2IDL_LOCAL_PATH` … 手順 1a で clone した `zero-plotter/mcap-ros2idl-support` のパス
@@ -328,10 +329,11 @@ gcloud config get-value project      # 既定のプロジェクト
 ### どのプロジェクトに VM を作ればよいか
 
 `gcloud projects list` に出るのは「見えるプロジェクト」で、VM を作れるとは限らない。
-**個人の作業 VM は `t2-remote-devbox`（開発者用の devbox プロジェクト）が第一候補**。
+**このツールの標準は `t2-integration`**（gcp.env.example の既定値。運用実績あり）。
+そこで権限が無い場合の代替候補は `t2-remote-devbox`（開発者用の devbox プロジェクト）。
 作れるかは次で事前確認できる（エラーにならなければ Compute 権限あり）:
 ```bash
-gcloud compute instances list --project t2-remote-devbox
+gcloud compute instances list --project t2-integration
 ```
 VM の**プロジェクトはバケットと別でよい**（egress 無料は同一**リージョン**であればよく、
 プロジェクト一致は不要）。VM を東京（asia-northeast1）に置き、手順 2.5 でバケット読み取り

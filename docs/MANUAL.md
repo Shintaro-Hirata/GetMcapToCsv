@@ -113,8 +113,9 @@ Windows + PowerShell を前提に書きます（Mac/Linux の場合の違いは�
 （依頼文の例は [9-2](#9-2-権限がない系のエラー) 参照）:
 
 - バケット `t2-ft-original-data` の読み取り権限（自分の Google アカウントに対して）
-- VM 経由ルートを使う場合: どこかのプロジェクトで VM を作れる権限
-  （`roles/compute.instanceAdmin.v1`。個人作業用なら `t2-remote-devbox` が第一候補）
+- VM 経由ルートを使う場合: プロジェクト **`t2-integration`** で VM を作れる権限
+  （`roles/compute.instanceAdmin.v1`。このツールでは t2-integration に VM を作る運用が
+  標準です。権限が無い場合の代替は [9-2](#9-2-権限がない系のエラー)）
 
 ### 3-2. このツールを入手して依存パッケージを入れる
 
@@ -205,13 +206,14 @@ CSV 抽出の推奨ルート「VM 経由」を使うための設定です（初�
 Copy-Item scripts\gcp.env.example scripts\gcp.env
 ```
 
-作成された `scripts/gcp.env` をメモ帳等で開き、次の 4 つを埋めます:
+作成された `scripts/gcp.env` をメモ帳等で開き、次の 4 つを確認・記入します
+（自分で書くのは実質 `GCP_VM` と `ROS2IDL_LOCAL_PATH` の 2 つだけです）:
 
 | 設定 | 何を書くか |
 |------|-----------|
-| `GCP_PROJECT` | VM を作れる自分のプロジェクトID（`gcloud projects list` で確認。表示名ではなく ID） |
+| `GCP_PROJECT` | **`t2-integration` のままでよい**（社内標準。ここで VM 作成の権限エラーが出る場合は → [9-2](#9-2-権限がない系のエラー)） |
 | `GCP_ZONE` | `asia-northeast1-a` のままでよい（データと同じ東京リージョン） |
-| `GCP_VM` | VM の名前。好きな名前でよい（例: `mcap-worker-yamada`） |
+| `GCP_VM` | VM の名前。**人ごとに別の名前**にする（例: `mcap-worker-yamada`。同名だと他の人と同時実行したとき衝突します） |
 | `ROS2IDL_LOCAL_PATH` | 3-3 で clone した中の `zero-plotter/mcap-ros2idl-support` フォルダのフルパス（zip 配布の同梱版なら `GetMcapToCsv\mcap-ros2idl-support` のフルパス） |
 
 さらに、コストを最小にしたい場合は `SPOT=1` の行のコメント（先頭の `#`）を外すのが
@@ -410,7 +412,7 @@ VM 運用の詳細（モデル A/B、Spot、コスト内訳、既存 VM への�
 | `pip install` が `mcap-ros2idl-support` の行で失敗 | private リポジトリの認証の問題。[3-3](#3-3-zero-plotterデコード用パッケージを用意する) の手動インストールで解決 |
 | `.ps1` スクリプトが「実行できない」と言われる | PowerShell で一度だけ `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned` を実行 |
 | UI がブラウザで開かない | `start_ui.bat` のコンソールに出ている URL（`http://localhost:8501` 等）を手動でブラウザに入力 |
-| UI で「scripts/gcp.env が未設定のため VM 経由は使えません」 | [3-5](#3-5-vm-経由ルートの設定ファイルを作る) を実施。特に `GCP_PROJECT` が `your-project-id` のままだと使えない |
+| UI で「scripts/gcp.env が未設定のため VM 経由は使えません」 | [3-5](#3-5-vm-経由ルートの設定ファイルを作る) を実施。特に `GCP_VM` が `your-vm-name` のまま（または古い gcp.env で `GCP_PROJECT` が `your-project-id` のまま）だと使えない |
 
 ### 9-2. 権限がない系のエラー
 
@@ -419,7 +421,7 @@ VM 運用の詳細（モデル A/B、Spot、コスト内訳、既存 VM への�
 | VM 作成時に `Reauthentication failed. cannot prompt during non-interactive execution` | 手元 gcloud の**ログイン期限切れ**（日をまたぐと切れる。正常な動作）。UI が自動で再ログイン画面を開くので、ブラウザで会社アカウントにログインすればそのまま続行される。画面が開かない場合は PowerShell で `gcloud auth login` を実行してから再実行 |
 | 検索時に認証エラー | `gcloud auth application-default login` を実行し直す |
 | 検索時に 403（バケットが読めない） | 自分のアカウントに `t2-ft-original-data` の読み取り権限がない。GCP 管理者に「バケット t2-ft-original-data の読み取り権限（roles/storage.objectViewer）を付与してほしい」と依頼 |
-| VM 作成が `PERMISSION_DENIED` | そのプロジェクトで VM を作る権限がない。①`gcp.env` の `GCP_PROJECT` を権限のあるプロジェクト（例: `t2-remote-devbox`）に変える、または ②管理者に「Compute Engine API の有効化と roles/compute.instanceAdmin.v1 の付与」を依頼 |
+| VM 作成が `PERMISSION_DENIED` | `t2-integration`（gcp.env の `GCP_PROJECT`）で VM を作る権限がない。①管理者に「t2-integration での Compute Engine 利用（roles/compute.instanceAdmin.v1）の付与」を依頼（標準運用に揃うのでおすすめ）、または ②`GCP_PROJECT` を権限のある別プロジェクト（例: `t2-remote-devbox`）に変える |
 | VM での抽出時に `403 ... does not have storage.objects.list access` | VM に自分の認証が入っていない。④ の「認証を VM に入れる」にチェックして再実行（CLI なら `-SetupAuth`） |
 
 ### 9-3. VM 経由の抽出が途中で失敗する
