@@ -581,6 +581,10 @@ if time_ok and time_needed and range_ok:
 _btn_label = "🔍 ① 候補ファイルを検索" if is_gcs else "📂 ① ローカル mcap を読み込み"
 if st.button(_btn_label, type="primary",
              disabled=(time_needed and (not time_ok or not range_ok))):
+    # 起動ターミナル側の生存確認ログ。「ボタンを押しても何も起きない」ときに、
+    # クリックがサーバーへ届いているか (WebSocket 断か処理側の問題か) を切り分ける。
+    print(f"[ui] 検索開始: vehicle={vehicle!r} "
+          f"{start_dt:%Y-%m-%d %H:%M:%S} - {end_dt:%Y-%m-%d %H:%M:%S} (JST)", flush=True)
     ss.sources = None
     ss.topics_info = None
     ss.result_files = None
@@ -1013,6 +1017,8 @@ if ss.sources:
     st.caption("⏳ 実行中にページ内の他のボタンや入力を操作すると処理が中断されます"
                "（Streamlit の仕様）。完了表示が出るまでそのままお待ちください。")
     if st.button("🚀 ④ 抽出実行", type="primary", disabled=not can_run):
+        print(f"[ui] 抽出開始: {out_format} / ファイル {len(selected_sources)} 件 / "
+              f"トピック {len(selected_topics)} 件", flush=True)
         params = ss.search_params
         os.makedirs(outdir, exist_ok=True)
 

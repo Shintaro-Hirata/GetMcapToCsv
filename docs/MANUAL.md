@@ -413,6 +413,7 @@ VM 運用の詳細（モデル A/B、Spot、コスト内訳、既存 VM への�
 | `.ps1` スクリプトが「実行できない」と言われる | PowerShell で一度だけ `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned` を実行 |
 | UI がブラウザで開かない | コンソールに出ている URL（`http://localhost:8501` 等）を手動でブラウザに入力（Linux / WSL では自動で開かないことが多い） |
 | 起動時に `FutureWarning`（Python バージョンのサポート予告）や `UserWarning: ... without a quota project` が出る | **エラーではなく警告で、対応不要**。ログに `You can now view your Streamlit app in your browser` が出ていれば UI は正常に起動しているので、そのままブラウザで URL を開く。quota project の警告を消したい場合のみ `gcloud auth application-default set-quota-project t2-integration` を実行（任意） |
+| 画面は表示されるが「候補ファイルを検索」等のボタンを押しても何も起きない | ボタンを押した直後に、**起動したターミナルに `[ui] 検索開始: ...` が出るか**を見る。**(a) 出る場合**: クリックは届いており処理中か失敗。ターミナルのエラーメッセージを確認し、該当する項目（認証は 9-2、0 件は 9-4）を見る。**(b) 出ない場合**: ブラウザとサーバーの通信（WebSocket）が切れている。SSH・VS Code のポート転送やリモートデスクトップ越しで起きやすい。まずページを再読み込み（F5）し、ダメなら開始時刻欄に `abc` と入れてみる（赤いエラーが出れば通信は正常）。リモートの場合はアプリを動かしている PC 自身のブラウザで開くか、`streamlit run app.py --server.address=0.0.0.0` で起動して表示される Network URL を開く |
 | UI で「scripts/gcp.env が未設定のため VM 経由は使えません」 | [3-5](#3-5-vm-経由ルートの設定ファイルを作る) を実施。特に `GCP_VM` が `your-vm-name` のまま（または古い gcp.env で `GCP_PROJECT` が `your-project-id` のまま）だと使えない |
 
 ### 9-2. 権限がない系のエラー
