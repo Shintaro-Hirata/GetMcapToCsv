@@ -98,6 +98,18 @@ if [ "$PRIVATE" = "1" ]; then
   fi
 fi
 
+# 既存 VM がある状態での作成は "already exists" の生エラーになるため、先に案内を出す
+if gcloud compute instances describe "$GCP_VM" --project "$GCP_PROJECT" --zone "$GCP_ZONE" >/dev/null 2>&1; then
+  echo "[error] VM '$GCP_VM' は既に存在します ($GCP_PROJECT/$GCP_ZONE)。対処は 2 つ:"
+  echo "  a) 作り直さずマシンタイプだけ変更 (セットアップが残るのでおすすめ):"
+  echo "     gcloud compute instances stop $GCP_VM --zone $GCP_ZONE --project $GCP_PROJECT"
+  echo "     gcloud compute instances set-machine-type $GCP_VM --machine-type $MACHINE_TYPE --zone $GCP_ZONE --project $GCP_PROJECT"
+  echo "     gcloud compute instances start $GCP_VM --zone $GCP_ZONE --project $GCP_PROJECT"
+  echo "  b) 先に削除してからこのスクリプトを再実行:"
+  echo "     gcloud compute instances delete $GCP_VM --zone $GCP_ZONE --project $GCP_PROJECT --quiet"
+  exit 1
+fi
+
 gcloud compute instances create "$GCP_VM" \
   --project="$GCP_PROJECT" \
   --zone="$GCP_ZONE" \

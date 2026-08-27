@@ -114,6 +114,20 @@ if ($private) {
   }
 }
 
+# Fail early with guidance if the VM already exists (a raw 'already exists'
+# error confused users when recreating after a MACHINE_TYPE change).
+& gcloud compute instances describe $vm --project=$project --zone=$zone --format='value(name)' 2>$null | Out-Null
+if ($LASTEXITCODE -eq 0) {
+  Write-Host "[error] VM '$vm' already exists in $project/$zone. Two options:"
+  Write-Host '  a) Change its machine type WITHOUT recreating (keeps setup; recommended):'
+  Write-Host "     gcloud compute instances stop $vm --zone $zone --project $project"
+  Write-Host "     gcloud compute instances set-machine-type $vm --machine-type $machineType --zone $zone --project $project"
+  Write-Host "     gcloud compute instances start $vm --zone $zone --project $project"
+  Write-Host '  b) Delete it first, then run this script again:'
+  Write-Host "     gcloud compute instances delete $vm --zone $zone --project $project --quiet"
+  exit 1
+}
+
 $createArgs = @('compute', 'instances', 'create', $vm,
   "--project=$project", "--zone=$zone", "--machine-type=$machineType",
   "--image-family=$imageFamily", "--image-project=$imageProj",

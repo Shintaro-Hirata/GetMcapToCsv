@@ -473,6 +473,7 @@ VM 運用の詳細（モデル A/B、Spot、コスト内訳、既存 VM への�
 |------|------|
 | ログ末尾が `Remote side unexpectedly closed network connection` 等で切れて失敗 | **Spot VM の中断**（`SPOT=1` 使用時の典型）。害はないので**もう一度「抽出実行」を押すだけ**で通常は成功する。頻発する場合は `scripts/gcp.env` の `SPOT=1` をコメントアウト |
 | 初回 SSH で `Connection refused` がしばらく続く | VM 起動直後は SSH がまだ準備中。スクリプトが自動でリトライするので**待てば OK**（数十秒〜1 分） |
+| VM 作成が `The resource ... already exists` で失敗 | 同名の VM が既に存在している。マシンタイプを変えたいだけなら削除せず `gcloud compute instances stop <VM名> ...` → `set-machine-type` → `start` の 3 コマンドで変更できる（スクリプトがエラー時に具体的なコマンドを表示します）。作り直す場合は先に `delete` の完了を待ってから `gcp_create_vm` を実行 |
 | VM 作成に失敗した | 「① VM 作成ログ」を確認。権限エラーなら [9-2](#9-2-権限がない系のエラー)。一時的なエラーなら再実行 |
 | 失敗後、VM が残って課金されていないか不安 | ④ の「🔍 課金状況を確認」ボタン（CLI: `scripts/gcp_status.ps1`）。VM 名の行が出なければ課金ゼロ。残っていたら表示される削除コマンドで消す |
 
