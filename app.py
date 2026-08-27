@@ -86,9 +86,12 @@ def _vm_script_cmd(script_base, ps_args, sh_args):
 
 
 def run_script_streaming(cmd, log_area):
-    """スクリプトを実行し、出力を逐次 log_area に流す。戻り値: (returncode, 全出力)。"""
+    """スクリプト (リスト) またはシェルコマンド (文字列) を実行し、出力を逐次
+    log_area に流す。戻り値: (returncode, 全出力)。文字列はシェル経由で実行する
+    (Windows で gcloud.cmd を解決するため)。"""
     proc = subprocess.Popen(
-        cmd, cwd=APP_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        cmd, cwd=APP_DIR, shell=isinstance(cmd, str),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, encoding="utf-8", errors="replace")
     lines = []
     for line in iter(proc.stdout.readline, ""):
@@ -194,7 +197,7 @@ _PERSISTED_KEYS = (
     "w_lookback", "w_metaw", "w_extw",
     "cache_enable", "cache_dir", "cache_max_gb",
     "w_outfmt", "w_outdir", "w_merged",
-    "w_merged_mode", "w_merged_grid", "w_merged_hold",
+    "w_merged_mode", "w_merged_grid", "w_merged_hold", "w_split_min",
     "csv_route", "csvvm_model", "csvvm_auth",
 )
 for _k in list(ss.keys()):
@@ -224,6 +227,10 @@ ss.setdefault("w_merged", False)
 ss.setdefault("w_merged_mode", MERGED_MODE_OPTIONS[0])
 ss.setdefault("w_merged_grid", "100ms")
 ss.setdefault("w_merged_hold", 5.0)
+ss.setdefault("w_split_min", 0.0)
+ss.setdefault("col_renames", {})   # {"トピック\n列名": 出力名} CSV 列名の変更
+ss.setdefault("batch_rows", [])    # バッチ実行の行 [{車両ID, 開始日時, 終了日時}]
+ss.setdefault("batch_ver", 0)      # バッチ表を作り直すためのカウンタ
 
 
 def run_captured(fn, *args, **kwargs):
@@ -267,6 +274,18 @@ def parse_time_text(text):
     return None
 
 
+def parse_batch_dt(text):
+    """バッチ表の日時文字列を JST の datetime にする。解釈できなければ None。"""
+    s = str(text or "").strip().replace("／", "/").replace("：", ":")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+                "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
+        try:
+            return datetime.datetime.strptime(s, fmt).replace(tzinfo=core.JST)
+        except ValueError:
+            pass
+    return None
+
+
 def source_kind(name):
     """パスから develop / image / sensor などの種類ラベルを取り出す。"""
     parent = name.rsplit("/", 2)
@@ -299,6 +318,10 @@ def gather_settings():
         sel = g(f"colsel_{t}")
         if sel:
             columns_selected[t] = list(sel)
+    columns_renamed = {}
+    for k, v in (ss.get("col_renames") or {}).items():
+        t, _, c = k.partition("\n")
+        columns_renamed.setdefault(t, {})[c] = v
     fmt = g("w_outfmt", OUT_FORMAT_OPTIONS[0])
     return {
         "_type": SETTINGS_TYPE,
@@ -332,6 +355,8 @@ def gather_settings():
         "topics": list(ss.get("last_selected_topics") or []),
         "topic_columns": {t: list(v) for t, v in (ss.get("topic_columns") or {}).items()},
         "columns_selected": columns_selected,
+        "columns_renamed": columns_renamed,
+        "batch_rows": list(ss.get("batch_rows") or []),
         "output": {
             "format_index": OUT_FORMAT_OPTIONS.index(fmt) if fmt in OUT_FORMAT_OPTIONS else 0,
             "outdir": g("w_outdir", os.path.abspath("out")),
@@ -340,6 +365,7 @@ def gather_settings():
                                  == MERGED_MODE_OPTIONS[0]),
             "merged_grid": g("w_merged_grid", "100ms"),
             "merged_hold": float(g("w_merged_hold", 5.0)),
+            "split_minutes": float(g("w_split_min", 0.0)),
             "route_vm": g("csv_route", CSV_ROUTE_OPTIONS[0]) == CSV_ROUTE_OPTIONS[0],
             "vm_model_b": str(g("csvvm_model", VM_MODEL_OPTIONS[0])).startswith("B"),
             "vm_auth": bool(g("csvvm_auth", True)),
@@ -421,6 +447,11 @@ def apply_settings(data):
             ss["w_merged_hold"] = float(out["merged_hold"])
     except (TypeError, ValueError):
         pass
+    try:
+        if "split_minutes" in out:
+            ss["w_split_min"] = max(0.0, float(out["split_minutes"]))
+    except (TypeError, ValueError):
+        pass
     if "route_vm" in out:
         ss["csv_route"] = CSV_ROUTE_OPTIONS[0 if out["route_vm"] else 1]
     if "vm_model_b" in out:
@@ -441,6 +472,17 @@ def apply_settings(data):
         opts = (ss.get("topic_columns") or {}).get(t)
         if opts and isinstance(sel, list):
             ss[f"colsel_{t}"] = [c for c in sel if c in opts]
+
+    for t, m in (data.get("columns_renamed") or {}).items():
+        if isinstance(m, dict):
+            for c, v in m.items():
+                if v:
+                    ss["col_renames"][f"{t}\n{c}"] = str(v)
+    if isinstance(data.get("batch_rows"), list):
+        ss.batch_rows = [
+            {k: str(r.get(k) or "") for k in ("車両ID", "開始日時", "終了日時")}
+            for r in data["batch_rows"] if isinstance(r, dict)]
+        ss.batch_ver += 1  # バッチ表を作り直して読み込んだ行を反映
 
     if data.get("file_selection"):
         ss.pending_file_selection = {str(k): bool(v)
@@ -636,6 +678,7 @@ if st.button(_btn_label, type="primary",
                 "end_ns": core.to_ns(end_dt),
                 "base": f"{vehicle.strip().upper()}_{start_dt:%Y%m%d_%H%M%S}-"
                         f"{end_dt.strftime(end_fmt)}",
+                "base_prefix": vehicle.strip().upper(),  # 分割出力の区間別ファイル名用
                 "extract_workers": int(extract_workers) or None,
             }
         except LookupError as e:
@@ -679,6 +722,7 @@ if st.button(_btn_label, type="primary",
                         "start_ns": core.to_ns(start_dt) if use_filter else None,
                         "end_ns": core.to_ns(end_dt) if use_filter else None,
                         "base": base,
+                        "base_prefix": folder,  # 分割出力の区間別ファイル名用
                         "extract_workers": int(extract_workers) or None,
                     }
 
@@ -886,7 +930,7 @@ if ss.sources:
 
         # --- カラム絞り込み (CSV 出力の列を選ぶ。既定は全カラム) ---
         if selected_topics:
-            with st.expander("🧩 カラム絞り込み（任意・CSV のみ）"):
+            with st.expander("🧩 カラム絞り込み・列名変更（任意・CSV のみ）"):
                 st.caption(
                     "トピックごとに CSV へ出力する列を選べます (既定は全カラム)。"
                     "※ mcap はメッセージ単位で取得するため、列を絞っても GCS の"
@@ -908,8 +952,45 @@ if ss.sources:
                         t, options=opts, default=opts,  # 取得直後は全選択
                         key=f"colsel_{t}",
                         help="× で外した列は CSV に出力されません。全部外すと全カラム扱い。")
+                # --- 列名の変更 (任意): 出力 CSV のヘッダを分かりやすい名前にする ---
+                ren_rows = []
+                for t in selected_topics:
+                    opts = ss.topic_columns.get(t)
+                    if not opts:
+                        continue
+                    sel = st.session_state.get(f"colsel_{t}")
+                    use = sel if sel and 0 < len(sel) < len(opts) else opts
+                    for c in use:
+                        ren_rows.append({"トピック": t, "元の列名": c,
+                                         "出力名": ss.col_renames.get(f"{t}\n{c}", "")})
+                if ren_rows:
+                    st.markdown("**✏ 列名の変更（任意）** — 客先向けの分かりやすい名前などを"
+                                "「出力名」列に入力（空欄なら元の列名のまま）。"
+                                "トピック別 CSV と結合 CSV(時間軸そろえ) のヘッダに反映され、"
+                                "設定 JSON にも保存されます。")
+                    ren_key = abs(hash(tuple(f"{r['トピック']}|{r['元の列名']}"
+                                             for r in ren_rows))) % 100000
+                    edited_ren = st.data_editor(
+                        pd.DataFrame(ren_rows),
+                        disabled=["トピック", "元の列名"],
+                        hide_index=True, use_container_width=True,
+                        height=min(400, 42 + 35 * len(ren_rows)),
+                        key=f"rename_editor_{ren_key}")
+                    for _, r in edited_ren.iterrows():
+                        rk = f"{r['トピック']}\n{r['元の列名']}"
+                        v = str(r["出力名"] or "").strip()
+                        if v:
+                            ss.col_renames[rk] = v
+                        else:
+                            ss.col_renames.pop(rk, None)
+                    vals = list(ss.col_renames.values())
+                    dups = sorted({v for v in vals if vals.count(v) > 1})
+                    if dups:
+                        st.warning("出力名が重複しています（列の区別がつかなくなります）: "
+                                   + ", ".join(dups))
                 if not any(t in ss.topic_columns for t in selected_topics):
-                    st.caption("「カラム一覧を取得」を押すと、ここで列を選べます。")
+                    st.caption("「カラム一覧を取得」を押すと、ここで列の絞り込みと"
+                               "列名の変更ができます。")
     else:
         st.caption("「トピック一覧を取得」を押すと、ここで選択できます。"
                    " (mcap を元ファイルのまま保存する場合はトピック選択は不要)")
@@ -953,6 +1034,19 @@ if ss.sources:
                                             " (実際のデータ欠損が見えるように)。0 で無制限。")
             merged_grid_sec = MERGED_GRID_CHOICES[grid_label]
             merged_hold_sec = float(hold)
+
+    # 分割出力: 長時間の抽出でも 1 ファイルが巨大にならないよう、書き出しを分数で刻む
+    split_min = 0.0
+    if out_format.startswith("CSV"):
+        spc1, _ = st.columns([1, 3])
+        with spc1:
+            split_min = float(st.number_input(
+                "⏳ 分割出力 (分, 0 = 分割なし)", min_value=0.0, step=10.0,
+                key="w_split_min",
+                help="指定した分数ごとにファイルを区切って出力する (例: 30 →"
+                     " 12:00-12:30, 12:30-13:00, ...)。mcap の読み込みは 1 回のままで、"
+                     "書き出しだけを分割するので追加の課金・時間はほぼ無い。"
+                     "各ファイルの t_sec はその区間の先頭からの経過秒になる。"))
 
     # --- CSV の抽出ルート (GCS のみ): この PC で直接 or GCP 内の VM 経由 ---
     # ここで決めた時間帯・トピック・カラムをそのまま VM に渡せるので、
@@ -1067,24 +1161,41 @@ if ss.sources:
 
     st.caption("⏳ 実行中にページ内の他のボタンや入力を操作すると処理が中断されます"
                "（Streamlit の仕様）。完了表示が出るまでそのままお待ちください。")
+    def build_topic_config():
+        """③の選択トピックとカラム絞り込み・列名変更から CLI 用のトピック設定を作る。
+        一部の列だけ選ばれていれば絞り込む (全選択/空選択は全カラム扱い)。"""
+        config = {}
+        for t in selected_topics:
+            cfg_t = {"suffix": t.strip("/").replace("/", "_"), "fields": []}
+            opts = ss.topic_columns.get(t)
+            sel = st.session_state.get(f"colsel_{t}")
+            if opts and sel and 0 < len(sel) < len(opts):
+                cfg_t["columns"] = list(sel)
+            ren = {c: ss.col_renames[f"{t}\n{c}"]
+                   for c in (opts or []) if f"{t}\n{c}" in ss.col_renames}
+            if ren:
+                cfg_t["rename"] = ren
+            config[t] = cfg_t
+        return config
+
+    def add_output_flags(ps, sh):
+        """④の結合 CSV・分割の設定を gcp_fetch の引数 (ps1/sh) に反映する。"""
+        if not merged_csv:
+            ps.append("-NoMerged"); sh.append("--no-merged")
+        elif merged_grid_sec:
+            ps += ["-MergedGrid", f"{merged_grid_sec:g}",
+                   "-MergedHold", f"{merged_hold_sec:g}"]
+            sh += ["--merged-grid", f"{merged_grid_sec:g}",
+                   "--merged-hold", f"{merged_hold_sec:g}"]
+        if split_min:
+            ps += ["-SplitMinutes", f"{split_min:g}"]
+            sh += ["--split-minutes", f"{split_min:g}"]
+
     if st.button("🚀 ④ 抽出実行", type="primary", disabled=not can_run):
         print(f"[ui] 抽出開始: {out_format} / ファイル {len(selected_sources)} 件 / "
               f"トピック {len(selected_topics)} 件", flush=True)
         params = ss.search_params
         os.makedirs(outdir, exist_ok=True)
-
-        def build_topic_config():
-            """③の選択トピックとカラム絞り込みから CLI 用のトピック設定を作る。
-            一部の列だけ選ばれていれば絞り込む (全選択/空選択は全カラム扱い)。"""
-            config = {}
-            for t in selected_topics:
-                cfg_t = {"suffix": t.strip("/").replace("/", "_"), "fields": []}
-                opts = ss.topic_columns.get(t)
-                sel = st.session_state.get(f"colsel_{t}")
-                if opts and sel and 0 < len(sel) < len(opts):
-                    cfg_t["columns"] = list(sel)
-                config[t] = cfg_t
-            return config
 
         # --- VM 経由 (CSV のみ): 検索 UI で決めた条件を topics JSON にして VM へ渡す ---
         if out_format.startswith("CSV") and csv_route_vm:
@@ -1117,13 +1228,7 @@ if ss.sources:
                   "-Topics", topics_path, "-GcsFiles", files_path, "-LocalOut", outdir]
             sh = ["--vehicle", vehicle, "--start", s_str, "--end", e_str,
                   "--topics", topics_path, "--gcs-files", files_path, "--local-out", outdir]
-            if not merged_csv:
-                ps.append("-NoMerged"); sh.append("--no-merged")
-            elif merged_grid_sec:
-                ps += ["-MergedGrid", f"{merged_grid_sec:g}",
-                       "-MergedHold", f"{merged_hold_sec:g}"]
-                sh += ["--merged-grid", f"{merged_grid_sec:g}",
-                       "--merged-hold", f"{merged_hold_sec:g}"]
+            add_output_flags(ps, sh)
             if st.session_state.get("csvvm_auth", True):
                 ps.append("-SetupAuth"); sh.append("--setup-auth")
             vm_model_b = str(st.session_state.get("csvvm_model", "B")).startswith("B")
@@ -1229,11 +1334,18 @@ if ss.sources:
                         workers=params["extract_workers"],
                         progress=on_file_done,
                         cache_dir=cache_dir)
+                    hold = merged_hold_sec if merged_hold_sec is not None else 5.0
+                    if split_min:
+                        return core.write_csvs_split(
+                            per_topic, topic_config, outdir,
+                            params.get("base_prefix", params["base"]),
+                            params["start_ns"], params["end_ns"], split_min,
+                            merged=merged_csv, merged_grid=merged_grid_sec,
+                            merged_hold=hold)
                     return core.write_csvs(per_topic, topic_config, outdir,
                                            params["base"], merged=merged_csv,
                                            merged_grid=merged_grid_sec,
-                                           merged_hold=(merged_hold_sec
-                                                        if merged_hold_sec is not None else 5.0))
+                                           merged_hold=hold)
                 files, log = run_captured(run)
             elif out_format.startswith("mcap (時間帯"):
                 out_path = os.path.join(outdir, f"{params['base']}_cropped.mcap")
@@ -1312,3 +1424,159 @@ if ss.sources:
             st.warning("出力ファイルがありません。ログを確認してください。")
         with st.expander("実行ログ", expanded=not ss.result_files):
             st.code(ss.result_log or "(ログなし)")
+
+    # ==============================================================
+    # ⑤ バッチ実行 (任意): 複数の車両・期間を同じ設定でまとめて抽出
+    # ==============================================================
+    if is_gcs and out_format.startswith("CSV") and selected_topics:
+        st.header("⑤ バッチ実行（任意）")
+        with st.expander("🌙 複数の車両・期間をまとめて抽出（夜間実行向け）"):
+            st.caption(
+                "③のトピック・カラム・列名変更と④の出力設定（結合 CSV・分割・抽出ルート）を"
+                "全行に適用し、上から順に抽出します。対象ファイルは各行の条件から**自動で**"
+                "絞り込みます（②の手動選択は使いません。record_sensor を含めるかは"
+                "①のチェックに従い、image は含めません）。"
+                "実行中はこの画面を操作しないでください。**PC がスリープしない設定**に"
+                "しておくこと（夜間実行時）。")
+            _batch_src = ss.batch_rows or [{"車両ID": st.session_state.get("w_vehicle", ""),
+                                            "開始日時": "", "終了日時": ""}]
+            edited_batch = st.data_editor(
+                pd.DataFrame(_batch_src, columns=["車両ID", "開始日時", "終了日時"]),
+                num_rows="dynamic", hide_index=True, use_container_width=True,
+                key=f"batch_editor_{ss.batch_ver}",
+                column_config={
+                    "車両ID": st.column_config.TextColumn("車両ID", help="例: GIGA11"),
+                    "開始日時": st.column_config.TextColumn(
+                        "開始日時", help="例: 2026-08-18 12:00"),
+                    "終了日時": st.column_config.TextColumn(
+                        "終了日時", help="例: 2026-08-18 18:00"),
+                })
+            rows_b = [{k: str(r.get(k) or "").strip()
+                       for k in ("車両ID", "開始日時", "終了日時")}
+                      for _, r in edited_batch.iterrows()]
+            ss.batch_rows = [r for r in rows_b if any(r.values())]
+            batch_jobs = []
+            n_bad = 0
+            for r in ss.batch_rows:
+                sdt = parse_batch_dt(r["開始日時"])
+                edt = parse_batch_dt(r["終了日時"])
+                if r["車両ID"] and sdt and edt and sdt < edt:
+                    batch_jobs.append((r["車両ID"].upper(), sdt, edt))
+                else:
+                    n_bad += 1
+            if n_bad:
+                st.warning(f"{n_bad} 行は車両ID または日時（例: 2026-08-18 12:00）を"
+                           "解釈できないため実行対象外です。")
+            route_note = "VM 経由" if csv_route_vm else "この PC で直接（ダウンロード課金あり）"
+            if st.button(f"🌙 バッチ実行 ({len(batch_jobs)} 件, {route_note})",
+                         disabled=not batch_jobs, key="batch_run"):
+                print(f"[ui] バッチ開始: {len(batch_jobs)} 件", flush=True)
+                if csv_route_vm and not ensure_gcloud_auth(
+                        st.empty(), need_adc=st.session_state.get("csvvm_auth", True)):
+                    st.stop()
+                os.makedirs(outdir, exist_ok=True)
+                topic_config = build_topic_config()
+                results = []
+                if csv_route_vm:
+                    topics_path = os.path.join(outdir, "_vm_topics.json")
+                    with open(topics_path, "w", encoding="utf-8") as f:
+                        json.dump(topic_config, f, ensure_ascii=False, indent=1)
+                    vm_model_b = str(st.session_state.get("csvvm_model", "B")).startswith("B")
+                    gcp_cfg = read_gcp_env()
+                    if vm_model_b:
+                        # バッチ中は VM を使い回し、最後にまとめて削除する
+                        # (1 件ごとの作成・削除で数分ずつ浪費しないため)
+                        st.info("VM を作成します（バッチ全体で使い回し、終了時に削除）...")
+                        with st.expander("VM 作成ログ", expanded=False):
+                            rc, _ = run_script_streaming(
+                                _vm_script_cmd("gcp_create_vm", ["-Yes"], ["--yes"]),
+                                st.empty())
+                        if rc != 0:
+                            st.error("VM 作成に失敗したため中止します。")
+                            st.stop()
+                    try:
+                        consec_fail = 0
+                        for i, (veh, sdt, edt) in enumerate(batch_jobs):
+                            label = f"{veh} {sdt:%Y-%m-%d %H:%M} 〜 {edt:%Y-%m-%d %H:%M}"
+                            st.info(f"({i + 1}/{len(batch_jobs)}) {label} を抽出中...")
+                            s_str = f"{sdt:%Y-%m-%d %H:%M:%S}"
+                            e_str = f"{edt:%Y-%m-%d %H:%M:%S}"
+                            ps = ["-Vehicle", veh, "-Start", s_str, "-End", e_str,
+                                  "-Topics", topics_path, "-LocalOut", outdir]
+                            sh = ["--vehicle", veh, "--start", s_str, "--end", e_str,
+                                  "--topics", topics_path, "--local-out", outdir]
+                            if include_sensor:
+                                ps.append("-IncludeSensor"); sh.append("--include-sensor")
+                            add_output_flags(ps, sh)
+                            if i == 0 and st.session_state.get("csvvm_auth", True):
+                                ps.append("-SetupAuth"); sh.append("--setup-auth")
+                            if not vm_model_b:
+                                ps.append("-StartStop"); sh.append("--start-stop")
+                            with st.expander(f"ログ: {label}", expanded=False):
+                                rc, _out = run_script_streaming(
+                                    _vm_script_cmd("gcp_fetch", ps, sh), st.empty())
+                            results.append((label, rc == 0))
+                            consec_fail = 0 if rc == 0 else consec_fail + 1
+                            if consec_fail >= 2:
+                                st.error("2 件連続で失敗したため残りを中断します。"
+                                         "ログを確認してから再実行してください。")
+                                break
+                    finally:
+                        if vm_model_b:
+                            st.info("VM を削除します（待機費を残さないため）...")
+                            del_cmd = ("gcloud compute instances delete "
+                                       f"{gcp_cfg.get('GCP_VM', '')} "
+                                       f"--zone {gcp_cfg.get('GCP_ZONE', '')} "
+                                       f"--project {gcp_cfg.get('GCP_PROJECT', '')} --quiet")
+                            with st.expander("VM 削除ログ", expanded=False):
+                                run_script_streaming(del_cmd, st.empty())
+                else:
+                    core.STATS.reset()
+                    hold = merged_hold_sec if merged_hold_sec is not None else 5.0
+                    for i, (veh, sdt, edt) in enumerate(batch_jobs):
+                        label = f"{veh} {sdt:%Y-%m-%d %H:%M} 〜 {edt:%Y-%m-%d %H:%M}"
+                        prog_b = st.progress(0.0, text=f"({i + 1}/{len(batch_jobs)}) "
+                                                       f"{label} を検索中...")
+                        try:
+                            srcs, log1 = run_captured(
+                                core.find_gcs_sources, gcs_client(), bucket, veh,
+                                sdt, edt, subdir=subdir, lookback_hours=int(lookback),
+                                workers=int(meta_workers),
+                                include_sensor=include_sensor,
+                                sensor_subdir=sensor_subdir,
+                                include_image=False, image_subdir=image_subdir)
+                            s_ns, e_ns = core.to_ns(sdt), core.to_ns(edt)
+                            prog_b.progress(0.3, text=f"({i + 1}/{len(batch_jobs)}) "
+                                                      f"{label} を抽出中...")
+
+                            def run_one():
+                                pt = core.extract_rows(
+                                    srcs, topic_config, s_ns, e_ns,
+                                    workers=int(extract_workers) or None,
+                                    cache_dir=cache_dir)
+                                if split_min:
+                                    return core.write_csvs_split(
+                                        pt, topic_config, outdir, veh, s_ns, e_ns,
+                                        split_min, merged=merged_csv,
+                                        merged_grid=merged_grid_sec, merged_hold=hold)
+                                return core.write_csvs(
+                                    pt, topic_config, outdir,
+                                    core.window_base(veh, s_ns, e_ns),
+                                    merged=merged_csv, merged_grid=merged_grid_sec,
+                                    merged_hold=hold)
+                            files_b, log2 = run_captured(run_one)
+                            prog_b.progress(1.0, text=f"{label}: {len(files_b)} ファイル出力")
+                            results.append((label, bool(files_b)))
+                            with st.expander(f"ログ: {label}", expanded=False):
+                                st.code(log1 + log2)
+                        except Exception as e:
+                            prog_b.progress(0.0, text=f"{label}: 失敗")
+                            results.append((label, False))
+                            st.error(f"{label}: {e}")
+                    if cache_dir:
+                        core.prune_cache(cache_dir, float(cache_max_gb))
+                ok_n = sum(1 for _, ok in results if ok)
+                (st.success if ok_n == len(results) else st.warning)(
+                    f"バッチ完了: {ok_n}/{len(results)} 件成功。出力先: {outdir}")
+                for label, ok in results:
+                    st.write(("✅ " if ok else "❌ ") + label)

@@ -27,6 +27,7 @@ param(
   [switch]$NoMerged,     # do not write the merged _all.csv
   [string]$MergedGrid,   # resample the merged CSV onto a fixed grid (seconds, e.g. 0.1)
   [string]$MergedHold,   # max seconds to hold the last value on the grid (0 = unlimited)
+  [string]$SplitMinutes, # split output files every N minutes (e.g. 30)
   [string]$LocalOut,     # local folder to receive the CSVs (overrides LOCAL_OUT in gcp.env)
   [switch]$SetupAuth,    # copy local ADC to the VM so it reads GCS as you (first time)
   [switch]$StartStop,    # start before run, stop after (even on error) to minimize cost
@@ -240,6 +241,7 @@ if ($IncludeImage)  { $ra += '--include-image' }
 if ($NoMerged)      { $ra += '--no-merged' }
 if ($MergedGrid)    { $ra += @('--merged-grid', $MergedGrid) }
 if ($MergedHold)    { $ra += @('--merged-hold', $MergedHold) }
+if ($SplitMinutes)  { $ra += @('--split-minutes', $SplitMinutes) }
 if ($ExtraArgs)     { $ra += $ExtraArgs }
 if ($ra.Count -eq 0) { throw 'No extraction args. Pass -Vehicle/-Start/-End/-Topics etc.' }
 

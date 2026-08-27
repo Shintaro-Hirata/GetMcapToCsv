@@ -233,6 +233,10 @@ python get_mcap_to_csv.py --local "C:\data\*.mcap" --start "2025-12-04 12:00" --
   （例 `["position.x", "speed"]`）。`fields` との違い: `fields` は列名が最後の要素名に
   短縮される extract.py 互換形式、`columns` はフラット展開の列名そのまま。
   UI のカラム絞り込みはこちらを使う。
+- `rename` …（任意）CSV に出力する**列名の変更** `{元の列名: 出力名}`
+  （例 `{"speed": "車速[km/h]"}`）。トピック別 CSV と結合 CSV（時間軸そろえ）の
+  ヘッダに反映される。客先向けの分かりやすい名前を付けたいときに使う。
+  UI では ③ の「カラム絞り込み・列名変更」から設定できる。
 - `_` で始まるキー（`_comment` など）は無視される。
 
 サンプル: [`topics.example.t2.json`](topics.example.t2.json)（バケットの /t2 データ用）、
@@ -249,6 +253,7 @@ python get_mcap_to_csv.py --local "C:\data\*.mcap" --start "2025-12-04 12:00" --
 | `--outdir` | CSV 出力先（デフォルト `out`） |
 | `--merged-grid` | 結合 CSV を一定周期（秒）の共通時間軸に揃えて出力（例: `0.1`）。各セルはその時刻までの最新値（前値ホールド） |
 | `--merged-hold` | `--merged-grid` で前値を保持する最大秒数。超えた区間は空欄（0=無制限、デフォルト 5） |
+| `--split-minutes` | 指定した分数ごとに出力ファイルを区切る（例: `30`）。読み込みは 1 回のまま書き出しだけ分割 |
 | `--bucket` | バケット名（デフォルト `t2-ft-original-data`） |
 | `--subdir` | セッション内の対象サブディレクトリ（デフォルト `record_develop`、`"*"` で全て） |
 | `--workers` | 時刻メタデータ読み込みの並列数（デフォルト 16） |
