@@ -44,6 +44,7 @@ run_ssh() { gcloud compute ssh "$REMOTE" "${SSH_FLAGS[@]}" --command "$1"; }
 SETUP_AUTH=0
 START_STOP=0
 DELETE_AFTER=0
+SKIP_PUSH=0
 TOPICS_FILE=""
 GCS_FILES_FILE=""
 POS_ARGS=()
@@ -58,6 +59,7 @@ for a in "$@"; do
     --setup-auth) SETUP_AUTH=1 ;;
     --start-stop) START_STOP=1 ;;
     --delete-after) DELETE_AFTER=1 ;;
+    --skip-push) SKIP_PUSH=1 ;;  # ツール転送を省略 (前回転送済み。バッチ2件目以降用)
     --local-out) EXPECT_LOCAL_OUT=1 ;;
     --topics) EXPECT_TOPICS=1 ;;      # 手元の topics JSON は VM へ転送してから basename で渡す
     --gcs-files) EXPECT_GCS_FILES=1 ;;  # ②選択のファイル一覧 JSON も同様に転送する
@@ -98,15 +100,19 @@ for _ in $(seq 1 30); do
   sleep 5
 done
 
-echo "[info] VM ($GCP_VM / $GCP_ZONE) にツールを転送..."
-run_ssh "mkdir -p $REMOTE_DIR/scripts"
-# 実行に必要な最小ファイルだけ転送 (mcap 本体は転送しない)
-for f in get_mcap_to_csv.py requirements.txt topics.example.t2.json topics.example.apollo.json; do
-  gcloud compute scp "${SSH_FLAGS[@]}" "$REPO_DIR/$f" "$REMOTE:$REMOTE_DIR/$f"
-done
-gcloud compute scp "${SSH_FLAGS[@]}" "$REPO_DIR/scripts/run_on_gcp.sh" "$REMOTE:$REMOTE_DIR/scripts/run_on_gcp.sh"
-# CRLF チェックアウト対策 (bash が pipefail\r 等で失敗するため VM 側で除去)
-run_ssh "sed -i 's/\r//' $REMOTE_DIR/scripts/run_on_gcp.sh"
+if [ "$SKIP_PUSH" = "1" ]; then
+  echo "[info] ツール転送をスキップ (前回の実行で転送済みの前提)"
+else
+  echo "[info] VM ($GCP_VM / $GCP_ZONE) にツールを転送..."
+  run_ssh "mkdir -p $REMOTE_DIR/scripts"
+  # 実行に必要な最小ファイルだけ転送 (mcap 本体は転送しない)
+  for f in get_mcap_to_csv.py requirements.txt topics.example.t2.json topics.example.apollo.json; do
+    gcloud compute scp "${SSH_FLAGS[@]}" "$REPO_DIR/$f" "$REMOTE:$REMOTE_DIR/$f"
+  done
+  gcloud compute scp "${SSH_FLAGS[@]}" "$REPO_DIR/scripts/run_on_gcp.sh" "$REMOTE:$REMOTE_DIR/scripts/run_on_gcp.sh"
+  # CRLF チェックアウト対策 (bash が pipefail\r 等で失敗するため VM 側で除去)
+  run_ssh "sed -i 's/\r//' $REMOTE_DIR/scripts/run_on_gcp.sh"
+fi
 
 # 手元で指定した topics JSON を VM へ転送し、VM 上では basename で参照する
 if [ -n "$TOPICS_FILE" ]; then
@@ -127,7 +133,10 @@ fi
 # /t2 デコード用の私物パッケージを手元から VM へ転送 (VM での GitHub 認証を回避)
 ROS2IDL_REMOTE=""
 if [ -n "${ROS2IDL_LOCAL_PATH:-}" ]; then
-  if [ -d "$ROS2IDL_LOCAL_PATH" ]; then
+  if [ "$SKIP_PUSH" = "1" ]; then
+    echo "[info] mcap-ros2idl-support の転送をスキップ (前回転送済みの前提)"
+    ROS2IDL_REMOTE="mcap-ros2idl-support"
+  elif [ -d "$ROS2IDL_LOCAL_PATH" ]; then
     echo "[info] mcap-ros2idl-support を VM へ転送 (元: $ROS2IDL_LOCAL_PATH)"
     # ローカル側の apex_json 対応チェック (古い/別フォルダを指していると気づける)
     FAC_LOCAL=$(find "$ROS2IDL_LOCAL_PATH" -name decode_factory.py 2>/dev/null | head -1)

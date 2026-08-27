@@ -602,7 +602,7 @@ with st.expander("詳細オプション"):
                                    key="w_lookback")
         meta_workers = st.number_input("メタデータ並列数", min_value=1, max_value=64,
                                        key="w_metaw")
-        extract_workers = st.number_input("抽出並列数 (0=自動)", min_value=0, max_value=16,
+        extract_workers = st.number_input("抽出並列数 (0=自動)", min_value=0, max_value=32,
                                           key="w_extw")
 
     st.markdown("**ローカルキャッシュ**（同じ mcap の再ダウンロード = 再課金を防ぐ）")
@@ -1530,6 +1530,10 @@ if ss.sources:
                             add_output_flags(ps, sh)
                             if i == 0 and st.session_state.get("csvvm_auth", True):
                                 ps.append("-SetupAuth"); sh.append("--setup-auth")
+                            if i > 0:
+                                # ツールと mcap-ros2idl-support は 1 件目で転送済み。
+                                # 2 件目以降は転送を省略して 30 秒〜1 分/件を節約する
+                                ps.append("-SkipPush"); sh.append("--skip-push")
                             if not vm_model_b:
                                 ps.append("-StartStop"); sh.append("--start-stop")
                             with st.expander(f"ログ: {label}", expanded=False):

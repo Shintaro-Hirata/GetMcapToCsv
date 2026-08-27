@@ -944,7 +944,10 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
     jobs = build_extract_jobs(sources, topic_config, exclude_pats,
                               start_ns, end_ns, no_download, cache_dir)
     if workers is None:
-        workers = min(len(jobs), max(1, (os.cpu_count() or 4) - 1), 8)
+        # vCPU-1 まで自動で並列化する (上限 32)。デコードは CPU バウンドかつ
+        # ファイル単位の並列なので、vCPU の多いマシン (VM の MACHINE_TYPE を
+        # e2-highcpu-32 等にした場合) ではほぼ台数分だけ速くなる
+        workers = min(len(jobs), max(1, (os.cpu_count() or 4) - 1), 32)
     workers = max(1, workers)
 
     n_dl = sum(1 for j in jobs if j.get("download"))
