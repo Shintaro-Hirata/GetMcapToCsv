@@ -77,6 +77,27 @@ def read_gcp_env():
     return cfg
 
 
+def vm_status(gcp_cfg):
+    """gcp.env の VM の存在と状態を返す ("RUNNING"/"TERMINATED" 等。存在しなければ None)。
+
+    UI の「VM 運用」選択と実際の VM の有無が食い違っても事故にならないよう、
+    実行前にここで実態を確認して動作を合わせる (無ければ作成、あれば使い回し)。
+    """
+    vm = gcp_cfg.get("GCP_VM")
+    zone = gcp_cfg.get("GCP_ZONE")
+    proj = gcp_cfg.get("GCP_PROJECT")
+    if not (vm and zone and proj):
+        return None
+    try:
+        r = subprocess.run(
+            f"gcloud compute instances describe {vm} --zone {zone} --project {proj} "
+            f"--format=value(status)",
+            shell=True, capture_output=True, text=True, timeout=60)
+        return (r.stdout.strip() or None) if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
 def _vm_script_cmd(script_base, ps_args, sh_args):
     """OS に応じて .ps1 (Windows) か .sh を呼ぶコマンド列を返す。"""
     if sys.platform == "win32":
@@ -1110,7 +1131,10 @@ if ss.sources:
                 st.radio("VM 運用", VM_MODEL_OPTIONS,
                          horizontal=True, key="csvvm_model",
                          help="B は使わない間 ¥0（毎回 VM 作成で数分）。"
-                              "A は VM を残す（停止中もディスク代 月 ~¥450）が立ち上がりが速い。")
+                              "A は VM を残す（停止中もディスク代 月 ~¥450）が立ち上がりが速い。"
+                              "どちらを選んでいても実行時に VM の有無を自動判定し、"
+                              "既存の VM は削除せず使い回す（無ければ作成する）ので、"
+                              "選択ミスで失敗したり VM が消えたりすることはない。")
             with vmc2:
                 st.checkbox("認証を VM に入れる（新規 VM は必須）", value=True, key="csvvm_auth",
                             help="手元の gcloud auth application-default login の認証を VM へコピー。")
@@ -1243,7 +1267,18 @@ if ss.sources:
             if st.session_state.get("csvvm_auth", True):
                 ps.append("-SetupAuth"); sh.append("--setup-auth")
             vm_model_b = str(st.session_state.get("csvvm_model", "B")).startswith("B")
-            if vm_model_b:
+            # 「VM 運用」の選択と実際の VM の有無が食い違っていても実態に合わせる:
+            # 無ければモデルに関わらず作成し、既にあれば作成せず使い回す (勝手に
+            # 削除もしない)。削除するのは「この実行で作った VM」だけ。
+            status = vm_status(read_gcp_env())
+            create_first = status is None
+            if vm_model_b and not create_first:
+                st.info("既存の VM が見つかったため、作成せずに使い回します"
+                        "（終了後は停止のみ。削除はしません）。毎回作って消す運用に"
+                        "戻すには、先に「課金状況を確認」の削除コマンドで VM を消してください。")
+            elif not vm_model_b and create_first:
+                st.info("VM が存在しないため、先に作成します（A 運用のため実行後も残ります）。")
+            if vm_model_b and create_first:
                 ps.append("-DeleteAfter"); sh.append("--delete-after")
             else:
                 ps.append("-StartStop"); sh.append("--start-stop")
@@ -1253,7 +1288,7 @@ if ss.sources:
             # 各フェーズのログは独立した expander に流す。こうすると②が①を
             # 上書きせず、両方のログが最後まで残る。見出しをクリックすると
             # そのフェーズのログを開閉できる（配布時にも全ログを追える）。
-            if vm_model_b:
+            if create_first:
                 st.info("① VM を作成します（1〜2 分）...")
                 with st.expander("① VM 作成ログ（クリックで開閉）", expanded=True):
                     create_log = st.empty()
@@ -1503,10 +1538,15 @@ if ss.sources:
                         json.dump(topic_config, f, ensure_ascii=False, indent=1)
                     vm_model_b = str(st.session_state.get("csvvm_model", "B")).startswith("B")
                     gcp_cfg = read_gcp_env()
-                    if vm_model_b:
-                        # バッチ中は VM を使い回し、最後にまとめて削除する
-                        # (1 件ごとの作成・削除で数分ずつ浪費しないため)
-                        st.info("VM を作成します（バッチ全体で使い回し、終了時に削除）...")
+                    vm_args = (f"{gcp_cfg.get('GCP_VM', '')} "
+                               f"--zone {gcp_cfg.get('GCP_ZONE', '')} "
+                               f"--project {gcp_cfg.get('GCP_PROJECT', '')}")
+                    # バッチ中は VM を 1 台使い回す。無ければ作成し、既にあれば
+                    # そのまま使う (この実行で作った VM だけを最後に削除できる)
+                    status = vm_status(gcp_cfg)
+                    created_here = False
+                    if status is None:
+                        st.info("VM を作成します（バッチ全体で使い回し）...")
                         with st.expander("VM 作成ログ", expanded=False):
                             rc, _ = run_script_streaming(
                                 _vm_script_cmd("gcp_create_vm", ["-Yes"], ["--yes"]),
@@ -1514,6 +1554,14 @@ if ss.sources:
                         if rc != 0:
                             st.error("VM 作成に失敗したため中止します。")
                             st.stop()
+                        created_here = True
+                    elif status != "RUNNING":
+                        st.info("既存の VM を起動します（バッチ全体で使い回し）...")
+                        with st.expander("VM 起動ログ", expanded=False):
+                            run_script_streaming(
+                                f"gcloud compute instances start {vm_args}", st.empty())
+                    else:
+                        st.info("既存の VM が起動中のため、そのまま使い回します。")
                     try:
                         consec_fail = 0
                         for i, (veh, sdt, edt) in enumerate(batch_jobs):
@@ -1534,8 +1582,6 @@ if ss.sources:
                                 # ツールと mcap-ros2idl-support は 1 件目で転送済み。
                                 # 2 件目以降は転送を省略して 30 秒〜1 分/件を節約する
                                 ps.append("-SkipPush"); sh.append("--skip-push")
-                            if not vm_model_b:
-                                ps.append("-StartStop"); sh.append("--start-stop")
                             with st.expander(f"ログ: {label}", expanded=False):
                                 rc, _out = run_script_streaming(
                                     _vm_script_cmd("gcp_fetch", ps, sh), st.empty())
@@ -1546,14 +1592,18 @@ if ss.sources:
                                          "ログを確認してから再実行してください。")
                                 break
                     finally:
-                        if vm_model_b:
+                        if created_here and vm_model_b:
                             st.info("VM を削除します（待機費を残さないため）...")
-                            del_cmd = ("gcloud compute instances delete "
-                                       f"{gcp_cfg.get('GCP_VM', '')} "
-                                       f"--zone {gcp_cfg.get('GCP_ZONE', '')} "
-                                       f"--project {gcp_cfg.get('GCP_PROJECT', '')} --quiet")
                             with st.expander("VM 削除ログ", expanded=False):
-                                run_script_streaming(del_cmd, st.empty())
+                                run_script_streaming(
+                                    f"gcloud compute instances delete {vm_args} --quiet",
+                                    st.empty())
+                        else:
+                            # 既存の VM (または A 運用で作った VM) は削除せず停止だけする
+                            st.info("VM を停止します（削除はしません）...")
+                            with st.expander("VM 停止ログ", expanded=False):
+                                run_script_streaming(
+                                    f"gcloud compute instances stop {vm_args}", st.empty())
                 else:
                     core.STATS.reset()
                     hold = merged_hold_sec if merged_hold_sec is not None else 5.0
