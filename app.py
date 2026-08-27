@@ -1130,11 +1130,11 @@ if ss.sources:
             with vmc1:
                 st.radio("VM 運用", VM_MODEL_OPTIONS,
                          horizontal=True, key="csvvm_model",
-                         help="B は使わない間 ¥0（毎回 VM 作成で数分）。"
-                              "A は VM を残す（停止中もディスク代 月 ~¥450）が立ち上がりが速い。"
-                              "どちらを選んでいても実行時に VM の有無を自動判定し、"
-                              "既存の VM は削除せず使い回す（無ければ作成する）ので、"
-                              "選択ミスで失敗したり VM が消えたりすることはない。")
+                         help="B = **終了後に VM が残らないことを保証**（維持費 ¥0。"
+                              "既存 VM があってもそれを使い、終了時に削除する）。"
+                              "A = VM を残して使い回す（停止中もディスク代 月 ~¥450 かかるが"
+                              "立ち上がりが速い）。どちらも VM が無ければ自動で作成するので、"
+                              "選択と実態のずれで失敗はしない。")
             with vmc2:
                 st.checkbox("認証を VM に入れる（新規 VM は必須）", value=True, key="csvvm_auth",
                             help="手元の gcloud auth application-default login の認証を VM へコピー。")
@@ -1267,18 +1267,19 @@ if ss.sources:
             if st.session_state.get("csvvm_auth", True):
                 ps.append("-SetupAuth"); sh.append("--setup-auth")
             vm_model_b = str(st.session_state.get("csvvm_model", "B")).startswith("B")
-            # 「VM 運用」の選択と実際の VM の有無が食い違っていても実態に合わせる:
-            # 無ければモデルに関わらず作成し、既にあれば作成せず使い回す (勝手に
-            # 削除もしない)。削除するのは「この実行で作った VM」だけ。
+            # 「VM 運用」の選択と実際の VM の有無が食い違っていても失敗させない:
+            # 無ければモデルに関わらず作成し、既にあれば作成せず使う。
+            # B の約束は「終了後に VM が存在しない = 維持費ゼロ」なので、
+            # B では既存 VM でも終了後に必ず削除する (開始時に明示する)。
             status = vm_status(read_gcp_env())
             create_first = status is None
             if vm_model_b and not create_first:
-                st.info("既存の VM が見つかったため、作成せずに使い回します"
-                        "（終了後は停止のみ。削除はしません）。毎回作って消す運用に"
-                        "戻すには、先に「課金状況を確認」の削除コマンドで VM を消してください。")
+                st.info("既存の VM が見つかりました。作成せずにこの VM で実行し、"
+                        "**B 運用のため終了後に削除します**（維持費を残さないため）。"
+                        "VM を残したい場合は「A: 既存 VM を start→stop」を選んでください。")
             elif not vm_model_b and create_first:
                 st.info("VM が存在しないため、先に作成します（A 運用のため実行後も残ります）。")
-            if vm_model_b and create_first:
+            if vm_model_b:
                 ps.append("-DeleteAfter"); sh.append("--delete-after")
             else:
                 ps.append("-StartStop"); sh.append("--start-stop")
@@ -1542,11 +1543,13 @@ if ss.sources:
                                f"--zone {gcp_cfg.get('GCP_ZONE', '')} "
                                f"--project {gcp_cfg.get('GCP_PROJECT', '')}")
                     # バッチ中は VM を 1 台使い回す。無ければ作成し、既にあれば
-                    # そのまま使う (この実行で作った VM だけを最後に削除できる)
+                    # そのまま使う。B の約束は「終了後に VM が存在しない = 維持費
+                    # ゼロ」なので、B では既存 VM でも終了時に必ず削除する
+                    end_note = ("バッチ終了時に VM を削除します（B 運用・維持費ゼロ）"
+                                if vm_model_b else "バッチ終了時に VM を停止します（A 運用）")
                     status = vm_status(gcp_cfg)
-                    created_here = False
                     if status is None:
-                        st.info("VM を作成します（バッチ全体で使い回し）...")
+                        st.info(f"VM を作成します（バッチ全体で使い回し、{end_note}）...")
                         with st.expander("VM 作成ログ", expanded=False):
                             rc, _ = run_script_streaming(
                                 _vm_script_cmd("gcp_create_vm", ["-Yes"], ["--yes"]),
@@ -1554,14 +1557,13 @@ if ss.sources:
                         if rc != 0:
                             st.error("VM 作成に失敗したため中止します。")
                             st.stop()
-                        created_here = True
                     elif status != "RUNNING":
-                        st.info("既存の VM を起動します（バッチ全体で使い回し）...")
+                        st.info(f"既存の VM を起動します（バッチ全体で使い回し、{end_note}）...")
                         with st.expander("VM 起動ログ", expanded=False):
                             run_script_streaming(
                                 f"gcloud compute instances start {vm_args}", st.empty())
                     else:
-                        st.info("既存の VM が起動中のため、そのまま使い回します。")
+                        st.info(f"既存の VM が起動中のため、そのまま使い回します（{end_note}）。")
                     try:
                         consec_fail = 0
                         for i, (veh, sdt, edt) in enumerate(batch_jobs):
@@ -1592,15 +1594,14 @@ if ss.sources:
                                          "ログを確認してから再実行してください。")
                                 break
                     finally:
-                        if created_here and vm_model_b:
-                            st.info("VM を削除します（待機費を残さないため）...")
+                        if vm_model_b:
+                            st.info("VM を削除します（維持費を残さないため）...")
                             with st.expander("VM 削除ログ", expanded=False):
                                 run_script_streaming(
                                     f"gcloud compute instances delete {vm_args} --quiet",
                                     st.empty())
                         else:
-                            # 既存の VM (または A 運用で作った VM) は削除せず停止だけする
-                            st.info("VM を停止します（削除はしません）...")
+                            st.info("VM を停止します（A 運用のため削除はしません）...")
                             with st.expander("VM 停止ログ", expanded=False):
                                 run_script_streaming(
                                     f"gcloud compute instances stop {vm_args}", st.empty())
