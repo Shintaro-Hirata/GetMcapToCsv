@@ -950,6 +950,25 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
         workers = min(len(jobs), max(1, (os.cpu_count() or 4) - 1), 32)
     workers = max(1, workers)
 
+    # 一括ダウンロードは並列数ぶんの一時ファイルを同時に持つため、ディスクの空きを
+    # 超えると全ワーカーが ENOSPC (No space left on device) で連鎖的に失敗する。
+    # 空き容量から同時に置ける本数を見積もり、並列をそこまでに制限する
+    dl_sizes = [j["size"] for j in jobs if j.get("download") and j.get("size")]
+    if dl_sizes:
+        try:
+            tmp_target = cache_dir if cache_dir else tempfile.gettempdir()
+            free = shutil.disk_usage(tmp_target).free
+            per_file = max(dl_sizes) + (256 << 20)  # 展開・書き出し用の余裕
+            disk_cap = max(1, int(free * 0.9) // per_file)
+            if disk_cap < workers:
+                print(f"[info] 一時ディスクの空き ({size_str(free)}) に合わせて並列を "
+                      f"{workers} → {disk_cap} に制限します (最大ファイル "
+                      f"{size_str(max(dl_sizes))}/本)。VM のブートディスクを増やすと"
+                      f"並列を維持できます (gcp.env の BOOT_DISK_GB)")
+                workers = disk_cap
+        except OSError:
+            pass
+
     n_dl = sum(1 for j in jobs if j.get("download"))
     print(f"[info] {len(jobs)} ファイルを読み込み (並列 {workers}, "
           f"一括ダウンロード {n_dl} 件 / 部分読み込み {len(jobs) - n_dl} 件)")
@@ -957,6 +976,7 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
     all_topics = topic_config is None
     per_topic = {} if all_topics else {t: [] for t in topic_config}
     decode_errors = defaultdict(int)
+    n_read_fail = 0
 
     n_done = [0]
 
@@ -988,6 +1008,7 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
                     try:
                         merge(fut.result())
                     except Exception as e:
+                        n_read_fail += 1
                         print(f"[warn] 読み込み失敗 ({futures[fut]['name']}): {e}")
         except (OSError, RuntimeError) as e:  # プロセス起動に失敗したら直列で実行
             print(f"[warn] 並列実行に失敗したため直列で処理します: {e}")
@@ -995,10 +1016,16 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
                 try:
                     merge(_extract_worker(job))
                 except Exception as e2:
+                    n_read_fail += 1
                     print(f"[warn] 読み込み失敗 ({job['name']}): {e2}")
 
     for err, n in decode_errors.items():
         print(f"[warn] デコード失敗 {n} 件: {err}")
+    if n_read_fail:
+        print(f"[warn] ******************************************************")
+        print(f"[warn] {n_read_fail} / {len(jobs)} ファイルを読み込めませんでした。")
+        print(f"[warn] CSV は読めたファイルだけで生成されるため、不完全な可能性があります。")
+        print(f"[warn] ******************************************************")
     return per_topic
 
 
@@ -1737,7 +1764,7 @@ def main():
     parser.add_argument("--subdir", default=DEFAULT_SUBDIR,
                         help=f"recording セッション内の対象サブディレクトリ"
                              f" (default: {DEFAULT_SUBDIR}, \"*\" で全て)")
-    parser.add_argument("--workers", type=int, default=16,
+    parser.add_argument("--workers", type=int, default=32,
                         help="時刻メタデータ読み込みの並列数 (default: 16)")
     parser.add_argument("--extract-workers", type=int, default=None, metavar="N",
                         help="抽出 (ダウンロード + デコード) のファイル並列数"

@@ -217,7 +217,7 @@ ss.setdefault("w_subdir", core.DEFAULT_SUBDIR)
 ss.setdefault("w_imgsub", "record_debug_image")
 ss.setdefault("w_sensub", "record_sensor")
 ss.setdefault("w_lookback", 24)
-ss.setdefault("w_metaw", 16)
+ss.setdefault("w_metaw", 32)
 ss.setdefault("w_extw", 0)
 ss.setdefault("cache_enable", True)
 ss.setdefault("cache_dir", os.path.abspath(core.DEFAULT_CACHE_DIR))
@@ -343,7 +343,7 @@ def gather_settings():
             "image_subdir": g("w_imgsub", "record_debug_image"),
             "sensor_subdir": g("w_sensub", "record_sensor"),
             "lookback": int(g("w_lookback", 24)),
-            "meta_workers": int(g("w_metaw", 16)),
+            "meta_workers": int(g("w_metaw", 32)),
             "extract_workers": int(g("w_extw", 0)),
         },
         "cache": {
