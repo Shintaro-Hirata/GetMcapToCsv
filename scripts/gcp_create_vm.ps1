@@ -107,8 +107,12 @@ if (-not $Yes) {
 
 if ($private) {
   $fwRule = Cfg 'FW_RULE' "allow-iap-ssh-$iapTag"
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
   & gcloud compute firewall-rules describe $fwRule --project=$project 2>$null | Out-Null
-  if ($LASTEXITCODE -ne 0) {
+  $fwMissing = ($LASTEXITCODE -ne 0)
+  $ErrorActionPreference = $prevEap
+  if ($fwMissing) {
     Write-Host "[info] Creating IAP SSH firewall rule: $fwRule"
     & gcloud compute firewall-rules create $fwRule --project=$project `
       --direction=INGRESS --action=ALLOW --rules=tcp:22 `
@@ -121,8 +125,15 @@ if ($private) {
 
 # Fail early with guidance if the VM already exists (a raw 'already exists'
 # error confused users when recreating after a MACHINE_TYPE change).
+# NOTE: under $ErrorActionPreference='Stop', a native command writing to
+# stderr (gcloud's "not found") kills the script even though a missing VM is
+# the normal case here - relax it around the probe and test $LASTEXITCODE.
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 & gcloud compute instances describe $vm --project=$project --zone=$zone --format='value(name)' 2>$null | Out-Null
-if ($LASTEXITCODE -eq 0) {
+$vmExists = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = $prevEap
+if ($vmExists) {
   Write-Host "[error] VM '$vm' already exists in $project/$zone. Two options:"
   Write-Host '  a) Change its machine type WITHOUT recreating (keeps setup; recommended):'
   Write-Host "     gcloud compute instances stop $vm --zone $zone --project $project"
