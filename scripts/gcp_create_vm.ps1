@@ -52,10 +52,15 @@ Default project     :  gcloud config get-value project
 "@
 }
 
-# 8 vCPU: python decode (apex_json etc.) is CPU-bound and parallelism = vCPU-1,
-# so wall time roughly halves vs 4 vCPU while per-run cost stays about the same.
-$machineType = Cfg 'MACHINE_TYPE' 'e2-standard-8'
-$bootDiskGb  = Cfg 'BOOT_DISK_GB' '30'   # OS + temp is plenty; keeps stopped-disk cost low (30GB ~= 450 JPY/mo)
+# Decode is CPU-bound and file-parallel up to vCPU-1 (tool cap 32), so a big
+# machine cuts wall time almost linearly at a similar per-run cost. Override in
+# gcp.env (e.g. MACHINE_TYPE=e2-standard-8) to downsize for light workloads.
+$machineType = Cfg 'MACHINE_TYPE' 'e2-highcpu-32'
+# Parallel downloads hold one temp file per worker (record_sensor is 2-3GB each),
+# so 200GB keeps ~31 workers fed. The disk bills only while the VM exists, so
+# model B (create-and-delete) pays only pennies per run. Downsize for model A
+# (kept VM) if the standing disk cost matters (200GB ~= 3000 JPY/mo while kept).
+$bootDiskGb  = Cfg 'BOOT_DISK_GB' '200'
 $imageFamily = Cfg 'IMAGE_FAMILY' 'debian-12'
 $imageProj   = Cfg 'IMAGE_PROJECT' 'debian-cloud'
 $private     = (Cfg 'PRIVATE' '0') -eq '1'
@@ -102,8 +107,12 @@ if (-not $Yes) {
 
 if ($private) {
   $fwRule = Cfg 'FW_RULE' "allow-iap-ssh-$iapTag"
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
   & gcloud compute firewall-rules describe $fwRule --project=$project 2>$null | Out-Null
-  if ($LASTEXITCODE -ne 0) {
+  $fwMissing = ($LASTEXITCODE -ne 0)
+  $ErrorActionPreference = $prevEap
+  if ($fwMissing) {
     Write-Host "[info] Creating IAP SSH firewall rule: $fwRule"
     & gcloud compute firewall-rules create $fwRule --project=$project `
       --direction=INGRESS --action=ALLOW --rules=tcp:22 `
@@ -112,6 +121,27 @@ if ($private) {
       Write-Warning 'Firewall create failed (permission/org policy). Ask an admin to allow tcp:22 from 35.235.240.0/20.'
     }
   }
+}
+
+# Fail early with guidance if the VM already exists (a raw 'already exists'
+# error confused users when recreating after a MACHINE_TYPE change).
+# NOTE: under $ErrorActionPreference='Stop', a native command writing to
+# stderr (gcloud's "not found") kills the script even though a missing VM is
+# the normal case here - relax it around the probe and test $LASTEXITCODE.
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+& gcloud compute instances describe $vm --project=$project --zone=$zone --format='value(name)' 2>$null | Out-Null
+$vmExists = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = $prevEap
+if ($vmExists) {
+  Write-Host "[error] VM '$vm' already exists in $project/$zone. Two options:"
+  Write-Host '  a) Change its machine type WITHOUT recreating (keeps setup; recommended):'
+  Write-Host "     gcloud compute instances stop $vm --zone $zone --project $project"
+  Write-Host "     gcloud compute instances set-machine-type $vm --machine-type $machineType --zone $zone --project $project"
+  Write-Host "     gcloud compute instances start $vm --zone $zone --project $project"
+  Write-Host '  b) Delete it first, then run this script again:'
+  Write-Host "     gcloud compute instances delete $vm --zone $zone --project $project --quiet"
+  exit 1
 }
 
 $createArgs = @('compute', 'instances', 'create', $vm,

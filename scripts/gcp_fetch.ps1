@@ -27,6 +27,8 @@ param(
   [switch]$NoMerged,     # do not write the merged _all.csv
   [string]$MergedGrid,   # resample the merged CSV onto a fixed grid (seconds, e.g. 0.1)
   [string]$MergedHold,   # max seconds to hold the last value on the grid (0 = unlimited)
+  [string]$SplitMinutes, # split output files every N minutes (e.g. 30)
+  [switch]$SkipPush,     # skip pushing the tool and mcap-ros2idl-support (already on the VM from a previous run; batch rows 2+ use this)
   [string]$LocalOut,     # local folder to receive the CSVs (overrides LOCAL_OUT in gcp.env)
   [switch]$SetupAuth,    # copy local ADC to the VM so it reads GCS as you (first time)
   [switch]$StartStop,    # start before run, stop after (even on error) to minimize cost
@@ -153,14 +155,18 @@ try {
 # connection ("Connection refused"), so we poll until SSH works.
 Wait-VmReady
 
-Write-Host "[info] Pushing tool to VM ($vm / $zone)..."
-Invoke-RemoteSsh "mkdir -p $remoteDir/scripts"
-foreach ($f in @('get_mcap_to_csv.py', 'requirements.txt', 'topics.example.t2.json', 'topics.example.apollo.json')) {
-  Invoke-Scp (Join-Path $repoDir $f) "${vm}:$remoteDir/$f"
+if ($SkipPush) {
+  Write-Host '[info] Skipping tool push (already on the VM from a previous run).'
+} else {
+  Write-Host "[info] Pushing tool to VM ($vm / $zone)..."
+  Invoke-RemoteSsh "mkdir -p $remoteDir/scripts"
+  foreach ($f in @('get_mcap_to_csv.py', 'requirements.txt', 'topics.example.t2.json', 'topics.example.apollo.json')) {
+    Invoke-Scp (Join-Path $repoDir $f) "${vm}:$remoteDir/$f"
+  }
+  Invoke-Scp (Join-Path $repoDir 'scripts\run_on_gcp.sh') "${vm}:$remoteDir/scripts/run_on_gcp.sh"
+  # strip CRLF added by Windows Git checkout (bash fails on pipefail\r etc.)
+  Invoke-RemoteSsh "sed -i 's/\r//' $remoteDir/scripts/run_on_gcp.sh"
 }
-Invoke-Scp (Join-Path $repoDir 'scripts\run_on_gcp.sh') "${vm}:$remoteDir/scripts/run_on_gcp.sh"
-# strip CRLF added by Windows Git checkout (bash fails on pipefail\r etc.)
-Invoke-RemoteSsh "sed -i 's/\r//' $remoteDir/scripts/run_on_gcp.sh"
 
 # transfer a user-specified topics file and reference it by basename on the VM
 $remoteTopics = $null
@@ -184,7 +190,10 @@ if ($GcsFiles) {
 $envExport = ''
 if ($venvDir) { $envExport += "VENV_DIR=$(Q $venvDir) " }
 if ($ros2idl) {
-  if (Test-Path $ros2idl) {
+  if ($SkipPush) {
+    Write-Host '[info] Skipping mcap-ros2idl-support push (already on the VM).'
+    $envExport += "ROS2IDL_PATH=$(Q 'mcap-ros2idl-support') "
+  } elseif (Test-Path $ros2idl) {
     $ros2idlFull = (Resolve-Path $ros2idl).Path
     Write-Host "[info] Sending mcap-ros2idl-support to VM from: $ros2idlFull"
     # client-side check: is THIS local folder apex_json-capable? (points out a wrong/old path)
@@ -240,6 +249,7 @@ if ($IncludeImage)  { $ra += '--include-image' }
 if ($NoMerged)      { $ra += '--no-merged' }
 if ($MergedGrid)    { $ra += @('--merged-grid', $MergedGrid) }
 if ($MergedHold)    { $ra += @('--merged-hold', $MergedHold) }
+if ($SplitMinutes)  { $ra += @('--split-minutes', $SplitMinutes) }
 if ($ExtraArgs)     { $ra += $ExtraArgs }
 if ($ra.Count -eq 0) { throw 'No extraction args. Pass -Vehicle/-Start/-End/-Topics etc.' }
 

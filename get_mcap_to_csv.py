@@ -737,6 +737,8 @@ def load_topic_config(path):
         config[topic] = {"suffix": suffix, "fields": list(entry.get("fields", []))}
         if entry.get("columns"):  # フラット展開時に残す列 (フル列名)
             config[topic]["columns"] = list(entry["columns"])
+        if entry.get("rename"):  # CSV 出力時の列名変更 {元の列名: 出力名}
+            config[topic]["rename"] = dict(entry["rename"])
     return config
 
 
@@ -942,8 +944,30 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
     jobs = build_extract_jobs(sources, topic_config, exclude_pats,
                               start_ns, end_ns, no_download, cache_dir)
     if workers is None:
-        workers = min(len(jobs), max(1, (os.cpu_count() or 4) - 1), 8)
+        # vCPU-1 まで自動で並列化する (上限 32)。デコードは CPU バウンドかつ
+        # ファイル単位の並列なので、vCPU の多いマシン (VM の MACHINE_TYPE を
+        # e2-highcpu-32 等にした場合) ではほぼ台数分だけ速くなる
+        workers = min(len(jobs), max(1, (os.cpu_count() or 4) - 1), 32)
     workers = max(1, workers)
+
+    # 一括ダウンロードは並列数ぶんの一時ファイルを同時に持つため、ディスクの空きを
+    # 超えると全ワーカーが ENOSPC (No space left on device) で連鎖的に失敗する。
+    # 空き容量から同時に置ける本数を見積もり、並列をそこまでに制限する
+    dl_sizes = [j["size"] for j in jobs if j.get("download") and j.get("size")]
+    if dl_sizes:
+        try:
+            tmp_target = cache_dir if cache_dir else tempfile.gettempdir()
+            free = shutil.disk_usage(tmp_target).free
+            per_file = max(dl_sizes) + (256 << 20)  # 展開・書き出し用の余裕
+            disk_cap = max(1, int(free * 0.9) // per_file)
+            if disk_cap < workers:
+                print(f"[info] 一時ディスクの空き ({size_str(free)}) に合わせて並列を "
+                      f"{workers} → {disk_cap} に制限します (最大ファイル "
+                      f"{size_str(max(dl_sizes))}/本)。VM のブートディスクを増やすと"
+                      f"並列を維持できます (gcp.env の BOOT_DISK_GB)")
+                workers = disk_cap
+        except OSError:
+            pass
 
     n_dl = sum(1 for j in jobs if j.get("download"))
     print(f"[info] {len(jobs)} ファイルを読み込み (並列 {workers}, "
@@ -952,6 +976,7 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
     all_topics = topic_config is None
     per_topic = {} if all_topics else {t: [] for t in topic_config}
     decode_errors = defaultdict(int)
+    n_read_fail = 0
 
     n_done = [0]
 
@@ -983,6 +1008,7 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
                     try:
                         merge(fut.result())
                     except Exception as e:
+                        n_read_fail += 1
                         print(f"[warn] 読み込み失敗 ({futures[fut]['name']}): {e}")
         except (OSError, RuntimeError) as e:  # プロセス起動に失敗したら直列で実行
             print(f"[warn] 並列実行に失敗したため直列で処理します: {e}")
@@ -990,10 +1016,16 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
                 try:
                     merge(_extract_worker(job))
                 except Exception as e2:
+                    n_read_fail += 1
                     print(f"[warn] 読み込み失敗 ({job['name']}): {e2}")
 
     for err, n in decode_errors.items():
         print(f"[warn] デコード失敗 {n} 件: {err}")
+    if n_read_fail:
+        print(f"[warn] ******************************************************")
+        print(f"[warn] {n_read_fail} / {len(jobs)} ファイルを読み込めませんでした。")
+        print(f"[warn] CSV は読めたファイルだけで生成されるため、不完全な可能性があります。")
+        print(f"[warn] ******************************************************")
     return per_topic
 
 
@@ -1007,6 +1039,49 @@ def topic_columns(fields, rows):
             if k != "t_ns":
                 cols[k] = True
     return list(cols.keys())
+
+
+def window_base(prefix, ws_ns, we_ns):
+    """分割出力 1 区間分の出力ファイル名ベースを作る (日をまたぐ区間は終了側にも日付)。"""
+    ws = datetime.datetime.fromtimestamp(ws_ns / 1e9, JST)
+    we = datetime.datetime.fromtimestamp(we_ns / 1e9, JST)
+    end_fmt = "%Y%m%d_%H%M%S" if we.date() != ws.date() else "%H%M%S"
+    return f"{prefix}_{ws:%Y%m%d_%H%M%S}-{we.strftime(end_fmt)}"
+
+
+def write_csvs_split(per_topic, topic_config, outdir, base_prefix, start_ns, end_ns,
+                     split_minutes, merged=True, merged_grid=None, merged_hold=5.0):
+    """指定期間を split_minutes 分ごとの区間に刻み、区間ごとに CSV 一式を書き出す。
+
+    長時間の抽出 (特に結合 CSV) は 1 ファイルが巨大になるため、抽出済みデータを
+    書き出しの段階で分割する (mcap の読み込みは 1 回のまま)。区間ごとに出力ファイル名の
+    時間帯が変わり、t_sec も各区間の先頭からの経過秒になる (各ファイルが自己完結)。
+    start_ns / end_ns が None の場合はデータの実時刻範囲を使う。
+    戻り値: 書き出した全ファイルパスのリスト。
+    """
+    all_t = [r["t_ns"] for rows in per_topic.values() for r in rows]
+    if not all_t:
+        print("[warn] 対象トピックのメッセージが 1 件も見つかりませんでした。")
+        return []
+    s_ns = start_ns if start_ns is not None else min(all_t)
+    e_ns = end_ns if end_ns is not None else max(all_t) + 1
+    step_ns = max(int(split_minutes * 60 * 1e9), 1)
+    written = []
+    n_win = 0
+    ws = s_ns
+    while ws < e_ns:
+        we = min(ws + step_ns, e_ns)
+        sub = {t: [r for r in rows if ws <= r["t_ns"] < we]
+               for t, rows in per_topic.items()}
+        if any(sub.values()):
+            n_win += 1
+            written += write_csvs(sub, topic_config, outdir,
+                                  window_base(base_prefix, ws, we), merged=merged,
+                                  merged_grid=merged_grid, merged_hold=merged_hold)
+        ws = we
+    print(f"[info] 分割出力: {split_minutes:g} 分 × {n_win} 区間 "
+          f"(データの無い区間はスキップ)")
+    return written
 
 
 def _grid_label(grid_sec):
@@ -1046,10 +1121,18 @@ def write_merged_grid_csv(per_topic, topic_config, outdir, base, grid_sec, hold_
             continue
         rows_by_topic[topic] = rows
         suffix = topic_config[topic]["suffix"]
+        rename = topic_config[topic].get("rename") or {}
         for c in topic_columns(topic_config[topic]["fields"], rows):
-            col_defs.append((topic, c, f"{suffix}.{c}"))
+            # 出力名の指定があればそのまま使う (客先向け表示名など)。無ければ
+            # 「suffix.列名」でトピック間の同名列の衝突を避ける
+            col_defs.append((topic, c, rename.get(c) or f"{suffix}.{c}"))
     if not col_defs:
         return []
+    dup = {h for h in (x[2] for x in col_defs)
+           if sum(1 for x in col_defs if x[2] == h) > 1}
+    if dup:
+        print(f"[warn] 結合 CSV の列名が重複しています (rename の指定を見直してください): "
+              + ", ".join(sorted(dup)))
 
     os.makedirs(outdir, exist_ok=True)
     out = os.path.join(outdir, f"{base}_all_{_grid_label(grid_sec)}.csv")
@@ -1125,10 +1208,11 @@ def write_csvs(per_topic, topic_config, outdir, base, merged=True,
         cols = topic_columns(fields_of(topic), rows)
         for c in cols:
             merged_cols[c] = True
+        rename = {} if all_topics else (topic_config[topic].get("rename") or {})
         out = os.path.join(outdir, f"{base}_{suffix_of(topic)}.csv")
         with open(out, "w", newline="", encoding="utf-8-sig") as g:
             w = csv.writer(g)
-            w.writerow(["time_jst", "t_sec", "t_ns"] + cols)
+            w.writerow(["time_jst", "t_sec", "t_ns"] + [rename.get(c, c) for c in cols])
             for r in rows:
                 w.writerow(time_cols(r["t_ns"]) + [r.get(c, "") for c in cols])
         print(f"[ok] wrote {out}  ({len(rows)} rows)")
@@ -1680,7 +1764,7 @@ def main():
     parser.add_argument("--subdir", default=DEFAULT_SUBDIR,
                         help=f"recording セッション内の対象サブディレクトリ"
                              f" (default: {DEFAULT_SUBDIR}, \"*\" で全て)")
-    parser.add_argument("--workers", type=int, default=16,
+    parser.add_argument("--workers", type=int, default=32,
                         help="時刻メタデータ読み込みの並列数 (default: 16)")
     parser.add_argument("--extract-workers", type=int, default=None, metavar="N",
                         help="抽出 (ダウンロード + デコード) のファイル並列数"
@@ -1703,6 +1787,10 @@ def main():
     parser.add_argument("--merged-hold", type=float, default=5.0, metavar="SEC",
                         help="--merged-grid で前値を保持する最大秒数。"
                              "これを超えて更新が無い区間は空欄になる (0=無制限, 既定 5)")
+    parser.add_argument("--split-minutes", type=float, default=None, metavar="MIN",
+                        help="指定した分数ごとに出力ファイルを区切る (例: 30)。"
+                             "長時間の抽出でも 1 ファイルが巨大にならない。"
+                             "mcap の読み込みは 1 回で、書き出しだけを分割する")
     parser.add_argument("--cache-dir", default=DEFAULT_CACHE_DIR, metavar="DIR",
                         help="一括ダウンロードのローカルキャッシュ先。同じファイルの"
                              f"再ダウンロード (= 再課金) を防ぐ (default: {DEFAULT_CACHE_DIR})")
@@ -1834,8 +1922,17 @@ def main():
                              workers=args.extract_workers,
                              no_download=args.no_download,
                              cache_dir=cache_dir)
-    write_csvs(per_topic, topic_config, args.outdir, base, merged=not args.no_merged,
-               merged_grid=args.merged_grid, merged_hold=args.merged_hold)
+    if args.split_minutes:
+        # 分割時のファイル名は「<プレフィクス>_<区間開始>-<区間終了>」。GCS モードは
+        # 車両IDを、ローカルモードは元ファイル名 (base) をプレフィクスに使う
+        prefix = vehicle if args.local is None else base
+        write_csvs_split(per_topic, topic_config, args.outdir, prefix,
+                         start_ns, end_ns, args.split_minutes,
+                         merged=not args.no_merged,
+                         merged_grid=args.merged_grid, merged_hold=args.merged_hold)
+    else:
+        write_csvs(per_topic, topic_config, args.outdir, base, merged=not args.no_merged,
+                   merged_grid=args.merged_grid, merged_hold=args.merged_hold)
     if cache_dir:
         prune_cache(cache_dir, args.cache_max_gb)
     print_transfer_summary()

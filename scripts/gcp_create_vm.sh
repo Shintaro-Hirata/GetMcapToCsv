@@ -35,8 +35,13 @@ fi
 # 既定値 (必要なら gcp.env で上書き可能)
 # 8 vCPU: apex_json など Python デコードは CPU 律速で、並列数 (vCPU-1) が実行時間に直結。
 # 時間単価は 4vCPU の約2倍だが実行時間が約半分になるため、1回あたりの料金はほぼ同じ。
-MACHINE_TYPE="${MACHINE_TYPE:-e2-standard-8}"
-BOOT_DISK_GB="${BOOT_DISK_GB:-30}"                # OS + 一時ファイルに十分。停止中ディスク代を抑える (30GB≒月¥450)
+# デコードは CPU バウンドで vCPU-1 まで並列化 (上限 32) されるため大きめが既定。
+# 軽い用途は gcp.env で MACHINE_TYPE=e2-standard-8 等に下げてよい
+MACHINE_TYPE="${MACHINE_TYPE:-e2-highcpu-32}"
+# 並列ダウンロードはワーカー数ぶんの一時ファイル (sensor は 1 本 2〜3GB) を同時に持つ
+# ため 200GB を既定にする。ディスク代は VM が存在する間だけ (モデル B なら実質数円/回。
+# VM を残すモデル A で維持費が気になる場合は BOOT_DISK_GB を小さく)
+BOOT_DISK_GB="${BOOT_DISK_GB:-200}"
 IMAGE_FAMILY="${IMAGE_FAMILY:-debian-12}"
 IMAGE_PROJECT="${IMAGE_PROJECT:-debian-cloud}"
 # PRIVATE=0 (既定): 外部IP付きの標準的な VM (SSH は IAM/鍵で保護)。手順が単純で詰まりにくい。
@@ -96,6 +101,18 @@ if [ "$PRIVATE" = "1" ]; then
       --target-tags="$IAP_TAG" \
       || echo "[warn] ファイアウォール作成に失敗 (権限/組織ポリシー)。管理者に tcp:22 from 35.235.240.0/20 の許可を依頼してください。"
   fi
+fi
+
+# 既存 VM がある状態での作成は "already exists" の生エラーになるため、先に案内を出す
+if gcloud compute instances describe "$GCP_VM" --project "$GCP_PROJECT" --zone "$GCP_ZONE" >/dev/null 2>&1; then
+  echo "[error] VM '$GCP_VM' は既に存在します ($GCP_PROJECT/$GCP_ZONE)。対処は 2 つ:"
+  echo "  a) 作り直さずマシンタイプだけ変更 (セットアップが残るのでおすすめ):"
+  echo "     gcloud compute instances stop $GCP_VM --zone $GCP_ZONE --project $GCP_PROJECT"
+  echo "     gcloud compute instances set-machine-type $GCP_VM --machine-type $MACHINE_TYPE --zone $GCP_ZONE --project $GCP_PROJECT"
+  echo "     gcloud compute instances start $GCP_VM --zone $GCP_ZONE --project $GCP_PROJECT"
+  echo "  b) 先に削除してからこのスクリプトを再実行:"
+  echo "     gcloud compute instances delete $GCP_VM --zone $GCP_ZONE --project $GCP_PROJECT --quiet"
+  exit 1
 fi
 
 gcloud compute instances create "$GCP_VM" \
