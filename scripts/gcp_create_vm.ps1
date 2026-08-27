@@ -52,10 +52,15 @@ Default project     :  gcloud config get-value project
 "@
 }
 
-# 8 vCPU: python decode (apex_json etc.) is CPU-bound and parallelism = vCPU-1,
-# so wall time roughly halves vs 4 vCPU while per-run cost stays about the same.
-$machineType = Cfg 'MACHINE_TYPE' 'e2-standard-8'
-$bootDiskGb  = Cfg 'BOOT_DISK_GB' '30'   # OS + temp is plenty; keeps stopped-disk cost low (30GB ~= 450 JPY/mo)
+# Decode is CPU-bound and file-parallel up to vCPU-1 (tool cap 32), so a big
+# machine cuts wall time almost linearly at a similar per-run cost. Override in
+# gcp.env (e.g. MACHINE_TYPE=e2-standard-8) to downsize for light workloads.
+$machineType = Cfg 'MACHINE_TYPE' 'e2-highcpu-32'
+# Parallel downloads hold one temp file per worker (record_sensor is 2-3GB each),
+# so 200GB keeps ~31 workers fed. The disk bills only while the VM exists, so
+# model B (create-and-delete) pays only pennies per run. Downsize for model A
+# (kept VM) if the standing disk cost matters (200GB ~= 3000 JPY/mo while kept).
+$bootDiskGb  = Cfg 'BOOT_DISK_GB' '200'
 $imageFamily = Cfg 'IMAGE_FAMILY' 'debian-12'
 $imageProj   = Cfg 'IMAGE_PROJECT' 'debian-cloud'
 $private     = (Cfg 'PRIVATE' '0') -eq '1'
