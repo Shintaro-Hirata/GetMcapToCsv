@@ -810,15 +810,28 @@ def _collect_rows(reader, topic_config, exclude_pats, start_ns, end_ns):
     return per_topic, dict(decode_errors), count
 
 
-def _stream_saving_fraction(blob, topics, start_ns, end_ns, stats):
-    """サマリだけ読み、チャンクスキップでどれだけ転送を減らせるか (0.0-1.0) を返す。"""
+def _summary_probe(blob, topics, start_ns, end_ns, stats):
+    """サマリだけ読み、(時間帯内に選択トピックのメッセージがあるか, チャンクスキップ削減率) を返す。
+
+    1 つ目は False のときだけ確定的 (= ダウンロードもデコードも不要と分かる)。
+    develop/sensor の両方にトピック名だけ登録され実体が片側に無いデータでは、
+    これで GB 級のファイル読み込みを丸ごと省ける。判定不能なら None。
+    2 つ目はストリーミング読みが読むチャンク本体の比率から計算する (不明なら None)。
+    """
     try:
         with CountingFile(blob.open("rb", chunk_size=256 * 1024), stats) as f:
             summary = make_reader(f).get_summary()
         if summary is None or not summary.chunk_indexes:
-            return None
+            return None, None
+        # メッセージインデックスの無い書き方のファイルでは
+        # 「どのチャンクに何が入っているか」を判定できない
+        if not any(ci.message_index_offsets for ci in summary.chunk_indexes):
+            return None, None
         sel_ids = {cid for cid, ch in summary.channels.items() if ch.topic in topics}
+        if not sel_ids:
+            return False, None  # 選択トピックのチャンネル自体が無い
         total = needed = 0
+        has_selected = False
         for ci in summary.chunk_indexes:
             if start_ns is not None and ci.message_end_time < start_ns:
                 continue
@@ -826,12 +839,13 @@ def _stream_saving_fraction(blob, topics, start_ns, end_ns, stats):
                 continue
             total += ci.chunk_length + ci.message_index_length
             if any(cid in ci.message_index_offsets for cid in sel_ids):
+                has_selected = True
                 needed += ci.chunk_length  # ストリーミングが読むのはチャンク本体のみ
         if total <= 0:
-            return None
-        return 1.0 - needed / total
+            return has_selected, None
+        return has_selected, 1.0 - needed / total
     except Exception:
-        return None
+        return None, None
 
 
 # 一括ダウンロードをやめて部分読み込みに切り替える削減率のしきい値
@@ -847,6 +861,7 @@ def _extract_worker(job):
     factories = build_decoder_factories(quiet=True)
     stats = TransferStats()  # ワーカープロセス内のローカル計測 (戻り値で親へ返す)
     tmpdir = None
+    dl_secs = 0.0
     cache_dir = job.get("cache_dir")
     try:
         if job["kind"] == "gcs":
@@ -859,18 +874,28 @@ def _extract_worker(job):
                 from google.cloud import storage  # storage.Client
                 blob = storage.Client().bucket(job["bucket"]).blob(job["blob_name"])
                 download = job["download"]
-                if download and job.get("topic_config") is not None:
-                    # トピックが絞られているときはサマリで必要チャンク比を見て、
-                    # 大幅に減るなら丸ごとダウンロードをやめて部分読み込みにする
-                    saving = _stream_saving_fraction(
+                if job.get("topic_config") is not None:
+                    # サマリだけ先に読み、この時間帯に選択トピックのメッセージが
+                    # 1 件も無いファイルはダウンロードもデコードもせずスキップする
+                    # (実体が develop/sensor の片側にしか無いトピックで GB 級を節約)。
+                    # メッセージがある場合も、チャンクスキップで大幅に減るなら
+                    # 丸ごとダウンロードをやめて部分読み込みにする
+                    has_sel, saving = _summary_probe(
                         blob, set(job["topic_config"].keys()),
                         job["start_ns"], job["end_ns"], stats)
-                    if saving is not None and saving >= _AUTO_STREAM_SAVING:
+                    if has_sel is False:
+                        print(f"[info] {job['name'].rsplit('/', 1)[-1]}: "
+                              f"選択トピックのメッセージ 0 件 → スキップ (ダウンロードなし)")
+                        return (job["name"], {t: [] for t in job["topic_config"]},
+                                {}, 0, time.monotonic() - t0,
+                                stats.gcs_bytes, stats.cache_bytes, 0.0)
+                    if download and saving is not None and saving >= _AUTO_STREAM_SAVING:
                         download = False
                         print(f"[info] {job['name'].rsplit('/', 1)[-1]}: "
                               f"選択トピックに不要なチャンクが {saving * 100:.0f}% → 部分読み込みに切替")
                 if download:
                     # 時間帯がファイルの大半を占めるなら一括ダウンロードの方が速い
+                    t_dl = time.monotonic()
                     if cache_dir:
                         local = cache_store_download(blob, cache_dir, stats)
                     else:
@@ -878,6 +903,7 @@ def _extract_worker(job):
                         local = os.path.join(tmpdir, "part.mcap")
                         blob.download_to_filename(local)
                         stats.add_gcs(os.path.getsize(local))
+                    dl_secs = time.monotonic() - t_dl
                     f = open(local, "rb")
                 else:
                     f = CountingFile(blob.open("rb", chunk_size=16 * 1024 * 1024), stats)
@@ -889,7 +915,7 @@ def _extract_worker(job):
                 reader, job["topic_config"], job["exclude"],
                 job["start_ns"], job["end_ns"])
         return (job["name"], per_topic, errors, count, time.monotonic() - t0,
-                stats.gcs_bytes, stats.cache_bytes)
+                stats.gcs_bytes, stats.cache_bytes, dl_secs)
     finally:
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -981,7 +1007,7 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
     n_done = [0]
 
     def merge(result):
-        name, part, errors, count, sec, gcs_b, cache_b = result
+        name, part, errors, count, sec, gcs_b, cache_b, dl_sec = result
         STATS.add_gcs(gcs_b)
         STATS.add_cache(cache_b)
         for topic, rows in part.items():
@@ -989,7 +1015,10 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
         for err, n in errors.items():
             decode_errors[err] += n
         src_note = " [キャッシュ]" if cache_b and not gcs_b else ""
-        print(f"[info]   {name.rsplit('/', 1)[-1]}: {count} 行 ({sec:.1f} 秒){src_note}")
+        # DL と解析の内訳を出す (どちらがボトルネックかをログから判断できるように)
+        timing = (f"DL {dl_sec:.1f} 秒 + 解析 {sec - dl_sec:.1f} 秒"
+                  if dl_sec > 0 else f"{sec:.1f} 秒")
+        print(f"[info]   {name.rsplit('/', 1)[-1]}: {count} 行 ({timing}){src_note}")
         n_done[0] += 1
         if progress:
             progress(n_done[0], len(jobs), name)
