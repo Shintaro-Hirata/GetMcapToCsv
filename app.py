@@ -488,7 +488,10 @@ def apply_settings(data):
         ss.pending_file_selection = {str(k): bool(v)
                                      for k, v in data["file_selection"].items()}
     if isinstance(data.get("topics"), list):
-        ss.pending_topic_selection = [str(t) for t in data["topics"]]
+        ss.loaded_topic_selection = [str(t) for t in data["topics"]]
+        # プリセット/全選択が残っていると読み込んだ選択より優先されてしまうので戻す
+        ss["w_topic_preset"] = "(手動選択)"
+        ss["w_topic_all"] = False
         ss.topics_id += 1  # 取得済みのトピック表があれば作り直して選択を反映
 
 
@@ -870,26 +873,31 @@ if ss.sources:
 
     if ss.topics_info:
         all_topic_names = list(ss.topics_info.keys())
+        preset_options = ["(手動選択)"] + list(presets.keys())
+        if ss.get("w_topic_preset") not in preset_options:
+            ss["w_topic_preset"] = "(手動選択)"
         with tcol2:
             preset_name = st.selectbox(
                 "プリセット (選ぶと下の表の選択に反映)",
-                ["(手動選択)"] + list(presets.keys()))
+                preset_options, key="w_topic_preset")
         with tcol3:
             st.write("")
-            use_all = st.checkbox("全トピック選択", value=False)
+            use_all = st.checkbox("全トピック選択", value=False, key="w_topic_all")
 
-        # 設定ファイルから読み込んだトピック選択が最優先 (一度反映したら通常動作に戻る)
-        pending_topics = ss.pop("pending_topic_selection", None)
-        if pending_topics is not None:
-            pend_set = set(pending_topics)
-            default_set = {t for t in all_topic_names if t in pend_set}
-            missing_saved = sorted(pend_set - default_set)
+        # 表の「選択」の初期値。手動選択のときは保持している選択 (設定ファイルの
+        # 読み込み結果や前回までの手動選択) を毎回初期値にする。表の初期値は
+        # 再描画のたびに作り直されるため、一度きりの適用では次の再描画で消えてしまう。
+        loaded_topics = ss.get("loaded_topic_selection")
+        if use_all:
+            default_set = set(all_topic_names)
+        elif preset_name == "(手動選択)" and loaded_topics is not None:
+            loaded_set = set(loaded_topics)
+            default_set = {t for t in all_topic_names if t in loaded_set}
+            missing_saved = sorted(loaded_set - default_set)
             if missing_saved:
-                st.caption("⚠ 読み込んだ設定にあってデータに存在しないトピック: "
+                st.caption("⚠ 選択済みでデータに存在しないトピック: "
                            + ", ".join(missing_saved[:10])
                            + (" ..." if len(missing_saved) > 10 else ""))
-        elif use_all:
-            default_set = set(all_topic_names)
         elif preset_name != "(手動選択)":
             wanted = presets[preset_name]
             default_set = {t for t in all_topic_names
@@ -922,6 +930,9 @@ if ss.sources:
         )
         selected_topics = list(edited_topics[edited_topics["選択"]]["トピック"])
         ss.last_selected_topics = selected_topics  # 設定保存 (gather_settings) で参照する
+        if not use_all and preset_name == "(手動選択)":
+            # 手動選択の内容を保持し、次回の表の初期値にする (再取得しても選択が残る)
+            ss.loaded_topic_selection = list(selected_topics)
         st.caption(f"✅ 選択中: {len(selected_topics)} / {len(all_topic_names)} トピック")
         if selected_topics:
             with st.expander("選択中のトピックを確認"):
@@ -1438,8 +1449,11 @@ if ss.sources:
                 "①のチェックに従い、image は含めません）。"
                 "実行中はこの画面を操作しないでください。**PC がスリープしない設定**に"
                 "しておくこと（夜間実行時）。")
-            _batch_src = ss.batch_rows or [{"車両ID": st.session_state.get("w_vehicle", ""),
-                                            "開始日時": "", "終了日時": ""}]
+            # ①の検索条件をそのまま 1 行分にしたもの (初期行と「行を追加」で使う)
+            _seed_row = {"車両ID": (vehicle or "").strip().upper(),
+                         "開始日時": f"{start_dt:%Y-%m-%d %H:%M:%S}",
+                         "終了日時": f"{end_dt:%Y-%m-%d %H:%M:%S}"}
+            _batch_src = ss.batch_rows or [_seed_row]
             edited_batch = st.data_editor(
                 pd.DataFrame(_batch_src, columns=["車両ID", "開始日時", "終了日時"]),
                 num_rows="dynamic", hide_index=True, use_container_width=True,
@@ -1455,6 +1469,12 @@ if ss.sources:
                        for k in ("車両ID", "開始日時", "終了日時")}
                       for _, r in edited_batch.iterrows()]
             ss.batch_rows = [r for r in rows_b if any(r.values())]
+            if st.button("➕ ①の検索条件を行として追加", key="batch_add",
+                         help="①で入力中の車両ID・開始/終了日時を表の末尾に追加します。"
+                              "①を書き換えてこのボタンを押す、を繰り返すと楽に行を作れます。"):
+                ss.batch_rows = ss.batch_rows + [dict(_seed_row)]
+                ss.batch_ver += 1  # 表を作り直して追加行を反映
+                st.rerun()
             batch_jobs = []
             n_bad = 0
             for r in ss.batch_rows:
