@@ -451,15 +451,74 @@ class LocalMcapSource:
         return open(self.path, "rb")
 
 
+# サマリ時刻レンジのローカルキャッシュ。GCS 上の mcap は不変なので
+# (パス, サイズ) が同じなら再読み込みは不要。①検索のたびに数十ファイルの
+# フッタをインターネット越しに読む時間を、2 回目以降ほぼゼロにする。
+_TIME_CACHE_PATH = os.path.join(DEFAULT_CACHE_DIR, "time_ranges.json")
+_time_cache = None
+_time_cache_lock = threading.Lock()
+
+
+def _time_cache_key(source):
+    blob = getattr(source, "blob", None)
+    if blob is not None:
+        return f"gs://{blob.bucket.name}/{blob.name}|{source.size or 0}"
+    path = getattr(source, "path", None)
+    if path:
+        try:
+            st = os.stat(path)
+            return f"local|{os.path.abspath(path)}|{st.st_size}|{int(st.st_mtime)}"
+        except OSError:
+            return None
+    return None
+
+
+def _time_cache_get(key):
+    global _time_cache
+    with _time_cache_lock:
+        if _time_cache is None:
+            try:
+                with open(_TIME_CACHE_PATH, encoding="utf-8") as f:
+                    _time_cache = {k: tuple(v) for k, v in json.load(f).items()}
+            except Exception:
+                _time_cache = {}
+        return _time_cache.get(key)
+
+
+def _time_cache_put(key, rng):
+    with _time_cache_lock:
+        if _time_cache is None or key is None or rng is None:
+            return
+        _time_cache[key] = tuple(rng)
+        try:
+            os.makedirs(os.path.dirname(_TIME_CACHE_PATH) or ".", exist_ok=True)
+            tmp = _TIME_CACHE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({k: list(v) for k, v in _time_cache.items()}, f)
+            os.replace(tmp, _TIME_CACHE_PATH)
+        except OSError:
+            pass
+
+
 def read_time_range(source):
-    """mcap のサマリだけを読んでメッセージの (start_ns, end_ns) を返す。無ければ None。"""
+    """mcap のサマリだけを読んでメッセージの (start_ns, end_ns) を返す。無ければ None。
+
+    結果はローカルにキャッシュし、同じファイル (パス・サイズ一致) は再読み込みしない。
+    """
+    key = _time_cache_key(source)
+    if key is not None:
+        cached = _time_cache_get(key)
+        if cached is not None:
+            return cached
     try:
         with source.open(chunk_size=256 * 1024) as f:
             reader = make_reader(f)
             summary = reader.get_summary()
             stats = summary.statistics if summary else None
             if stats and stats.message_count > 0:
-                return stats.message_start_time, stats.message_end_time
+                rng = (stats.message_start_time, stats.message_end_time)
+                _time_cache_put(key, rng)
+                return rng
     except Exception as e:
         print(f"[warn] サマリ読み込み失敗 ({source.name}): {e}")
     return None
@@ -854,6 +913,92 @@ def _resolve_duplicate_recordings(kinds):
     return kept, dropped, (chosen_kind if dropped else None)
 
 
+def _probe_topic_coverage(client, job, topics, start_ns, end_ns):
+    """サマリだけを読み、時間帯内で各トピックのメッセージを含むチャンクの合計時間を返す。
+
+    戻り値: {topic: カバー時間(ns)}。サマリやメッセージインデックスが無く
+    判定できない場合は None (呼び出し側はそのファイルを通常どおり読む)。
+    """
+    try:
+        blob = client.bucket(job["bucket"]).blob(job["blob_name"])
+        with CountingFile(blob.open("rb", chunk_size=256 * 1024), STATS) as f:
+            summary = make_reader(f).get_summary()
+        if summary is None or not summary.chunk_indexes:
+            return None
+        if not any(ci.message_index_offsets for ci in summary.chunk_indexes):
+            return None
+        by_id = {cid: ch.topic for cid, ch in summary.channels.items()
+                 if ch.topic in topics}
+        cov = {t: 0 for t in topics}
+        for ci in summary.chunk_indexes:
+            s = max(ci.message_start_time, start_ns)
+            e = min(ci.message_end_time, end_ns)
+            if e <= s:
+                continue
+            for cid, t in by_id.items():
+                if cid in ci.message_index_offsets:
+                    cov[t] += e - s
+        return cov
+    except Exception:
+        return None
+
+
+def _choose_redundant_skips(probed, start_ns, end_ns):
+    """二重記録としてスキップしてよいファイルを決める。
+
+    probed: (job, 記録種別, カバー時間 dict または None) のリスト。
+    develop 側の各トピックのカバー時間が抽出時間帯のほぼ全体 (95%) に達している
+    とき、そのトピックしか持たない develop 以外のファイルは読まなくてよい
+    (読んでもストリーム解決で捨てられる二重記録だけのため)。develop 側に欠けが
+    あるトピックはカバー率が下がり、そのファイルはスキップされない (安全側)。
+    戻り値: スキップする job 名の集合。
+    """
+    window = max(end_ns - start_ns, 1)
+    dev_cov = defaultdict(int)
+    for _job, kind, cov in probed:
+        if kind == "develop" and cov:
+            for t, c in cov.items():
+                dev_cov[t] += c
+    skips = set()
+    for job, kind, cov in probed:
+        if kind == "develop" or cov is None:
+            continue
+        present = [t for t, c in cov.items() if c > 0]
+        if present and all(dev_cov.get(t, 0) >= window * 0.95 for t in present):
+            skips.add(job["name"])
+    return skips
+
+
+def _skip_redundant_recordings(jobs, topic_config, start_ns, end_ns, workers=16):
+    """develop との二重記録ファイルを、読む前にサマリ判定で除外する。
+
+    /t2/main_mabx/* のように develop と sensor の両方に同じストリームが
+    記録されているデータでは、sensor 側 (1 分あたり数 GB) を読んでも
+    ストリーム解決で全行捨てられる。サマリ (数百 KB) の事前確認だけで
+    それが分かる場合は、ダウンロード・デコード自体を省く。
+    """
+    gcs = [j for j in jobs if j.get("kind") == "gcs"]
+    kinds = {_record_kind(j["name"]) for j in gcs}
+    if "develop" not in kinds or len(kinds) < 2:
+        return jobs
+    from google.cloud import storage  # storage.Client
+    client = storage.Client()
+    topics = set(topic_config.keys())
+
+    def probe(j):
+        return (j, _record_kind(j["name"]),
+                _probe_topic_coverage(client, j, topics, start_ns, end_ns))
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        probed = list(pool.map(probe, gcs))
+    skips = _choose_redundant_skips(probed, start_ns, end_ns)
+    if skips:
+        total = sum(j.get("size") or 0 for j in jobs if j["name"] in skips)
+        print(f"[info] develop と二重記録のため {len(skips)} ファイルを読まずにスキップ"
+              f"します (約 {size_str(total)} の読み込みを省略)")
+    return [j for j in jobs if j["name"] not in skips]
+
+
 def _dedup_rows(rows):
     """(時刻, 内容) が完全一致する重複行を除いた時刻順リストを返す。
 
@@ -1043,6 +1188,11 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
     """
     jobs = build_extract_jobs(sources, topic_config, exclude_pats,
                               start_ns, end_ns, no_download, cache_dir)
+    if topic_config is not None and start_ns is not None and end_ns is not None:
+        try:
+            jobs = _skip_redundant_recordings(jobs, topic_config, start_ns, end_ns)
+        except Exception as e:
+            print(f"[warn] 二重記録の事前判定に失敗したため全ファイルを読みます: {e}")
     if workers is None:
         # vCPU-1 まで自動で並列化する (上限 32)。デコードは CPU バウンドかつ
         # ファイル単位の並列なので、vCPU の多いマシン (VM の MACHINE_TYPE を
@@ -1547,9 +1697,29 @@ def download_raw_mcaps(sources, outdir, workers=4, progress=None, cache_dir=None
 def collect_topics(sources, workers=8):
     """対象ソースのサマリからトピック情報を集める。
 
-    戻り値: {topic: {"schema": 名前, "encoding": エンコーディング, "count": メッセージ数}}
+    チャンネル構成はセッション×記録種別 (develop/sensor) ごとに共通なので、
+    グループの代表 1 ファイル (最大サイズ) のサマリだけを読む。数十ファイル分の
+    フッタ読みが数ファイルで済み、トピック一覧の取得が大幅に速くなる。
+    count は代表ファイル内のメッセージ数 (選択の目安)。kinds はそのトピックの
+    実体 (メッセージ数 > 0) がある記録種別のリスト。
+    戻り値: {topic: {"schema", "encoding", "count", "kinds"}}
     """
-    def one(src):
+    groups = {}
+    for src in sources:
+        name = str(src.name).replace("\\", "/")
+        session = (name.split("/recording/")[-1].split("/")[0]
+                   if "/recording/" in name else os.path.dirname(name))
+        key = (session, _record_kind(name))
+        cur = groups.get(key)
+        if cur is None or (src.size or 0) > (cur.size or 0):
+            groups[key] = src
+    reps = sorted(groups.items(), key=lambda kv: kv[0])
+    if len(sources) > len(reps):
+        print(f"[info] トピック一覧: {len(sources)} ファイル中、セッション×種別の"
+              f"代表 {len(reps)} ファイルのサマリだけを読みます")
+
+    def one(item):
+        (_session, kind), src = item
         info = {}
         try:
             with src.open(chunk_size=256 * 1024) as f:
@@ -1564,6 +1734,7 @@ def collect_topics(sources, workers=8):
                     "schema": sc.name if sc else "?",
                     "encoding": sc.encoding if sc else "?",
                     "count": counts.get(ch.id, 0),
+                    "kind": kind,
                 }
         except Exception as e:
             print(f"[warn] トピック取得失敗 ({src.name}): {e}")
@@ -1571,12 +1742,17 @@ def collect_topics(sources, workers=8):
 
     merged = {}
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        for info in pool.map(one, sources):
+        for info in pool.map(one, reps):
             for topic, meta in info.items():
-                if topic in merged:
-                    merged[topic]["count"] += meta["count"]
-                else:
-                    merged[topic] = dict(meta)
+                cur = merged.setdefault(
+                    topic, {"schema": meta["schema"], "encoding": meta["encoding"],
+                            "count": 0, "kinds": []})
+                cur["count"] += meta["count"]
+                # 実体 (メッセージ) がある記録種別だけを記録元として出す
+                if meta["count"] > 0 and meta["kind"] not in cur["kinds"]:
+                    cur["kinds"].append(meta["kind"])
+    for meta in merged.values():
+        meta["kinds"].sort(key=lambda k: (k != "develop", k))
     return dict(sorted(merged.items()))
 def print_topics(sources):
     for src in sources:
