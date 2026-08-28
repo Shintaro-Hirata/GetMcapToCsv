@@ -810,6 +810,50 @@ def _collect_rows(reader, topic_config, exclude_pats, start_ns, end_ns):
     return per_topic, dict(decode_errors), count
 
 
+def _record_kind(name):
+    """ファイルパスから記録種別 (develop / sensor / image など) を取り出す。"""
+    parts = str(name).replace("\\", "/").rsplit("/", 2)
+    if len(parts) >= 2:
+        d = parts[-2]
+        return d[len("record_"):] if d.startswith("record_") else d
+    return "?"
+
+
+def _resolve_duplicate_recordings(kinds):
+    """{記録種別: 行リスト} から採用する行リストを決める。
+
+    同じトピックが record_develop と record_sensor の両方に記録されている
+    データがある (同じ CAN ストリームを別プロセスが二重に記録)。記録プロセス
+    ごとに受信時刻 (t_ns) が微妙にずれるため、メッセージ単位の突き合わせでは
+    二重計上を防げない。そこで時間帯が重なっている種別同士は「同じストリームの
+    二重記録」とみなし、行数の最も多い側だけを採用する。時間帯が重ならない側は
+    片側にしか無い区間なので残す。
+    戻り値: (採用行リスト, 除去行数, 採用種別 or None)
+    """
+    items = [(k, v) for k, v in kinds.items() if v]
+    if not items:
+        return [], 0, None
+    if len(items) == 1:
+        return items[0][1], 0, None
+    # 行数の多い順 (同数なら develop 優先) に並べ、先頭を基準ストリームにする
+    items.sort(key=lambda kv: (len(kv[1]), kv[0] == "develop"), reverse=True)
+    chosen_kind, chosen = items[0]
+    c0 = min(r["t_ns"] for r in chosen)
+    c1 = max(r["t_ns"] for r in chosen)
+    kept = list(chosen)
+    dropped = 0
+    for kind, rows in items[1:]:
+        r0 = min(r["t_ns"] for r in rows)
+        r1 = max(r["t_ns"] for r in rows)
+        span = max(r1 - r0, 1)
+        overlap = min(c1, r1) - max(c0, r0)
+        if overlap >= span * 0.5:
+            dropped += len(rows)  # 基準側と同じ時間帯 = 二重記録
+        else:
+            kept.extend(rows)     # 基準側に無い時間帯だけを持つ = 補完として残す
+    return kept, dropped, (chosen_kind if dropped else None)
+
+
 def _dedup_rows(rows):
     """(時刻, 内容) が完全一致する重複行を除いた時刻順リストを返す。
 
@@ -1040,12 +1084,17 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
 
     n_done = [0]
 
+    # トピックごとに記録種別 (develop/sensor) 別で集め、最後に二重記録を解決する
+    by_kind = {}
+
     def merge(result):
         name, part, errors, count, sec, gcs_b, cache_b, dl_sec = result
         STATS.add_gcs(gcs_b)
         STATS.add_cache(cache_b)
+        kind = _record_kind(name)
         for topic, rows in part.items():
-            per_topic.setdefault(topic, []).extend(rows)
+            if rows:
+                by_kind.setdefault(topic, {}).setdefault(kind, []).extend(rows)
         for err, n in errors.items():
             decode_errors[err] += n
         src_note = " [キャッシュ]" if cache_b and not gcs_b else ""
@@ -1082,7 +1131,15 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
                     n_read_fail += 1
                     print(f"[warn] 読み込み失敗 ({job['name']}): {e2}")
 
-    # develop と sensor の両方に記録されたメッセージの二重計上を除く
+    # 同じトピックが develop/sensor の両方に記録されている場合は片側だけ採用する
+    for t, kinds in by_kind.items():
+        rows, dropped, chosen = _resolve_duplicate_recordings(kinds)
+        if dropped:
+            print(f"[info] {t}: {'/'.join(sorted(kinds))} の両方に同じストリームが"
+                  f"記録されているため {chosen} 側を採用 ({dropped} 行の二重計上を除去)")
+        per_topic.setdefault(t, []).extend(rows)
+
+    # 同一時刻・同一内容の完全重複も除く (ファイル境界の重なりなど)
     n_dup = 0
     for t, rows in per_topic.items():
         if len(rows) > 1:
@@ -1090,8 +1147,7 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
             n_dup += len(rows) - len(deduped)
             per_topic[t] = deduped
     if n_dup:
-        print(f"[info] develop/sensor 間の重複メッセージ {n_dup} 行を除去しました"
-              f" (同一時刻・同一内容)")
+        print(f"[info] 完全重複メッセージ {n_dup} 行を除去しました (同一時刻・同一内容)")
 
     for err, n in decode_errors.items():
         print(f"[warn] デコード失敗 {n} 件: {err}")
