@@ -933,6 +933,7 @@ if ss.sources:
         topic_rows = [{
             "選択": t in default_set,
             "トピック": t,
+            "記録元": "+".join(ss.topics_info[t].get("kinds") or []) or "-",
             "メッセージ数": ss.topics_info[t]["count"],
             "エンコード": ss.topics_info[t]["encoding"],
             "スキーマ": ss.topics_info[t]["schema"],
@@ -942,8 +943,13 @@ if ss.sources:
             column_config={
                 "選択": st.column_config.CheckboxColumn("選択", width="small"),
                 "トピック": st.column_config.TextColumn("トピック", width="large"),
+                "記録元": st.column_config.TextColumn(
+                    "記録元", width="small",
+                    help="このトピックの実体 (メッセージ) がある記録種別。develop のみ"
+                         "なら①の「record_sensor も含める」は不要 (速くなる)。"
+                         "「-」は代表ファイル内にメッセージが無かったことを示す。"),
             },
-            disabled=["トピック", "メッセージ数", "エンコード", "スキーマ"],
+            disabled=["トピック", "記録元", "メッセージ数", "エンコード", "スキーマ"],
             hide_index=True,
             use_container_width=True,
             height=420,
