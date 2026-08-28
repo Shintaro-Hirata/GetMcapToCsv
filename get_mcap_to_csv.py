@@ -810,6 +810,25 @@ def _collect_rows(reader, topic_config, exclude_pats, start_ns, end_ns):
     return per_topic, dict(decode_errors), count
 
 
+def _dedup_rows(rows):
+    """(時刻, 内容) が完全一致する重複行を除いた時刻順リストを返す。
+
+    同じメッセージが record_develop と record_sensor の両方に記録されている
+    トピックがあり (例: /t2/main_mabx/*)、両方を読むと全行が二重になるため。
+    時刻が同じでも内容が異なる行は別メッセージとして残す。
+    """
+    seen = set()
+    out = []
+    for r in sorted(rows, key=lambda x: x["t_ns"]):
+        key = (r["t_ns"],
+               tuple(sorted((k, str(v)) for k, v in r.items() if k != "t_ns")))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
 def _summary_probe(blob, topics, start_ns, end_ns, stats):
     """サマリだけ読み、(時間帯内に選択トピックのメッセージがあるか, チャンクスキップ削減率) を返す。
 
@@ -850,6 +869,12 @@ def _summary_probe(blob, topics, start_ns, end_ns, stats):
 
 # 一括ダウンロードをやめて部分読み込みに切り替える削減率のしきい値
 _AUTO_STREAM_SAVING = 0.4
+
+# これ以上のサイズのファイルは (キャッシュを使わない実行では) ディスクに落とさず
+# GCS から直接ストリーミングで読む。多数の巨大ファイルを並列ダウンロードすると
+# ネットワークより先に永続ディスクのスループット上限 (e2 で約 240MB/s) に当たり、
+# ダウンロードもその読み返し (解析) も数分単位で詰まるため。
+_LARGE_STREAM_BYTES = 1 << 30  # 1GB
 
 
 def _extract_worker(job):
@@ -893,6 +918,11 @@ def _extract_worker(job):
                         download = False
                         print(f"[info] {job['name'].rsplit('/', 1)[-1]}: "
                               f"選択トピックに不要なチャンクが {saving * 100:.0f}% → 部分読み込みに切替")
+                if (download and not cache_dir
+                        and (job.get("size") or 0) >= _LARGE_STREAM_BYTES):
+                    download = False
+                    print(f"[info] {job['name'].rsplit('/', 1)[-1]}: 大きいファイルのため"
+                          f"ディスクに落とさず直接読み込み ({size_str(job['size'])})")
                 if download:
                     # 時間帯がファイルの大半を占めるなら一括ダウンロードの方が速い
                     t_dl = time.monotonic()
@@ -978,8 +1008,12 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
 
     # 一括ダウンロードは並列数ぶんの一時ファイルを同時に持つため、ディスクの空きを
     # 超えると全ワーカーが ENOSPC (No space left on device) で連鎖的に失敗する。
-    # 空き容量から同時に置ける本数を見積もり、並列をそこまでに制限する
-    dl_sizes = [j["size"] for j in jobs if j.get("download") and j.get("size")]
+    # 空き容量から同時に置ける本数を見積もり、並列をそこまでに制限する。
+    # _LARGE_STREAM_BYTES 以上のファイルは (キャッシュ無効時) ワーカー側で
+    # ストリーミング読みに切り替わりディスクを使わないため、ここでは数えない
+    dl_sizes = [j["size"] for j in jobs
+                if j.get("download") and j.get("size")
+                and (cache_dir or j["size"] < _LARGE_STREAM_BYTES)]
     if dl_sizes:
         try:
             tmp_target = cache_dir if cache_dir else tempfile.gettempdir()
@@ -1047,6 +1081,17 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
                 except Exception as e2:
                     n_read_fail += 1
                     print(f"[warn] 読み込み失敗 ({job['name']}): {e2}")
+
+    # develop と sensor の両方に記録されたメッセージの二重計上を除く
+    n_dup = 0
+    for t, rows in per_topic.items():
+        if len(rows) > 1:
+            deduped = _dedup_rows(rows)
+            n_dup += len(rows) - len(deduped)
+            per_topic[t] = deduped
+    if n_dup:
+        print(f"[info] develop/sensor 間の重複メッセージ {n_dup} 行を除去しました"
+              f" (同一時刻・同一内容)")
 
     for err, n in decode_errors.items():
         print(f"[warn] デコード失敗 {n} 件: {err}")
