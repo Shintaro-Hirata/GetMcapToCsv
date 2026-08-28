@@ -810,15 +810,91 @@ def _collect_rows(reader, topic_config, exclude_pats, start_ns, end_ns):
     return per_topic, dict(decode_errors), count
 
 
-def _stream_saving_fraction(blob, topics, start_ns, end_ns, stats):
-    """サマリだけ読み、チャンクスキップでどれだけ転送を減らせるか (0.0-1.0) を返す。"""
+def _record_kind(name):
+    """ファイルパスから記録種別 (develop / sensor / image など) を取り出す。"""
+    parts = str(name).replace("\\", "/").rsplit("/", 2)
+    if len(parts) >= 2:
+        d = parts[-2]
+        return d[len("record_"):] if d.startswith("record_") else d
+    return "?"
+
+
+def _resolve_duplicate_recordings(kinds):
+    """{記録種別: 行リスト} から採用する行リストを決める。
+
+    同じトピックが record_develop と record_sensor の両方に記録されている
+    データがある (同じ CAN ストリームを別プロセスが二重に記録)。記録プロセス
+    ごとに受信時刻 (t_ns) が微妙にずれるため、メッセージ単位の突き合わせでは
+    二重計上を防げない。そこで時間帯が重なっている種別同士は「同じストリームの
+    二重記録」とみなし、行数の最も多い側だけを採用する。時間帯が重ならない側は
+    片側にしか無い区間なので残す。
+    戻り値: (採用行リスト, 除去行数, 採用種別 or None)
+    """
+    items = [(k, v) for k, v in kinds.items() if v]
+    if not items:
+        return [], 0, None
+    if len(items) == 1:
+        return items[0][1], 0, None
+    # 行数の多い順 (同数なら develop 優先) に並べ、先頭を基準ストリームにする
+    items.sort(key=lambda kv: (len(kv[1]), kv[0] == "develop"), reverse=True)
+    chosen_kind, chosen = items[0]
+    c0 = min(r["t_ns"] for r in chosen)
+    c1 = max(r["t_ns"] for r in chosen)
+    kept = list(chosen)
+    dropped = 0
+    for kind, rows in items[1:]:
+        r0 = min(r["t_ns"] for r in rows)
+        r1 = max(r["t_ns"] for r in rows)
+        span = max(r1 - r0, 1)
+        overlap = min(c1, r1) - max(c0, r0)
+        if overlap >= span * 0.5:
+            dropped += len(rows)  # 基準側と同じ時間帯 = 二重記録
+        else:
+            kept.extend(rows)     # 基準側に無い時間帯だけを持つ = 補完として残す
+    return kept, dropped, (chosen_kind if dropped else None)
+
+
+def _dedup_rows(rows):
+    """(時刻, 内容) が完全一致する重複行を除いた時刻順リストを返す。
+
+    同じメッセージが record_develop と record_sensor の両方に記録されている
+    トピックがあり (例: /t2/main_mabx/*)、両方を読むと全行が二重になるため。
+    時刻が同じでも内容が異なる行は別メッセージとして残す。
+    """
+    seen = set()
+    out = []
+    for r in sorted(rows, key=lambda x: x["t_ns"]):
+        key = (r["t_ns"],
+               tuple(sorted((k, str(v)) for k, v in r.items() if k != "t_ns")))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
+def _summary_probe(blob, topics, start_ns, end_ns, stats):
+    """サマリだけ読み、(時間帯内に選択トピックのメッセージがあるか, チャンクスキップ削減率) を返す。
+
+    1 つ目は False のときだけ確定的 (= ダウンロードもデコードも不要と分かる)。
+    develop/sensor の両方にトピック名だけ登録され実体が片側に無いデータでは、
+    これで GB 級のファイル読み込みを丸ごと省ける。判定不能なら None。
+    2 つ目はストリーミング読みが読むチャンク本体の比率から計算する (不明なら None)。
+    """
     try:
         with CountingFile(blob.open("rb", chunk_size=256 * 1024), stats) as f:
             summary = make_reader(f).get_summary()
         if summary is None or not summary.chunk_indexes:
-            return None
+            return None, None
+        # メッセージインデックスの無い書き方のファイルでは
+        # 「どのチャンクに何が入っているか」を判定できない
+        if not any(ci.message_index_offsets for ci in summary.chunk_indexes):
+            return None, None
         sel_ids = {cid for cid, ch in summary.channels.items() if ch.topic in topics}
+        if not sel_ids:
+            return False, None  # 選択トピックのチャンネル自体が無い
         total = needed = 0
+        has_selected = False
         for ci in summary.chunk_indexes:
             if start_ns is not None and ci.message_end_time < start_ns:
                 continue
@@ -826,16 +902,23 @@ def _stream_saving_fraction(blob, topics, start_ns, end_ns, stats):
                 continue
             total += ci.chunk_length + ci.message_index_length
             if any(cid in ci.message_index_offsets for cid in sel_ids):
+                has_selected = True
                 needed += ci.chunk_length  # ストリーミングが読むのはチャンク本体のみ
         if total <= 0:
-            return None
-        return 1.0 - needed / total
+            return has_selected, None
+        return has_selected, 1.0 - needed / total
     except Exception:
-        return None
+        return None, None
 
 
 # 一括ダウンロードをやめて部分読み込みに切り替える削減率のしきい値
 _AUTO_STREAM_SAVING = 0.4
+
+# これ以上のサイズのファイルは (キャッシュを使わない実行では) ディスクに落とさず
+# GCS から直接ストリーミングで読む。多数の巨大ファイルを並列ダウンロードすると
+# ネットワークより先に永続ディスクのスループット上限 (e2 で約 240MB/s) に当たり、
+# ダウンロードもその読み返し (解析) も数分単位で詰まるため。
+_LARGE_STREAM_BYTES = 1 << 30  # 1GB
 
 
 def _extract_worker(job):
@@ -847,6 +930,7 @@ def _extract_worker(job):
     factories = build_decoder_factories(quiet=True)
     stats = TransferStats()  # ワーカープロセス内のローカル計測 (戻り値で親へ返す)
     tmpdir = None
+    dl_secs = 0.0
     cache_dir = job.get("cache_dir")
     try:
         if job["kind"] == "gcs":
@@ -859,18 +943,33 @@ def _extract_worker(job):
                 from google.cloud import storage  # storage.Client
                 blob = storage.Client().bucket(job["bucket"]).blob(job["blob_name"])
                 download = job["download"]
-                if download and job.get("topic_config") is not None:
-                    # トピックが絞られているときはサマリで必要チャンク比を見て、
-                    # 大幅に減るなら丸ごとダウンロードをやめて部分読み込みにする
-                    saving = _stream_saving_fraction(
+                if job.get("topic_config") is not None:
+                    # サマリだけ先に読み、この時間帯に選択トピックのメッセージが
+                    # 1 件も無いファイルはダウンロードもデコードもせずスキップする
+                    # (実体が develop/sensor の片側にしか無いトピックで GB 級を節約)。
+                    # メッセージがある場合も、チャンクスキップで大幅に減るなら
+                    # 丸ごとダウンロードをやめて部分読み込みにする
+                    has_sel, saving = _summary_probe(
                         blob, set(job["topic_config"].keys()),
                         job["start_ns"], job["end_ns"], stats)
-                    if saving is not None and saving >= _AUTO_STREAM_SAVING:
+                    if has_sel is False:
+                        print(f"[info] {job['name'].rsplit('/', 1)[-1]}: "
+                              f"選択トピックのメッセージ 0 件 → スキップ (ダウンロードなし)")
+                        return (job["name"], {t: [] for t in job["topic_config"]},
+                                {}, 0, time.monotonic() - t0,
+                                stats.gcs_bytes, stats.cache_bytes, 0.0)
+                    if download and saving is not None and saving >= _AUTO_STREAM_SAVING:
                         download = False
                         print(f"[info] {job['name'].rsplit('/', 1)[-1]}: "
                               f"選択トピックに不要なチャンクが {saving * 100:.0f}% → 部分読み込みに切替")
+                if (download and not cache_dir
+                        and (job.get("size") or 0) >= _LARGE_STREAM_BYTES):
+                    download = False
+                    print(f"[info] {job['name'].rsplit('/', 1)[-1]}: 大きいファイルのため"
+                          f"ディスクに落とさず直接読み込み ({size_str(job['size'])})")
                 if download:
                     # 時間帯がファイルの大半を占めるなら一括ダウンロードの方が速い
+                    t_dl = time.monotonic()
                     if cache_dir:
                         local = cache_store_download(blob, cache_dir, stats)
                     else:
@@ -878,6 +977,7 @@ def _extract_worker(job):
                         local = os.path.join(tmpdir, "part.mcap")
                         blob.download_to_filename(local)
                         stats.add_gcs(os.path.getsize(local))
+                    dl_secs = time.monotonic() - t_dl
                     f = open(local, "rb")
                 else:
                     f = CountingFile(blob.open("rb", chunk_size=16 * 1024 * 1024), stats)
@@ -889,7 +989,7 @@ def _extract_worker(job):
                 reader, job["topic_config"], job["exclude"],
                 job["start_ns"], job["end_ns"])
         return (job["name"], per_topic, errors, count, time.monotonic() - t0,
-                stats.gcs_bytes, stats.cache_bytes)
+                stats.gcs_bytes, stats.cache_bytes, dl_secs)
     finally:
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -952,8 +1052,12 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
 
     # 一括ダウンロードは並列数ぶんの一時ファイルを同時に持つため、ディスクの空きを
     # 超えると全ワーカーが ENOSPC (No space left on device) で連鎖的に失敗する。
-    # 空き容量から同時に置ける本数を見積もり、並列をそこまでに制限する
-    dl_sizes = [j["size"] for j in jobs if j.get("download") and j.get("size")]
+    # 空き容量から同時に置ける本数を見積もり、並列をそこまでに制限する。
+    # _LARGE_STREAM_BYTES 以上のファイルは (キャッシュ無効時) ワーカー側で
+    # ストリーミング読みに切り替わりディスクを使わないため、ここでは数えない
+    dl_sizes = [j["size"] for j in jobs
+                if j.get("download") and j.get("size")
+                and (cache_dir or j["size"] < _LARGE_STREAM_BYTES)]
     if dl_sizes:
         try:
             tmp_target = cache_dir if cache_dir else tempfile.gettempdir()
@@ -980,16 +1084,24 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
 
     n_done = [0]
 
+    # トピックごとに記録種別 (develop/sensor) 別で集め、最後に二重記録を解決する
+    by_kind = {}
+
     def merge(result):
-        name, part, errors, count, sec, gcs_b, cache_b = result
+        name, part, errors, count, sec, gcs_b, cache_b, dl_sec = result
         STATS.add_gcs(gcs_b)
         STATS.add_cache(cache_b)
+        kind = _record_kind(name)
         for topic, rows in part.items():
-            per_topic.setdefault(topic, []).extend(rows)
+            if rows:
+                by_kind.setdefault(topic, {}).setdefault(kind, []).extend(rows)
         for err, n in errors.items():
             decode_errors[err] += n
         src_note = " [キャッシュ]" if cache_b and not gcs_b else ""
-        print(f"[info]   {name.rsplit('/', 1)[-1]}: {count} 行 ({sec:.1f} 秒){src_note}")
+        # DL と解析の内訳を出す (どちらがボトルネックかをログから判断できるように)
+        timing = (f"DL {dl_sec:.1f} 秒 + 解析 {sec - dl_sec:.1f} 秒"
+                  if dl_sec > 0 else f"{sec:.1f} 秒")
+        print(f"[info]   {name.rsplit('/', 1)[-1]}: {count} 行 ({timing}){src_note}")
         n_done[0] += 1
         if progress:
             progress(n_done[0], len(jobs), name)
@@ -1018,6 +1130,24 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
                 except Exception as e2:
                     n_read_fail += 1
                     print(f"[warn] 読み込み失敗 ({job['name']}): {e2}")
+
+    # 同じトピックが develop/sensor の両方に記録されている場合は片側だけ採用する
+    for t, kinds in by_kind.items():
+        rows, dropped, chosen = _resolve_duplicate_recordings(kinds)
+        if dropped:
+            print(f"[info] {t}: {'/'.join(sorted(kinds))} の両方に同じストリームが"
+                  f"記録されているため {chosen} 側を採用 ({dropped} 行の二重計上を除去)")
+        per_topic.setdefault(t, []).extend(rows)
+
+    # 同一時刻・同一内容の完全重複も除く (ファイル境界の重なりなど)
+    n_dup = 0
+    for t, rows in per_topic.items():
+        if len(rows) > 1:
+            deduped = _dedup_rows(rows)
+            n_dup += len(rows) - len(deduped)
+            per_topic[t] = deduped
+    if n_dup:
+        print(f"[info] 完全重複メッセージ {n_dup} 行を除去しました (同一時刻・同一内容)")
 
     for err, n in decode_errors.items():
         print(f"[warn] デコード失敗 {n} 件: {err}")
