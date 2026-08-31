@@ -1355,7 +1355,8 @@ def window_base(prefix, ws_ns, we_ns):
 
 
 def write_csvs_split(per_topic, topic_config, outdir, base_prefix, start_ns, end_ns,
-                     split_minutes, merged=True, merged_grid=None, merged_hold=5.0):
+                     split_minutes, merged=True, merged_grid=None, merged_hold=5.0,
+                     drop_t_ns=False):
     """指定期間を split_minutes 分ごとの区間に刻み、区間ごとに CSV 一式を書き出す。
 
     長時間の抽出 (特に結合 CSV) は 1 ファイルが巨大になるため、抽出済みデータを
@@ -1383,7 +1384,8 @@ def write_csvs_split(per_topic, topic_config, outdir, base_prefix, start_ns, end
             n_win += 1
             written += write_csvs(sub, topic_config, outdir,
                                   window_base(base_prefix, ws, we), merged=merged,
-                                  merged_grid=merged_grid, merged_hold=merged_hold)
+                                  merged_grid=merged_grid, merged_hold=merged_hold,
+                                  drop_t_ns=drop_t_ns)
         ws = we
     print(f"[info] 分割出力: {split_minutes:g} 分 × {n_win} 区間 "
           f"(データの無い区間はスキップ)")
@@ -1398,7 +1400,8 @@ def _grid_label(grid_sec):
     return f"{grid_sec:g}s"
 
 
-def write_merged_grid_csv(per_topic, topic_config, outdir, base, grid_sec, hold_sec):
+def write_merged_grid_csv(per_topic, topic_config, outdir, base, grid_sec, hold_sec,
+                          drop_t_ns=False):
     """全トピックを一定周期の共通時間軸に揃えた結合 CSV を 1 本書き出す。
 
     周波数が異なるトピックをそのまま時刻順に並べると他トピックの列が歯抜けになり
@@ -1448,9 +1451,10 @@ def write_merged_grid_csv(per_topic, topic_config, outdir, base, grid_sec, hold_
     out = os.path.join(outdir, f"{base}_all_{_grid_label(grid_sec)}.csv")
     cursor = {t: 0 for t in rows_by_topic}   # 次に消費する行番号
     latest = {t: None for t in rows_by_topic}  # グリッド時刻までの最新行
+    head_time = ["time_jst", "t_sec"] if drop_t_ns else ["time_jst", "t_sec", "t_ns"]
     with open(out, "w", newline="", encoding="utf-8-sig") as g:
         w = csv.writer(g)
-        w.writerow(["time_jst", "t_sec", "t_ns"] + [h for _, _, h in col_defs])
+        w.writerow(head_time + [h for _, _, h in col_defs])
         for k in range(n_grid):
             gt = t_start + k * grid_ns
             for topic, rows in rows_by_topic.items():
@@ -1466,7 +1470,10 @@ def write_merged_grid_csv(per_topic, topic_config, outdir, base, grid_sec, hold_
                     vals.append("")
                 else:
                     vals.append(cur.get(c, ""))
-            w.writerow([fmt_jst(gt), round((gt - t_start) / 1e9, 3), gt] + vals)
+            tvals = [fmt_jst(gt), round((gt - t_start) / 1e9, 3)]
+            if not drop_t_ns:
+                tvals.append(gt)
+            w.writerow(tvals + vals)
     hold_str = "無制限" if hold_ns is None else f"{hold_sec:g}s"
     print(f"[ok] wrote {out}  ({n_grid} rows, 周期 {_grid_label(grid_sec)}, "
           f"前値ホールド上限 {hold_str})")
@@ -1474,13 +1481,14 @@ def write_merged_grid_csv(per_topic, topic_config, outdir, base, grid_sec, hold_
 
 
 def write_csvs(per_topic, topic_config, outdir, base, merged=True,
-               merged_grid=None, merged_hold=5.0):
+               merged_grid=None, merged_hold=5.0, drop_t_ns=False):
     """トピック別 CSV と (トピック指定時のみ) 全トピック結合 CSV を書き出す。
 
     topic_config が None のときは全トピックモード。トピックごとに CSV を 1 本ずつ
     出力し、列数が膨大になる結合 CSV は作らない。merged=False でも結合 CSV を省く。
     merged_grid (秒) を指定すると、結合 CSV は時刻順のメッセージ行の代わりに
     共通時間軸へ揃えた形式 (write_merged_grid_csv) で出力する。
+    drop_t_ns=True で t_ns 列を出力しない (客先納品用。GetDruidUser 取り込みには必須)。
     """
     all_topics = topic_config is None
     all_t = [r["t_ns"] for rows in per_topic.values() for r in rows]
@@ -1492,8 +1500,13 @@ def write_csvs(per_topic, topic_config, outdir, base, merged=True,
     os.makedirs(outdir, exist_ok=True)
     written = []
 
+    head_time = ["time_jst", "t_sec"] if drop_t_ns else ["time_jst", "t_sec", "t_ns"]
+
     def time_cols(t_ns):
-        return [fmt_jst(t_ns), round((t_ns - t0) / 1e9, 3), t_ns]
+        cols = [fmt_jst(t_ns), round((t_ns - t0) / 1e9, 3)]
+        if not drop_t_ns:
+            cols.append(t_ns)
+        return cols
 
     def suffix_of(topic):
         if not all_topics and topic in topic_config:
@@ -1522,7 +1535,7 @@ def write_csvs(per_topic, topic_config, outdir, base, merged=True,
         out = os.path.join(outdir, f"{base}_{suffix_of(topic)}.csv")
         with open(out, "w", newline="", encoding="utf-8-sig") as g:
             w = csv.writer(g)
-            w.writerow(["time_jst", "t_sec", "t_ns"] + [rename.get(c, c) for c in cols])
+            w.writerow(head_time + [rename.get(c, c) for c in cols])
             for r in rows:
                 w.writerow(time_cols(r["t_ns"]) + [r.get(c, "") for c in cols])
         print(f"[ok] wrote {out}  ({len(rows)} rows)")
@@ -1538,7 +1551,8 @@ def write_csvs(per_topic, topic_config, outdir, base, merged=True,
     # (2a) 共通時間軸へ揃えた結合 CSV (周期指定時)
     if merged_grid:
         written += write_merged_grid_csv(per_topic, topic_config, outdir, base,
-                                         merged_grid, merged_hold)
+                                         merged_grid, merged_hold,
+                                         drop_t_ns=drop_t_ns)
         return written
 
     # (2) 全トピック結合 CSV (時刻順 / 値が無い列は空欄)
@@ -1551,7 +1565,7 @@ def write_csvs(per_topic, topic_config, outdir, base, merged=True,
     out_all = os.path.join(outdir, f"{base}_all.csv")
     with open(out_all, "w", newline="", encoding="utf-8-sig") as g:
         w = csv.writer(g)
-        w.writerow(["time_jst", "t_sec", "t_ns", "topic"] + all_cols)
+        w.writerow(head_time + ["topic"] + all_cols)
         for topic, r in all_rows:
             w.writerow(time_cols(r["t_ns"]) + [suffix_by_topic[topic]]
                        + [r.get(c, "") for c in all_cols])
@@ -2127,6 +2141,9 @@ def main():
                         help="指定した分数ごとに出力ファイルを区切る (例: 30)。"
                              "長時間の抽出でも 1 ファイルが巨大にならない。"
                              "mcap の読み込みは 1 回で、書き出しだけを分割する")
+    parser.add_argument("--no-t-ns", action="store_true", dest="no_t_ns",
+                        help="t_ns 列 (epoch ナノ秒) を CSV に出力しない (客先納品用など)。"
+                             "GetDruidUser に取り込む CSV では t_ns が必須のため付けないこと")
     parser.add_argument("--cache-dir", default=DEFAULT_CACHE_DIR, metavar="DIR",
                         help="一括ダウンロードのローカルキャッシュ先。同じファイルの"
                              f"再ダウンロード (= 再課金) を防ぐ (default: {DEFAULT_CACHE_DIR})")
@@ -2279,10 +2296,12 @@ def main():
         write_csvs_split(per_topic, topic_config, args.outdir, prefix,
                          start_ns, end_ns, args.split_minutes,
                          merged=not args.no_merged,
-                         merged_grid=args.merged_grid, merged_hold=args.merged_hold)
+                         merged_grid=args.merged_grid, merged_hold=args.merged_hold,
+                         drop_t_ns=args.no_t_ns)
     else:
         write_csvs(per_topic, topic_config, args.outdir, base, merged=not args.no_merged,
-                   merged_grid=args.merged_grid, merged_hold=args.merged_hold)
+                   merged_grid=args.merged_grid, merged_hold=args.merged_hold,
+                   drop_t_ns=args.no_t_ns)
     if cache_dir:
         prune_cache(cache_dir, args.cache_max_gb)
     print_transfer_summary()

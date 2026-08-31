@@ -260,6 +260,7 @@ python get_mcap_to_csv.py --local "C:\data\*.mcap" --start "2025-12-04 12:00" --
 | `--merged-grid` | 結合 CSV を一定周期（秒）の共通時間軸に揃えて出力（例: `0.1`）。各セルはその時刻までの最新値（前値ホールド） |
 | `--merged-hold` | `--merged-grid` で前値を保持する最大秒数。超えた区間は空欄（0=無制限、デフォルト 5） |
 | `--split-minutes` | 指定した分数ごとに出力ファイルを区切る（例: `30`）。読み込みは 1 回のまま書き出しだけ分割 |
+| `--no-t-ns` | t_ns 列（epoch ナノ秒）を CSV に出力しない（客先納品用）。⚠ GetDruidUser 取り込み用 CSV では t_ns が必須のため付けない |
 | `--bucket` | バケット名（デフォルト `t2-ft-original-data`） |
 | `--subdir` | セッション内の対象サブディレクトリ（デフォルト `record_develop`、`"*"` で全て） |
 | `--workers` | 時刻メタデータ読み込みの並列数（デフォルト 16） |
@@ -274,6 +275,20 @@ python get_mcap_to_csv.py --local "C:\data\*.mcap" --start "2025-12-04 12:00" --
 | `--list-only` | 対象 mcap の一覧表示のみ |
 | `--list-topics` | トピック一覧表示（メッセージ数・エンコーディング・スキーマ名） |
 | `--local` | ローカル mcap を処理（glob パターン可） |
+
+## 出力済み CSV の後処理（列の一括除去）
+
+抽出をやり直さずに、出力済み CSV から列を取り除ける（例: 客先納品直前に t_ns を外す）:
+
+```bash
+python drop_csv_column.py out              # out/ 内の全 CSV から t_ns 列を除去
+python drop_csv_column.py out --dry-run    # 何が変わるかの確認だけ（書き換えない）
+python drop_csv_column.py out --columns t_ns t_sec   # 複数列も可
+```
+
+対象列が無いファイルは自動でスキップされる（二重実行しても安全）。書き換えは
+一時ファイル経由で、途中失敗しても元ファイルは壊れない。
+⚠ GetDruidUser に取り込む CSV では t_ns が必須のため、取り込み用フォルダには使わない。
 
 ## GCS 課金とその節約
 

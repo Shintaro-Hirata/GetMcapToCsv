@@ -219,7 +219,7 @@ _PERSISTED_KEYS = (
     "w_lookback", "w_metaw", "w_extw",
     "cache_enable", "cache_dir", "cache_max_gb",
     "w_outfmt", "w_outdir", "w_merged",
-    "w_merged_mode", "w_merged_grid", "w_merged_hold", "w_split_min",
+    "w_merged_mode", "w_merged_grid", "w_merged_hold", "w_split_min", "w_no_tns",
     "csv_route", "csvvm_model", "csvvm_auth",
 )
 for _k in list(ss.keys()):
@@ -250,6 +250,7 @@ ss.setdefault("w_merged_mode", MERGED_MODE_OPTIONS[0])
 ss.setdefault("w_merged_grid", "100ms")
 ss.setdefault("w_merged_hold", 5.0)
 ss.setdefault("w_split_min", 0.0)
+ss.setdefault("w_no_tns", False)   # t_ns 列を出力しない (GetDruidUser 取り込みには必須のため既定オフ)
 ss.setdefault("col_renames", {})   # {"トピック\n列名": 出力名} CSV 列名の変更
 ss.setdefault("rename_ver", 0)     # 列名変更表を作り直すためのカウンタ
 ss.setdefault("batch_rows", [])    # バッチ実行の行 [{車両ID, 開始日時, 終了日時}]
@@ -415,6 +416,7 @@ def gather_settings():
             "merged_grid": g("w_merged_grid", "100ms"),
             "merged_hold": float(g("w_merged_hold", 5.0)),
             "split_minutes": float(g("w_split_min", 0.0)),
+            "drop_t_ns": bool(g("w_no_tns", False)),
             "route_vm": g("csv_route", CSV_ROUTE_OPTIONS[0]) == CSV_ROUTE_OPTIONS[0],
             "vm_model_b": str(g("csvvm_model", VM_MODEL_OPTIONS[0])).startswith("B"),
             "vm_auth": bool(g("csvvm_auth", True)),
@@ -506,6 +508,8 @@ def apply_settings(data, keep_period=False):
             ss["w_split_min"] = max(0.0, float(out["split_minutes"]))
     except (TypeError, ValueError):
         pass
+    if "drop_t_ns" in out:
+        ss["w_no_tns"] = bool(out["drop_t_ns"])
     if "route_vm" in out:
         ss["csv_route"] = CSV_ROUTE_OPTIONS[0 if out["route_vm"] else 1]
     if "vm_model_b" in out:
@@ -1201,8 +1205,9 @@ if ss.sources:
 
     # 分割出力: 長時間の抽出でも 1 ファイルが巨大にならないよう、書き出しを分数で刻む
     split_min = 0.0
+    drop_t_ns = False
     if out_format.startswith("CSV"):
-        spc1, _ = st.columns([1, 3])
+        spc1, spc2 = st.columns([1, 3])
         with spc1:
             split_min = float(st.number_input(
                 "⏳ 分割出力 (分, 0 = 分割なし)", min_value=0.0, step=10.0,
@@ -1211,6 +1216,14 @@ if ss.sources:
                      " 12:00-12:30, 12:30-13:00, ...)。mcap の読み込みは 1 回のままで、"
                      "書き出しだけを分割するので追加の課金・時間はほぼ無い。"
                      "各ファイルの t_sec はその区間の先頭からの経過秒になる。"))
+        with spc2:
+            st.write("")
+            drop_t_ns = st.checkbox(
+                "🧹 t_ns 列を出力しない（客先納品用）", key="w_no_tns",
+                help="時刻列のうち t_ns (epoch ナノ秒) を CSV から除きます"
+                     " (time_jst と t_sec は残ります)。"
+                     "⚠ GetDruidUser に取り込む CSV では t_ns が必須のため、"
+                     "その用途ではオフのままにしてください。")
 
     # --- CSV の抽出ルート (GCS のみ): この PC で直接 or GCP 内の VM 経由 ---
     # ここで決めた時間帯・トピック・カラムをそのまま VM に渡せるので、
@@ -1404,6 +1417,8 @@ if ss.sources:
         if split_min:
             ps += ["-SplitMinutes", f"{split_min:g}"]
             sh += ["--split-minutes", f"{split_min:g}"]
+        if drop_t_ns:
+            ps.append("-NoTNs"); sh.append("--no-t-ns")
 
     if st.button("🚀 ④ 抽出実行", type="primary", disabled=not can_run):
         print(f"[ui] 抽出開始: {out_format} / ファイル {len(selected_sources)} 件 / "
@@ -1568,11 +1583,11 @@ if ss.sources:
                             params.get("base_prefix", params["base"]),
                             params["start_ns"], params["end_ns"], split_min,
                             merged=merged_csv, merged_grid=merged_grid_sec,
-                            merged_hold=hold)
+                            merged_hold=hold, drop_t_ns=drop_t_ns)
                     return core.write_csvs(per_topic, topic_config, outdir,
                                            params["base"], merged=merged_csv,
                                            merged_grid=merged_grid_sec,
-                                           merged_hold=hold)
+                                           merged_hold=hold, drop_t_ns=drop_t_ns)
                 files, log = run_captured(run)
             elif out_format.startswith("mcap (時間帯"):
                 out_path = os.path.join(outdir, f"{params['base']}_cropped.mcap")
@@ -1823,12 +1838,13 @@ if ss.sources:
                                     return core.write_csvs_split(
                                         pt, topic_config, outdir, veh, s_ns, e_ns,
                                         split_min, merged=merged_csv,
-                                        merged_grid=merged_grid_sec, merged_hold=hold)
+                                        merged_grid=merged_grid_sec, merged_hold=hold,
+                                        drop_t_ns=drop_t_ns)
                                 return core.write_csvs(
                                     pt, topic_config, outdir,
                                     core.window_base(veh, s_ns, e_ns),
                                     merged=merged_csv, merged_grid=merged_grid_sec,
-                                    merged_hold=hold)
+                                    merged_hold=hold, drop_t_ns=drop_t_ns)
                             files_b, log2 = run_captured(run_one)
                             prog_b.progress(1.0, text=f"{label}: {len(files_b)} ファイル出力")
                             results.append((label, bool(files_b)))

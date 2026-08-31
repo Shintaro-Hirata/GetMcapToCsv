@@ -114,6 +114,11 @@ JIRA: [VT26-1412](https://t2auto.atlassian.net/browse/VT26-1412)（親・提供�
 
 **決定済みのフォーマット**: バッチ実行 + 10 分割 + 結合 CSV「時間軸をそろえる (10ms)」+
 列名変更（客先向け日本語名）。設定はユーザーの設定 JSON に保存済み。
+**t_ns 列は不要と確定** → 今後の出力は④の「t_ns 列を出力しない」（CLI: `--no-t-ns`）を
+オンにする（設定 JSON にも保存される）。出力済みの CSV 約 100 本は
+`python drop_csv_column.py out` で一括除去できる（`--dry-run` で事前確認可）。
+⚠ どちらも BS 納品用のみ。**GetDruidUser に取り込む CSV は t_ns 必須**
+（src/services/csv_periods.py が t_ns 無しをエラーにする）ため既定はオフのまま。
 
 **このセッションで確定した重要知見（列名変更の監修結果）**:
 - EBC2 の速度・response3 の車速は **[m/s] ではなく [km/h]**（ツールは値変換しない）
