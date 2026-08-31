@@ -430,17 +430,17 @@ def apply_settings(data, keep_period=False):
     検索結果に依存するため pending_* に積み、結果が揃った時点で名前を突き合わせて
     反映する。知らないキー・壊れた値は黙って読み飛ばし、適用できる分だけ適用する。
 
-    keep_period=True のときは取得日付・時刻をファイルから復元せず、①に入力済みの
-    値をそのまま使う (同じトピック構成で別の日を抽出する用途)。日付に紐づく
-    ②のファイル選択も候補が変わって突き合わせられないため復元しない。
+    keep_period=True のときは車両ID・取得日付・時刻をファイルから復元せず、①に
+    入力済みの値をそのまま使う (同じトピック構成で別の車両・別の日を抽出する用途)。
+    車両・日付に紐づく②のファイル選択も候補が変わって突き合わせられないため復元しない。
     """
     def put(key, value):
         if value is not None:
             ss[key] = value
 
     put("input_mode", INPUT_MODE_OPTIONS[0 if data.get("input_mode_gcs", True) else 1])
-    put("w_vehicle", data.get("vehicle"))
     if not keep_period:
+        put("w_vehicle", data.get("vehicle"))
         try:
             if data.get("date"):
                 ss["w_date"] = datetime.date.fromisoformat(str(data["date"]))
@@ -611,12 +611,13 @@ with st.expander("💾 設定の保存・読み込み（①〜⑤の条件・選
             st.caption("📄 " + settings_summary(load_data))
 
         keep_period = st.checkbox(
-            "📅 取得日付・時刻は読み込まない（①に入力した日付・時刻を使う）",
+            "📅 車両ID・取得日付・時刻は読み込まない（①に入力した値を使う）",
             value=True, key="settings_keep_period",
             help="オン: トピック・カラム・列名変更・出力設定などだけを復元し、"
-                 "取得日付・時刻は今の①の入力のまま使います（同じトピック構成で"
-                 "別の日・別の時間帯を抽出するとき向け。日付に紐づく②のファイル選択も"
-                 "復元しません）。オフ: 保存時の日付・時刻ごとそのまま復元します。")
+                 "車両ID・取得日付・時刻は今の①の入力のまま使います（同じトピック構成で"
+                 "別の車両・別の日・別の時間帯を抽出するとき向け。車両・日付に紐づく"
+                 "②のファイル選択も復元しません）。オフ: 保存時の車両ID・日付・時刻ごと"
+                 "そのまま復元します。")
         auto_run = st.checkbox(
             "⚡ 適用後に「候補ファイルを検索」「トピック一覧を取得」まで自動実行",
             value=True, key="settings_auto_run",
