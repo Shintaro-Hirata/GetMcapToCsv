@@ -250,6 +250,7 @@ ss.setdefault("w_merged_grid", "100ms")
 ss.setdefault("w_merged_hold", 5.0)
 ss.setdefault("w_split_min", 0.0)
 ss.setdefault("col_renames", {})   # {"トピック\n列名": 出力名} CSV 列名の変更
+ss.setdefault("rename_ver", 0)     # 列名変更表を作り直すためのカウンタ
 ss.setdefault("batch_rows", [])    # バッチ実行の行 [{車両ID, 開始日時, 終了日時}]
 ss.setdefault("batch_ver", 0)      # バッチ表を作り直すためのカウンタ
 
@@ -494,11 +495,13 @@ def apply_settings(data):
         if opts and isinstance(sel, list):
             ss[f"colsel_{t}"] = [c for c in sel if c in opts]
 
-    for t, m in (data.get("columns_renamed") or {}).items():
-        if isinstance(m, dict):
-            for c, v in m.items():
-                if v:
-                    ss["col_renames"][f"{t}\n{c}"] = str(v)
+    if data.get("columns_renamed"):
+        for t, m in data["columns_renamed"].items():
+            if isinstance(m, dict):
+                for c, v in m.items():
+                    if v:
+                        ss["col_renames"][f"{t}\n{c}"] = str(v)
+        ss.rename_ver += 1  # 列名変更表を作り直して読み込んだ出力名を反映
     if isinstance(data.get("batch_rows"), list):
         ss.batch_rows = [
             {k: str(r.get(k) or "") for k in ("車両ID", "開始日時", "終了日時")}
@@ -1006,10 +1009,20 @@ if ss.sources:
                                 "「出力名」列に入力（空欄なら元の列名のまま）。"
                                 "トピック別 CSV と結合 CSV(時間軸そろえ) のヘッダに反映され、"
                                 "設定 JSON にも保存されます。")
-                    ren_key = abs(hash(tuple(f"{r['トピック']}|{r['元の列名']}"
-                                             for r in ren_rows))) % 100000
+                    ren_key = (abs(hash(tuple(f"{r['トピック']}|{r['元の列名']}"
+                                              for r in ren_rows))) % 100000,
+                               ss.rename_ver)
+                    # 表の入力データは行構成 (ren_key) ごとに固定する。編集結果を
+                    # 毎ランで入力へ書き戻すと data_editor の編集状態と競合し、
+                    # 直前の編集が一度巻き戻って見える (2 回入力しないと反映されない)
+                    seed_key = f"rename_seed_{ren_key}"
+                    if seed_key not in ss:
+                        for k in [k for k in ss.keys()
+                                  if str(k).startswith("rename_seed_") and k != seed_key]:
+                            del ss[k]
+                        ss[seed_key] = pd.DataFrame(ren_rows)
                     edited_ren = st.data_editor(
-                        pd.DataFrame(ren_rows),
+                        ss[seed_key],
                         disabled=["トピック", "元の列名"],
                         hide_index=True, use_container_width=True,
                         height=min(400, 42 + 35 * len(ren_rows)),
@@ -1495,9 +1508,18 @@ if ss.sources:
             _seed_row = {"車両ID": (vehicle or "").strip().upper(),
                          "開始日時": f"{start_dt:%Y-%m-%d %H:%M:%S}",
                          "終了日時": f"{end_dt:%Y-%m-%d %H:%M:%S}"}
-            _batch_src = ss.batch_rows or [_seed_row]
+            # 表の入力データは世代 (batch_ver) ごとに固定する。編集結果 (batch_rows) を
+            # 毎ランで入力へ書き戻すと data_editor の編集状態と競合し、直前の編集が
+            # 一度巻き戻って見える (2 回入力しないと反映されない)
+            seed_key = f"batch_seed_{ss.batch_ver}"
+            if seed_key not in ss:
+                for k in [k for k in ss.keys()
+                          if str(k).startswith("batch_seed_") and k != seed_key]:
+                    del ss[k]
+                ss[seed_key] = pd.DataFrame(ss.batch_rows or [_seed_row],
+                                            columns=["車両ID", "開始日時", "終了日時"])
             edited_batch = st.data_editor(
-                pd.DataFrame(_batch_src, columns=["車両ID", "開始日時", "終了日時"]),
+                ss[seed_key],
                 num_rows="dynamic", hide_index=True, use_container_width=True,
                 key=f"batch_editor_{ss.batch_ver}",
                 column_config={
