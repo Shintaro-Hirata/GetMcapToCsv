@@ -69,6 +69,13 @@ $iapTag      = Cfg 'IAP_TAG' 'mcap-iap-ssh'
 # then deletes itself (--instance-termination-action=DELETE) so nothing keeps billing.
 # Just rerun on failure. Good fit for short Model-B jobs.
 $spot        = (Cfg 'SPOT' '0') -eq '1'
+# MAX_RUN_HOURS: GCP deletes the VM automatically once it has been RUNNING for
+# N hours (--max-run-duration; counted from the last start, reset by a stop).
+# Safety net for the case where a network drop / crash on the local PC
+# prevented the script-side cleanup, so billing cannot run forever.
+# Normal runs and batches finish within hours, hence default 12. 0 disables.
+# If the flag is rejected (old gcloud / org policy) we retry without the timer.
+$maxRunHours = Cfg 'MAX_RUN_HOURS' '12'
 
 $sshFlags = @()
 if ($cfg.ContainsKey('GCLOUD_SSH_FLAGS') -and $cfg['GCLOUD_SSH_FLAGS']) {
@@ -80,6 +87,12 @@ $metadata = 'enable-guest-attributes=TRUE'
 $netArgs = @()
 if ($spot) {
   $netArgs += @('--provisioning-model=SPOT', '--instance-termination-action=DELETE')
+}
+# Auto-delete timer; do not duplicate --instance-termination-action when SPOT set it.
+$limitArgs = @()
+if ($maxRunHours -ne '0') {
+  $limitArgs += "--max-run-duration=${maxRunHours}h"
+  if (-not $spot) { $limitArgs += '--instance-termination-action=DELETE' }
 }
 if ($private) {
   $metadata = 'enable-oslogin=TRUE,enable-guest-attributes=TRUE'
@@ -94,6 +107,9 @@ Write-Host "  zone    : $zone"
 Write-Host "  name    : $vm"
 Write-Host "  machine : $machineType / boot disk ${bootDiskGb}GB / $imageFamily"
 if ($spot) { Write-Host '  pricing : Spot (~1/3; may rarely be terminated mid-run, then auto-deletes)' }
+if ($maxRunHours -ne '0') {
+  Write-Host "  timer   : auto-delete after running $maxRunHours hours (safety net for network drops)"
+}
 Write-Host '  scope   : bucket read (devstorage.read_only)'
 if ($private) {
   Write-Host '  network : private (no external IP / IAP SSH / OS Login)'
@@ -150,7 +166,15 @@ $createArgs = @('compute', 'instances', 'create', $vm,
   "--boot-disk-size=${bootDiskGb}GB", '--boot-disk-type=pd-balanced',
   "--metadata=$metadata",
   '--scopes=https://www.googleapis.com/auth/devstorage.read_only') + $netArgs
-& gcloud @createArgs
+$createWithTimer = $createArgs + $limitArgs
+& gcloud @createWithTimer
+if ($LASTEXITCODE -ne 0 -and $limitArgs.Count -gt 0) {
+  # Old gcloud / org policy may reject --max-run-duration. The timer is only a
+  # safety net, so retry without it (script-side cleanup still deletes the VM).
+  Write-Warning 'Create with auto-delete timer failed; retrying without the timer.'
+  Write-Warning '(Update gcloud, or set MAX_RUN_HOURS=0 in gcp.env to skip this retry.)'
+  & gcloud @createArgs
+}
 if ($LASTEXITCODE -ne 0) { throw 'VM creation failed. Check the error above.' }
 
 # Python deps are installed by run_on_gcp.sh on first use (self-contained),

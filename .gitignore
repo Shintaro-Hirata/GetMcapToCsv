@@ -7,5 +7,7 @@ mcap_cache/
 *.mcap
 *.csv
 scripts/gcp.env
+# UI の「この PC に保存」した設定 JSON (ユーザーごとのローカルデータ)
+ui_settings/
 # 配布 zip 作成時に同梱する mcap-ros2idl-support のローカルコピー (リポジトリには含めない)
 /mcap-ros2idl-support/
