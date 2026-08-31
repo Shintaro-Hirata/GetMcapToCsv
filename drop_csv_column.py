@@ -25,6 +25,7 @@ import glob
 import os
 import sys
 import tempfile
+import time
 
 
 def iter_csv_paths(targets):
@@ -51,38 +52,56 @@ def iter_csv_paths(targets):
     return out
 
 
+def _replace_with_retry(tmp, path, attempts=5, wait_sec=0.5):
+    """tmp で path を置き換える。Windows ではウイルススキャンや OneDrive 同期が
+    書き終わった直後のファイルを一瞬つかむことがあるため、少し待って再試行する。"""
+    for i in range(attempts):
+        try:
+            os.replace(tmp, path)  # 同一フォルダ内なのでアトミックに置き換わる
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(wait_sec)
+
+
 def drop_columns(path, columns, dry_run):
     """1 つの CSV から指定列を除いて書き戻す。戻り値: 状態文字列。"""
     # utf-8-sig: BOM 付き (GetMcapToCsv の出力) も無しも読める。書き戻しは BOM 付きに統一
-    with open(path, "r", newline="", encoding="utf-8-sig") as f:
-        reader = csv.reader(f)
-        header = next(reader, None)
-        if header is None:
-            return "空ファイルのためスキップ"
-        hits = [i for i, name in enumerate(header) if name in columns]
-        if not hits:
-            return "対象列なし (変更不要)"
-        if dry_run:
-            return f"列 {', '.join(header[i] for i in hits)} を除去します (dry-run)"
-        keep = [i for i in range(len(header)) if i not in hits]
-        # 同じフォルダに一時ファイルを作って書き、最後に置き換える (途中失敗でも元は無傷)
-        fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".",
-                                   suffix=".tmp", dir=os.path.dirname(path) or ".")
-        try:
+    tmp = None
+    try:
+        with open(path, "r", newline="", encoding="utf-8-sig") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if header is None:
+                return "空ファイルのためスキップ"
+            hits = [i for i, name in enumerate(header) if name in columns]
+            if not hits:
+                return "対象列なし (変更不要)"
+            removed = ", ".join(header[i] for i in hits)
+            if dry_run:
+                return f"列 {removed} を除去します (dry-run)"
+            keep = [i for i in range(len(header)) if i not in hits]
+            # 同じフォルダに一時ファイルを作って書き、最後に置き換える (途中失敗でも元は無傷)
+            fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".",
+                                       suffix=".tmp", dir=os.path.dirname(path) or ".")
             with os.fdopen(fd, "w", newline="", encoding="utf-8-sig") as g:
                 writer = csv.writer(g)
                 writer.writerow([header[i] for i in keep])
                 for row in reader:
                     # 稀に列数が足りない行があっても落とさない (ある分だけ残す)
                     writer.writerow([row[i] for i in keep if i < len(row)])
-            os.replace(tmp, path)  # 同一フォルダ内なのでアトミックに置き換わる
-        except BaseException:
+        # 置き換えは元ファイルを閉じてから行う。Windows は開いているファイルを
+        # 置き換えられない (全ファイルが WinError 5 になる) ため、with の外に置く
+        _replace_with_retry(tmp, path)
+        tmp = None  # 置き換え成功 = 一時ファイルは消滅済み
+        return f"列 {removed} を除去しました"
+    finally:
+        if tmp is not None:
             try:
                 os.remove(tmp)
             except OSError:
                 pass
-            raise
-        return f"列 {', '.join(header[i] for i in hits)} を除去しました"
 
 
 def main():
@@ -113,9 +132,11 @@ def main():
         try:
             result = drop_columns(p, columns, args.dry_run)
         except OSError as e:
-            # Excel で開いたまま等 (Windows はロックで置き換えに失敗する)
+            # Windows でファイルがつかまれている場合など (Excel で開いたまま、
+            # OneDrive 同期中、読み取り専用属性)。リトライ済みでもダメなら報告する
             print(f"[warn] {os.path.basename(p)}: 書き換えできません ({e})。"
-                  "開いているアプリを閉じて再実行してください。")
+                  "開いているアプリを閉じる・OneDrive 同期を一時停止する・"
+                  "読み取り専用属性を外す、のいずれかを試して再実行してください。")
             n_failed += 1
             continue
         if "除去" in result:
