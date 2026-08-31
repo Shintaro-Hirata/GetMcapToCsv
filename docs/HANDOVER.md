@@ -19,11 +19,29 @@ GetDruidUser に取り込んで BigQuery 欠損の穴埋め・統計比較に使
 構成:
 - `get_mcap_to_csv.py` — CLI 本体（検索・時刻絞り込み・抽出・CSV/mcap 出力・見積もり・キャッシュ）
 - `app.py` — Streamlit UI（検索 → ファイル選択 → トピック/カラム選択 → 出力。
-  CSV は「この PC で直接」と「VM 経由（課金最小）」の 2 ルート。①〜④の条件・選択は
-  ページ上部から JSON で保存・復元できる。gcloud ログイン期限切れは実行前に検知して
-  再ログインを自動起動する = `ensure_gcloud_auth`）
+  CSV は「この PC で直接」と「VM 経由（課金最小）」の 2 ルート）
 - `scripts/` — GCP 内実行（VM）用。`.ps1`（Windows 用・**ASCII のみ**）と `.sh` の両方を常に同時整備
+- `docs/MANUAL.md` — 初見者向けの時系列マニュアル（社内配布用の一次資料）
 - `docs/GCP_EXECUTION.md` — VM 運用の完全な手順書（コスト表・トラブルシュート込み）
+
+主な機能（実装済み。使い方は MANUAL.md）:
+- **設定の保存・読み込み**: ①〜④の全条件（検索・ファイル/トピック/カラム選択・列名変更・
+  バッチ行・出力設定）を JSON 1 ファイルで保存/復元
+- **開始・終了日付の分離**（日跨ぎ抽出）、**分割出力**（`--split-minutes`）、
+  **結合 CSV の時間軸そろえ**（`--merged-grid`/`--merged-hold`、前値ホールド）
+- **列名変更**（topics JSON の `rename`。客先向け出力名）
+- **バッチ実行**（⑤: 車両×期間の表を上から順に実行。VM は 1 台使い回し、2 件目以降は
+  ツール転送スキップ）
+- **VM ライフサイクル自動化**: 実行時に VM の実在を確認し、無ければ作成・B なら終了時に
+  必ず削除（維持費ゼロ保証）・A なら停止。gcloud ログイン期限切れは実行前検知して
+  再ログインを自動起動（`ensure_gcloud_auth`）
+- **高速化一式**: 抽出並列 vCPU-1（上限 32、ディスク空きで自動制限）、1GB 以上は
+  ディスクを経由せずストリーミング読み、選択トピック 0 件ファイルのスキップ、
+  develop と二重記録の sensor をサマリ判定で読む前にスキップ、検索の時刻メタデータ
+  ローカルキャッシュ（`mcap_cache/time_ranges.json`）、トピック一覧はセッション×種別の
+  代表ファイルのみ読む（トピックごとの実体所在 = 「記録元」列も表示）
+- **二重記録の解決**: 同一トピックが develop/sensor 両方にあり時間帯が重なる場合、
+  行数の多い側のストリームだけ採用（`_resolve_duplicate_recordings`）
 
 ## 2. コストの考え方（結論のみ）
 
@@ -43,6 +61,14 @@ GetDruidUser に取り込んで BigQuery 欠損の穴埋め・統計比較に使
 - **ディレクトリ名の日付は運行「終了」日**。検索は開始日〜終了日+1日を見る。
 - develop / sensor / image は同時刻で連番分割された兄弟ファイル。**入っているトピックが違う**
   （例: eps001 系は sensor 側。develop にはトピック名だけ登録され中身が無いことがある）。
+- **同じトピックが develop と sensor の両方に「実体入りで」二重記録されている場合がある**
+  （例: /t2/main_mabx/eps002。車両・日によって片側だけのこともある）。記録プロセスが
+  別なので同じメッセージでも t_ns (受信時刻) が µs 単位でずれる → メッセージ単位の
+  重複除去は効かず、ストリーム単位で解決する（実装済み）。
+- **/t2/main_mabx/* (J1939 CAN) の単位は要注意**: EBC2 の速度・response3 の
+  wheel_based_vehicle_speed は **km/h**（コード根拠: Yatagarasu の
+  `odometry_data.hpp` / `control_component.cpp` に `/3.6 // Convert to m/s`）。
+  EBC2 の `relative_speed_*` は**前軸速度との差分**であり絶対輪速ではない。
 - エンコード: /t2/* は ros2idl、/t2/main_mabx/* と /t2/control/demand* は **apex_json**、
   /events/* は ros2msg、/apollo/* は protobuf。apex_json は
   **新しめの mcap-ros2idl-support（zero-plotter リポジトリ内）でないとデコードできない**。
@@ -62,8 +88,41 @@ GetDruidUser に取り込んで BigQuery 欠損の穴埋め・統計比較に使
 | 適用したのに 0 行・時刻不一致系 | BigQuery/pandas の **datetime64[us] と [ns] の混在**。`dt.as_unit("ns")` で必ず ns に揃える |
 | Spot 中断 | `Remote side unexpectedly closed` → 再実行するだけ。UI が案内を出す |
 | VM 作成が `Reauthentication failed. cannot prompt during non-interactive execution` | gcloud ログインの期限切れ（組織のセッションポリシー）。UI 経由だと端末が無く再認証プロンプトを出せない → app.py の `ensure_gcloud_auth` が実行前にトークンの生死を確認し、切れていれば新しいコンソールで `gcloud auth login` を自動起動して完了を待つ（CLI 認証と ADC は別々に期限が切れる点に注意） |
+| VM 作成が `already exists` | UI 再起動で VM 運用ラジオが既定 (B) に戻り、既存 VM と衝突していた → UI は実行時に VM の実在を確認して動作を実態に合わせる（B は既存 VM でも終了時に削除 = 維持費ゼロの約束を守る）。gcp_create_vm も存在時は対処コマンドを表示 |
+| 存在チェックの gcloud describe でスクリプトが即死 | 「見つからない」は正常応答なのに、PS5.1 の EAP=Stop が gcloud の stderr で例外化 → probe の前後だけ 'Continue' + `$LASTEXITCODE` 判定（上の SSH 待ちと同じ罠） |
+| 高並列で `[Errno 28] No space left on device` が連鎖 | 並列数ぶんの一時ファイルがブートディスクを溢れさせた → 空き容量から並列を自動制限。読めなかったファイルがあれば末尾に目立つ警告（CSV 不完全の可能性） |
+| sensor 込みで DL が 8MB/s に崩壊 | ネットワークではなく **e2 の永続ディスク書込上限 (~240MB/s)** に 31 並列が詰まっていた → 1GB 以上はディスクに落とさずストリーミング読み（ログの「DL x 秒 + 解析 y 秒」内訳で切り分け可能） |
+| eps002 の CSV が 2 倍の行数 | develop/sensor の二重記録。t_ns がズレるため完全一致の重複除去では防げない → ストリーム単位で行数の多い側だけ採用（時間帯が重ならない部分は残す）。さらに読む前のサマリ判定で二重記録側のファイル自体をスキップ |
+| data_editor の編集が 1 回巻き戻る（2 回入力しないと反映されない） | 編集結果を毎ランで表の入力データに書き戻していたため、widget の編集状態と入力が競合 → 入力データは世代 (batch_ver / rename_ver) ごとに固定し、編集結果は状態にだけ蓄積する |
 
-## 5. 未了事項・次のタスク候補
+## 5. 進行中の案件: ブリヂストン (BS) 走行データ提供【最優先の継続作業】
+
+JIRA: [VT26-1412](https://t2auto.atlassian.net/browse/VT26-1412)（親・提供依頼 8 項目のトピック一覧あり）
+/ [VT26-1413](https://t2auto.atlassian.net/browse/VT26-1413)（CSV フォーマット決定）。
+依頼者: fujimaki さん（性能開発部）。上長: someya さん。
+
+**決定済みのフォーマット**: バッチ実行 + 10 分割 + 結合 CSV「時間軸をそろえる (10ms)」+
+列名変更（客先向け日本語名）。設定はユーザーの設定 JSON に保存済み。
+
+**このセッションで確定した重要知見（列名変更の監修結果）**:
+- EBC2 の速度・response3 の車速は **[m/s] ではなく [km/h]**（ツールは値変換しない）
+- `relative_speed_*` は「前輪速度」ではなく**前軸速度との相対速度（差分）**。
+  `rear_axle1` は第 1 後軸の意味
+- `str_angle` の正字は「ハンドル**舵**角」（蛇角は誤字）。rad かどうかは実データで
+  要確認（直進 ≈0、旋回で ±1 超なら rad）
+- `system_state` は整数 enum → **凡例が必須**。State.idl の定義順で
+  0=Terminated … 6=Ready … 16=AutonomousDriving（自動運転中）… 17=ADHandoffToDriver
+- 位置 3 トピックの採否（提案済み・ユーザー採用）: `localization_compositor/pose` を
+  **追加採用**（position.x/y = 地図原点基準の東/北[m]・基準点は後軸中心、heading は
+  東=0 の rad。緯度経度ではない点を凡例に明記）。`main_mabx/location_data`
+  （緯度経度 10Hz）は継続。`positioning_driver/inspvas` は位置としては見送り、
+  **roll/pitch[deg] が欲しいか BS に確認して要るときだけ** debug.poslv_roll/pitch を採用
+
+**残タスク**: ①単位を修正した列名で 1 往復分（8/17-18）を再出力（STEP2）
+②AD Status 凡例シート・座標系注記の作成 ③信号の図示による妥当性確認（fujimaki さん依頼。
+CSV を受け取ってプロット作成を手伝う約束あり） ④STEP3: 8 月末 内容確認 & 提供
+
+## 6. 未了事項・次のタスク候補
 
 1. **専用 GCP プロジェクト**: 現在は t2-integration に相乗り。分離したいが、プロジェクト作成は
    組織権限が必要なため **GCP 管理者への依頼待ち**（手順は GCP_EXECUTION.md「専用プロジェクト」節）。
@@ -80,7 +139,7 @@ GetDruidUser に取り込んで BigQuery 欠損の穴埋め・統計比較に使
 4. UI 実行中の操作でストリーム処理が中断されるのは Streamlit の仕様（注意書きで対応済み。
    根本対応するなら subprocess をバックグラウンド化して進捗をポーリングする作りに変える）。
 
-## 6. ローカル環境（git 外）に依存するもの
+## 7. ローカル環境（git 外）に依存するもの
 
 プラン移行ではリポジトリと下記ローカル要素があれば継続できる（PC 側に残るため作業不要）:
 - `scripts/gcp.env`（gitignore 済み。GCP_PROJECT=t2-integration / ZONE=asia-northeast1-a /
@@ -88,14 +147,24 @@ GetDruidUser に取り込んで BigQuery 欠損の穴埋め・統計比較に使
 - gcloud CLI 認証と ADC（`gcloud auth application-default login` 済み）
 - zero-plotter クローン（`git clone -b yatagarasu/main`。**apex_json 対応のため要 git pull 維持**）
 
-## 7. 動作確認の方法
+## 8. 動作確認の方法
 
 - 構文: `python -m py_compile app.py get_mcap_to_csv.py` / `bash -n scripts/*.sh`
 - .ps1 が ASCII のみか: `grep -P '[^\x00-\x7F]' scripts/*.ps1`（何も出なければ OK）
 - 実機確認: UI で短い時間帯（1〜2 分）を VM 経由で抽出（1 回 ¥10 未満）
 
-## 8. 新セッションの始め方（例）
+## 9. 動作確認の方法（追加分）
 
-> GetMcapToCsv と GetDruidUser を扱います。まず両リポジトリの docs/ にある
-> HANDOVER/HANDOFF ドキュメントを読んで文脈を把握してください。
-> どちらも main が本流です（作業はブランチを切って PR で main へ）。
+- UI の回帰は Streamlit AppTest で確認できる（セッション状態を直接セットして
+  `at.run()`、`at.exception` が空であること。AppTest の session_state は
+  **反復非対応**なので `for k in at.session_state` は書かない）
+- 抽出コアのロジック（ストリーム解決・スキップ判定・分割・rename）は
+  合成 mcap / 合成行データの単体テストで確認した実績あり（このリポジトリには
+  テストを常設していないため、変更時はその場で書いて流す）
+
+## 10. 新セッションの始め方（例）
+
+> GetMcapToCsv と GetDruidUser を扱います。まず GetMcapToCsv の docs/HANDOVER.md を
+> 読んで文脈を把握してください（BS データ提供案件の続きは HANDOVER の 5 章）。
+> main が本流で、作業はブランチを切って PR で main へ。ユーザーが PR をマージするので
+> マージ済みなら次の作業はブランチを main から切り直すこと。
