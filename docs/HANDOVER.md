@@ -134,6 +134,22 @@ JIRA: [VT26-1412](https://t2auto.atlassian.net/browse/VT26-1412)（親・提供�
   （緯度経度 10Hz）は継続。`positioning_driver/inspvas` は位置としては見送り、
   **roll/pitch[deg] が欲しいか BS に確認して要るときだけ** debug.poslv_roll/pitch を採用
 
+**座標系・正負の凡例（fujimaki さん要望・Yatagarasu コード根拠で確定）**:
+- 車両座標系 (odometry local) = **x前/y左/z上の右手系**（EgoPose.idl、
+  lateral_g_monitor の v×ヨーレート整合で確認）。ヨーレート＋＝左旋回、
+  ロールレート＋＝右下がり、**ピッチレート＋＝前下がり**（FLU 右手系の帰結）
+- localization pose = 地図原点基準 ENU（PointENU.idl）。**z は WGS-84 楕円体高**
+  （標高ではない）。heading は東=0・反時計回り正（Pose.idl）。基準点は後軸中心
+- lateral_error ＋＝経路の左側、heading_error ＋＝経路方位より左向き
+  （mpc_controller_initial_state.cpp: 基準点座標系の y / SO2 log）
+- str_angle ＋＝左切り（ControlCommand.idl「Left direction: positive」、
+  bicycle.hpp「left is positive」。eps/response3 系は符号反転なしで control へ）
+- relative_speed_* ＝ 当該車輪速−前軸速度（odometry_data.hpp: wheel = front + relative）。
+  front_axle_speed / wheel_based_vehicle_speed は J1939 のため**常に 0 以上**（後退でも正）
+- poslv_roll ＋＝右下がり、**poslv_pitch ＋＝前上がり**（novatel_mapper.cpp の回転合成:
+  IMU 座標は右/前/上。odometry のピッチレートと正負が逆な点に注意）。
+  ※ mapper に回転順の TODO コメントがあるため、納品前に坂・カーブで符号の実測確認を推奨
+
 **残タスク**: ①単位を修正した列名で 1 往復分（8/17-18）を再出力（STEP2）
 ②AD Status 凡例シート・座標系注記の作成 ③信号の図示による妥当性確認（fujimaki さん依頼。
 CSV を受け取ってプロット作成を手伝う約束あり） ④STEP3: 8 月末 内容確認 & 提供
