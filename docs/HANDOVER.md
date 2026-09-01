@@ -138,8 +138,13 @@ JIRA: [VT26-1412](https://t2auto.atlassian.net/browse/VT26-1412)（親・提供�
 - 車両座標系 (odometry local) = **x前/y左/z上の右手系**（EgoPose.idl、
   lateral_g_monitor の v×ヨーレート整合で確認）。ヨーレート＋＝左旋回、
   ロールレート＋＝右下がり、**ピッチレート＋＝前下がり**（FLU 右手系の帰結）
-- localization pose = 地図原点基準 ENU（PointENU.idl）。**z は WGS-84 楕円体高**
-  （標高ではない）。heading は東=0・反時計回り正（Pose.idl）。基準点は後軸中心
+- localization pose = 地図座標系 ENU（PointENU.idl）。実体は **UTM ゾーン 54N**
+  （localization_util.cpp: proj=utm zone=54, WGS84。「TTM = Taas Transverse Mercator」）。
+  つまり x=UTM easting（中央子午線 東経141°が x=500,000m）、y=UTM northing
+  （赤道から北への距離 m）。関東なら x≈40万・y≈390万 のオーダー。
+  **z は WGS-84 楕円体高**（標高ではない。厳密には楕円体高×UTMスケール係数≈0.9996〜）。
+  heading は東=0・反時計回り正（Pose.idl）。基準点は後軸中心。
+  座標差から距離を出す場合は UTM スケール係数分（~0.04%）の縮尺誤差がある点に注意
 - lateral_error ＋＝経路の左側、heading_error ＋＝経路方位より左向き
   （mpc_controller_initial_state.cpp: 基準点座標系の y / SO2 log）
 - str_angle ＋＝左切り（ControlCommand.idl「Left direction: positive」、
