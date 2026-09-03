@@ -29,11 +29,15 @@ import pandas as pd
 import streamlit as st
 
 import get_mcap_to_csv as core  # find_gcs_sources, collect_topics, extract_rows, write_csvs, save_mcap_slice, download_raw_mcaps
+import vm_job  # start_job, load_job, tail_job, read_log, clear_job (VM 抽出のUI非依存実行)
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PRESET_FILE = os.path.join(APP_DIR, "mcap_presets.json")
 SCRIPTS_DIR = os.path.join(APP_DIR, "scripts")
 SETTINGS_DIR = os.path.join(APP_DIR, "ui_settings")  # 「この PC に保存」した設定 JSON の置き場
+# 検索・抽出のたびに全条件を自動保存するファイル。タブのスリープや再読み込みで
+# Streamlit のセッションが失われ画面が初期状態に戻っても、ここから復元できる
+AUTOSAVE_FILE = os.path.join(SETTINGS_DIR, "_autosave.json")
 
 # 選択肢ラベルの定数。設定 JSON にはラベル文字列ではなく bool / index で保存し、
 # 読み込み時にここへ引き当てるので、文言を変えても古い設定ファイルが壊れない。
@@ -110,17 +114,39 @@ def _vm_script_cmd(script_base, ps_args, sh_args):
 def run_script_streaming(cmd, log_area):
     """スクリプト (リスト) またはシェルコマンド (文字列) を実行し、出力を逐次
     log_area に流す。戻り値: (returncode, 全出力)。文字列はシェル経由で実行する
-    (Windows で gcloud.cmd を解決するため)。"""
+    (Windows で gcloud.cmd を解決するため)。
+
+    画面更新は 0.3 秒ごとに間引く。1 行ごとに更新すると、行数の多い実行で
+    WebSocket 転送とブラウザ描画が膨らみ、タブが重くなる/休止されやすくなるため。
+    """
     proc = subprocess.Popen(
         cmd, cwd=APP_DIR, shell=isinstance(cmd, str),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, encoding="utf-8", errors="replace")
     lines = []
+    last_ui = 0.0
     for line in iter(proc.stdout.readline, ""):
         lines.append(line.rstrip("\n"))
-        log_area.code("\n".join(lines[-500:]))
+        now = time.monotonic()
+        if now - last_ui >= 0.3:
+            log_area.code("\n".join(lines[-500:]))
+            last_ui = now
     proc.wait()
+    log_area.code("\n".join(lines[-500:]))
     return proc.returncode, "\n".join(lines)
+
+
+def run_vm_job(cmd, outdir, label, log_area):
+    """VM 抽出コマンドを UI から独立したプロセスとして実行し、終了まで追跡する。
+
+    Streamlit のセッションはタブのスリープ・再読み込み・PC スリープで失われ、
+    画面が初期状態に戻る。その場合でもこの方式ならジョブ本体は走り続け、
+    復帰後に「未回収の VM ジョブ」から再接続してログ・結果を回収できる。
+    戻り値: (returncode, 全ログ)。
+    """
+    vm_job.start_job(cmd, outdir, label, cwd=APP_DIR)
+    return vm_job.tail_job(
+        outdir, lambda text: log_area.code(text[-40000:] or "(起動中...)"))
 
 
 def gcloud_token_ok(adc=False):
@@ -278,11 +304,15 @@ def load_presets():
 
 
 def list_saved_settings():
-    """ui_settings/ に保存済みの設定 JSON のパス一覧 (新しい順)。"""
+    """ui_settings/ に保存済みの設定 JSON のパス一覧 (新しい順)。
+
+    "_" 始まりは自動保存などの内部ファイルのため一覧から除く。
+    """
     try:
         files = glob.glob(os.path.join(SETTINGS_DIR, "*.json"))
     except OSError:
         return []
+    files = [p for p in files if not os.path.basename(p).startswith("_")]
     return sorted(files, key=os.path.getmtime, reverse=True)
 
 
@@ -422,6 +452,20 @@ def gather_settings():
             "vm_auth": bool(g("csvvm_auth", True)),
         },
     }
+
+
+def autosave_settings():
+    """現在の全条件を自動保存する (検索・抽出・バッチの実行ボタンのたびに呼ぶ)。
+
+    タブのスリープ・再読み込み・PC スリープで Streamlit のセッションが失われて
+    画面が初期状態に戻っても、ここから条件を復元できるようにする。
+    """
+    try:
+        os.makedirs(SETTINGS_DIR, exist_ok=True)
+        with open(AUTOSAVE_FILE, "w", encoding="utf-8") as f:
+            json.dump(gather_settings(), f, ensure_ascii=False, indent=1)
+    except OSError:
+        pass  # 自動保存の失敗で本来の処理は止めない
 
 
 def apply_settings(data, keep_period=False):
@@ -649,6 +693,85 @@ with st.expander("💾 設定の保存・読み込み（①〜⑤の条件・選
                     st.error(f"削除できませんでした: {e}")
 
 # ==================================================================
+# セッション消失からの復帰
+# タブのスリープ/再読み込み/PC スリープで Streamlit のセッション (画面の状態)
+# が失われると、画面が初期状態に戻る。条件は自動保存から復元でき、VM 抽出
+# ジョブは別プロセスで走り続けているので、ここから再接続して回収する。
+# ==================================================================
+if (ss.sources is None and not ss.get("autosave_handled")
+        and os.path.exists(AUTOSAVE_FILE)):
+    _autosave = None
+    try:
+        with open(AUTOSAVE_FILE, encoding="utf-8") as f:
+            _autosave = json.load(f)
+    except (OSError, ValueError):
+        pass
+    if _autosave:
+        with st.container(border=True):
+            st.markdown("♻ **前回の条件の自動保存があります** — "
+                        + settings_summary(_autosave))
+            st.caption("タブの再読み込みや PC スリープで画面が初期状態に戻っても、"
+                       "最後に検索・抽出したときの条件をここから復元できます。")
+            rc1, rc2, _ = st.columns([2, 1, 3])
+            with rc1:
+                if st.button("♻ この条件を復元（検索〜トピック一覧まで自動実行）",
+                             key="autosave_restore", type="primary"):
+                    apply_settings(_autosave, keep_period=False)
+                    ss.auto_search = True
+                    ss.autosave_handled = True
+            with rc2:
+                if st.button("閉じる", key="autosave_dismiss"):
+                    ss.autosave_handled = True
+                    st.rerun()
+
+_job_outdir = ss.get("w_outdir", os.path.abspath("out"))
+_job = vm_job.load_job(_job_outdir)
+if _job and not ss.get("vm_job_handled"):
+    with st.container(border=True):
+        if not _job.get("finished"):
+            st.markdown("⏳ **未回収の VM 抽出ジョブがあります**"
+                        f"（開始: {_job.get('started_at', '?')}）")
+            st.caption("画面が初期状態に戻っても、抽出ジョブは別プロセスで動き続けて"
+                       "います（VM も動いたまま）。再接続するとログの続きを表示し、"
+                       "完了まで待って結果を回収します。")
+        else:
+            st.markdown("📦 **前回の VM 抽出ジョブは終了しています**"
+                        f"（exit {_job.get('exit_code')}、開始: {_job.get('started_at', '?')}）")
+            st.caption(f"出力フォルダを確認してください: {_job_outdir}　"
+                       "（ログは下のボタンで表示できます）")
+        jc1, jc2, _ = st.columns([2, 1, 2])
+        with jc1:
+            if st.button("📡 ジョブに再接続してログ・結果を回収",
+                         key="vm_job_attach", type="primary"):
+                with st.expander("VM 抽出ログ（再接続）", expanded=True):
+                    _area = st.empty()
+                rc_job, _ = vm_job.tail_job(
+                    _job_outdir,
+                    lambda t: _area.code(t[-40000:] or "(ログ待ち...)"))
+                ss.vm_job_handled = True
+                if rc_job == 0:
+                    names = []
+                    try:
+                        with open(os.path.join(_job_outdir, "_last_run.txt"),
+                                  encoding="utf-8-sig") as mf:
+                            names = [ln.strip() for ln in mf if ln.strip()]
+                    except OSError:
+                        pass
+                    vm_job.clear_job(_job_outdir)
+                    st.success(f"ジョブは正常に完了しました。CSV {len(names)} 件を "
+                               f"{_job_outdir} に取得済みです。")
+                    for n in names[:200]:
+                        st.write(f"- `{n}`")
+                else:
+                    st.error("ジョブは失敗して終了しています。上のログを確認してください"
+                             "（Spot 中断などは①〜④の条件のまま再実行すれば回復します）。")
+        with jc2:
+            if st.button("🗑 この表示を消す（記録を破棄）", key="vm_job_discard"):
+                vm_job.clear_job(_job_outdir)
+                ss.vm_job_handled = True
+                st.rerun()
+
+# ==================================================================
 # ① 検索条件
 # ==================================================================
 st.header("① 検索条件")
@@ -788,6 +911,7 @@ if st.button(_btn_label, type="primary",
     # クリックがサーバーへ届いているか (WebSocket 断か処理側の問題か) を切り分ける。
     print(f"[ui] 検索開始: vehicle={vehicle!r} "
           f"{start_dt:%Y-%m-%d %H:%M:%S} - {end_dt:%Y-%m-%d %H:%M:%S} (JST)", flush=True)
+    autosave_settings()  # セッションが失われても条件を復元できるようにする
     ss.sources = None
     ss.topics_info = None
     ss.result_files = None
@@ -1423,6 +1547,7 @@ if ss.sources:
     if st.button("🚀 ④ 抽出実行", type="primary", disabled=not can_run):
         print(f"[ui] 抽出開始: {out_format} / ファイル {len(selected_sources)} 件 / "
               f"トピック {len(selected_topics)} 件", flush=True)
+        autosave_settings()  # セッションが失われても条件を復元できるようにする
         params = ss.search_params
         os.makedirs(outdir, exist_ok=True)
 
@@ -1493,11 +1618,16 @@ if ss.sources:
                 if not ok:
                     st.error("VM 作成に失敗しました。上の「① VM 作成ログ」を確認してください。")
             if ok:
-                st.info("② VM で抽出し、CSV を回収します...")
+                st.info("② VM で抽出し、CSV を回収します...（この間に画面が初期状態に"
+                        "戻ってしまっても、ジョブは動き続けます。ページ上部の"
+                        "「未回収の VM 抽出ジョブ」から再接続してください）")
                 with st.expander("② 抽出・CSV 回収ログ（クリックで開閉）", expanded=True):
                     fetch_log = st.empty()
-                rc, fetch_out = run_script_streaming(_vm_script_cmd("gcp_fetch", ps, sh), fetch_log)
+                rc, fetch_out = run_vm_job(
+                    _vm_script_cmd("gcp_fetch", ps, sh), outdir,
+                    f"{vehicle} {s_str} 〜 {e_str}", fetch_log)
                 if rc == 0:
+                    vm_job.clear_job(outdir)  # 回収済み。次回起動時の再接続表示を出さない
                     # gcp_fetch が書き出す「このランで生成した分」だけを表示する
                     # (出力フォルダに残る過去ランの CSV と混同しないため)
                     manifest = os.path.join(outdir, "_last_run.txt")
@@ -1731,6 +1861,7 @@ if ss.sources:
             if st.button(f"🌙 バッチ実行 ({len(batch_jobs)} 件, {route_note})",
                          disabled=not batch_jobs, key="batch_run"):
                 print(f"[ui] バッチ開始: {len(batch_jobs)} 件", flush=True)
+                autosave_settings()  # セッションが失われても条件を復元できるようにする
                 if csv_route_vm and not ensure_gcloud_auth(
                         st.empty(), need_adc=st.session_state.get("csvvm_auth", True)):
                     st.stop()
