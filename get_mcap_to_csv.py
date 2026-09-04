@@ -47,8 +47,8 @@ import tempfile
 import time
 import threading
 from collections import OrderedDict, defaultdict
-from concurrent.futures import (ProcessPoolExecutor, ThreadPoolExecutor,
-                                as_completed, wait)
+from concurrent.futures import (FIRST_COMPLETED, ProcessPoolExecutor,
+                                ThreadPoolExecutor, as_completed, wait)
 from fnmatch import fnmatch
 
 from mcap.reader import make_reader  # make_reader
@@ -989,8 +989,17 @@ def _skip_redundant_recordings(jobs, topic_config, start_ns, end_ns, workers=16)
         return (j, _record_kind(j["name"]),
                 _probe_topic_coverage(client, j, topics, start_ns, end_ns))
 
+    # 件数が多い (8 時間分で数百件) とここで数分かかるため、進捗を出す
+    print(f"[info] 二重記録の事前判定: {len(gcs)} ファイルのサマリを確認中 "
+          f"(並列 {max(1, workers)})...")
+    probed = []
+    t_tick = time.monotonic()
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        probed = list(pool.map(probe, gcs))
+        for res in pool.map(probe, gcs):
+            probed.append(res)
+            if time.monotonic() - t_tick >= 15:
+                print(f"[info]   事前判定 {len(probed)}/{len(gcs)} 件...")
+                t_tick = time.monotonic()
     skips = _choose_redundant_skips(probed, start_ns, end_ns)
     if skips:
         total = sum(j.get("size") or 0 for j in jobs if j["name"] in skips)
@@ -1251,8 +1260,9 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
         # DL と解析の内訳を出す (どちらがボトルネックかをログから判断できるように)
         timing = (f"DL {dl_sec:.1f} 秒 + 解析 {sec - dl_sec:.1f} 秒"
                   if dl_sec > 0 else f"{sec:.1f} 秒")
-        print(f"[info]   {name.rsplit('/', 1)[-1]}: {count} 行 ({timing}){src_note}")
         n_done[0] += 1
+        print(f"[info]   ({n_done[0]}/{len(jobs)}) {name.rsplit('/', 1)[-1]}: "
+              f"{count} 行 ({timing}){src_note}")
         if progress:
             progress(n_done[0], len(jobs), name)
 
@@ -1266,12 +1276,23 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
         try:
             with ProcessPoolExecutor(max_workers=workers) as pool:
                 futures = {pool.submit(_extract_worker, job): job for job in jobs}
-                for fut in as_completed(futures):
-                    try:
-                        merge(fut.result())
-                    except Exception as e:
-                        n_read_fail += 1
-                        print(f"[warn] 読み込み失敗 ({futures[fut]['name']}): {e}")
+                pending = set(futures)
+                t_start = time.monotonic()
+                while pending:
+                    done, pending = wait(pending, timeout=60,
+                                         return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        try:
+                            merge(fut.result())
+                        except Exception as e:
+                            n_read_fail += 1
+                            print(f"[warn] 読み込み失敗 ({futures[fut]['name']}): {e}")
+                    if not done and pending:
+                        # 大きいファイルばかりだと完了イベントが数分空くため、
+                        # 止まっていないことが分かるように生存ログを出す
+                        print(f"[info]   処理中... 完了 {n_done[0]}/{len(jobs)} 件, "
+                              f"実行中 {min(workers, len(pending))} 件 "
+                              f"(経過 {(time.monotonic() - t_start) / 60:.0f} 分)")
         except (OSError, RuntimeError) as e:  # プロセス起動に失敗したら直列で実行
             print(f"[warn] 並列実行に失敗したため直列で処理します: {e}")
             for job in jobs:
@@ -1280,6 +1301,10 @@ def extract_rows(sources, topic_config, start_ns, end_ns, exclude_pats=None,
                 except Exception as e2:
                     n_read_fail += 1
                     print(f"[warn] 読み込み失敗 ({job['name']}): {e2}")
+
+    # 読み込み後の集計 (長時間分だと行数が多く数分かかることがあるため区切りを出す)
+    print(f"[info] 全 {len(jobs)} ファイルの読み込みが完了。"
+          "二重記録の解決と重複除去中...")
 
     # 同じトピックが develop/sensor の両方に記録されている場合は片側だけ採用する
     for t, kinds in by_kind.items():
@@ -1330,7 +1355,8 @@ def window_base(prefix, ws_ns, we_ns):
 
 
 def write_csvs_split(per_topic, topic_config, outdir, base_prefix, start_ns, end_ns,
-                     split_minutes, merged=True, merged_grid=None, merged_hold=5.0):
+                     split_minutes, merged=True, merged_grid=None, merged_hold=5.0,
+                     drop_t_ns=False):
     """指定期間を split_minutes 分ごとの区間に刻み、区間ごとに CSV 一式を書き出す。
 
     長時間の抽出 (特に結合 CSV) は 1 ファイルが巨大になるため、抽出済みデータを
@@ -1346,6 +1372,7 @@ def write_csvs_split(per_topic, topic_config, outdir, base_prefix, start_ns, end
     s_ns = start_ns if start_ns is not None else min(all_t)
     e_ns = end_ns if end_ns is not None else max(all_t) + 1
     step_ns = max(int(split_minutes * 60 * 1e9), 1)
+    print(f"[info] 分割出力を開始: {split_minutes:g} 分刻みで区間ごとに書き出します...")
     written = []
     n_win = 0
     ws = s_ns
@@ -1357,7 +1384,8 @@ def write_csvs_split(per_topic, topic_config, outdir, base_prefix, start_ns, end
             n_win += 1
             written += write_csvs(sub, topic_config, outdir,
                                   window_base(base_prefix, ws, we), merged=merged,
-                                  merged_grid=merged_grid, merged_hold=merged_hold)
+                                  merged_grid=merged_grid, merged_hold=merged_hold,
+                                  drop_t_ns=drop_t_ns)
         ws = we
     print(f"[info] 分割出力: {split_minutes:g} 分 × {n_win} 区間 "
           f"(データの無い区間はスキップ)")
@@ -1372,7 +1400,8 @@ def _grid_label(grid_sec):
     return f"{grid_sec:g}s"
 
 
-def write_merged_grid_csv(per_topic, topic_config, outdir, base, grid_sec, hold_sec):
+def write_merged_grid_csv(per_topic, topic_config, outdir, base, grid_sec, hold_sec,
+                          drop_t_ns=False):
     """全トピックを一定周期の共通時間軸に揃えた結合 CSV を 1 本書き出す。
 
     周波数が異なるトピックをそのまま時刻順に並べると他トピックの列が歯抜けになり
@@ -1386,6 +1415,10 @@ def write_merged_grid_csv(per_topic, topic_config, outdir, base, grid_sec, hold_
     all_t = [r["t_ns"] for rows in per_topic.values() for r in rows]
     if not all_t:
         return []
+    n_rows_in = sum(len(rows) for rows in per_topic.values())
+    if n_rows_in >= 200_000:  # 分割出力の小さな区間ではこの行を出さない (ノイズ防止)
+        print(f"[info] 結合 CSV (時間軸そろえ {_grid_label(grid_sec)}) を生成中... "
+              f"(入力 {n_rows_in} 行。長時間分は数分かかることがあります)")
     grid_ns = max(int(round(grid_sec * 1e9)), 1)
     hold_ns = None if not hold_sec or hold_sec <= 0 else int(round(hold_sec * 1e9))
     t_start = (min(all_t) // grid_ns) * grid_ns  # グリッドを周期の倍数に吸着
@@ -1418,9 +1451,10 @@ def write_merged_grid_csv(per_topic, topic_config, outdir, base, grid_sec, hold_
     out = os.path.join(outdir, f"{base}_all_{_grid_label(grid_sec)}.csv")
     cursor = {t: 0 for t in rows_by_topic}   # 次に消費する行番号
     latest = {t: None for t in rows_by_topic}  # グリッド時刻までの最新行
+    head_time = ["time_jst", "t_sec"] if drop_t_ns else ["time_jst", "t_sec", "t_ns"]
     with open(out, "w", newline="", encoding="utf-8-sig") as g:
         w = csv.writer(g)
-        w.writerow(["time_jst", "t_sec", "t_ns"] + [h for _, _, h in col_defs])
+        w.writerow(head_time + [h for _, _, h in col_defs])
         for k in range(n_grid):
             gt = t_start + k * grid_ns
             for topic, rows in rows_by_topic.items():
@@ -1436,7 +1470,10 @@ def write_merged_grid_csv(per_topic, topic_config, outdir, base, grid_sec, hold_
                     vals.append("")
                 else:
                     vals.append(cur.get(c, ""))
-            w.writerow([fmt_jst(gt), round((gt - t_start) / 1e9, 3), gt] + vals)
+            tvals = [fmt_jst(gt), round((gt - t_start) / 1e9, 3)]
+            if not drop_t_ns:
+                tvals.append(gt)
+            w.writerow(tvals + vals)
     hold_str = "無制限" if hold_ns is None else f"{hold_sec:g}s"
     print(f"[ok] wrote {out}  ({n_grid} rows, 周期 {_grid_label(grid_sec)}, "
           f"前値ホールド上限 {hold_str})")
@@ -1444,13 +1481,14 @@ def write_merged_grid_csv(per_topic, topic_config, outdir, base, grid_sec, hold_
 
 
 def write_csvs(per_topic, topic_config, outdir, base, merged=True,
-               merged_grid=None, merged_hold=5.0):
+               merged_grid=None, merged_hold=5.0, drop_t_ns=False):
     """トピック別 CSV と (トピック指定時のみ) 全トピック結合 CSV を書き出す。
 
     topic_config が None のときは全トピックモード。トピックごとに CSV を 1 本ずつ
     出力し、列数が膨大になる結合 CSV は作らない。merged=False でも結合 CSV を省く。
     merged_grid (秒) を指定すると、結合 CSV は時刻順のメッセージ行の代わりに
     共通時間軸へ揃えた形式 (write_merged_grid_csv) で出力する。
+    drop_t_ns=True で t_ns 列を出力しない (客先納品用。GetDruidUser 取り込みには必須)。
     """
     all_topics = topic_config is None
     all_t = [r["t_ns"] for rows in per_topic.values() for r in rows]
@@ -1462,8 +1500,13 @@ def write_csvs(per_topic, topic_config, outdir, base, merged=True,
     os.makedirs(outdir, exist_ok=True)
     written = []
 
+    head_time = ["time_jst", "t_sec"] if drop_t_ns else ["time_jst", "t_sec", "t_ns"]
+
     def time_cols(t_ns):
-        return [fmt_jst(t_ns), round((t_ns - t0) / 1e9, 3), t_ns]
+        cols = [fmt_jst(t_ns), round((t_ns - t0) / 1e9, 3)]
+        if not drop_t_ns:
+            cols.append(t_ns)
+        return cols
 
     def suffix_of(topic):
         if not all_topics and topic in topic_config:
@@ -1492,7 +1535,7 @@ def write_csvs(per_topic, topic_config, outdir, base, merged=True,
         out = os.path.join(outdir, f"{base}_{suffix_of(topic)}.csv")
         with open(out, "w", newline="", encoding="utf-8-sig") as g:
             w = csv.writer(g)
-            w.writerow(["time_jst", "t_sec", "t_ns"] + [rename.get(c, c) for c in cols])
+            w.writerow(head_time + [rename.get(c, c) for c in cols])
             for r in rows:
                 w.writerow(time_cols(r["t_ns"]) + [r.get(c, "") for c in cols])
         print(f"[ok] wrote {out}  ({len(rows)} rows)")
@@ -1508,7 +1551,8 @@ def write_csvs(per_topic, topic_config, outdir, base, merged=True,
     # (2a) 共通時間軸へ揃えた結合 CSV (周期指定時)
     if merged_grid:
         written += write_merged_grid_csv(per_topic, topic_config, outdir, base,
-                                         merged_grid, merged_hold)
+                                         merged_grid, merged_hold,
+                                         drop_t_ns=drop_t_ns)
         return written
 
     # (2) 全トピック結合 CSV (時刻順 / 値が無い列は空欄)
@@ -1521,7 +1565,7 @@ def write_csvs(per_topic, topic_config, outdir, base, merged=True,
     out_all = os.path.join(outdir, f"{base}_all.csv")
     with open(out_all, "w", newline="", encoding="utf-8-sig") as g:
         w = csv.writer(g)
-        w.writerow(["time_jst", "t_sec", "t_ns", "topic"] + all_cols)
+        w.writerow(head_time + ["topic"] + all_cols)
         for topic, r in all_rows:
             w.writerow(time_cols(r["t_ns"]) + [suffix_by_topic[topic]]
                        + [r.get(c, "") for c in all_cols])
@@ -2097,6 +2141,9 @@ def main():
                         help="指定した分数ごとに出力ファイルを区切る (例: 30)。"
                              "長時間の抽出でも 1 ファイルが巨大にならない。"
                              "mcap の読み込みは 1 回で、書き出しだけを分割する")
+    parser.add_argument("--no-t-ns", action="store_true", dest="no_t_ns",
+                        help="t_ns 列 (epoch ナノ秒) を CSV に出力しない (客先納品用など)。"
+                             "GetDruidUser に取り込む CSV では t_ns が必須のため付けないこと")
     parser.add_argument("--cache-dir", default=DEFAULT_CACHE_DIR, metavar="DIR",
                         help="一括ダウンロードのローカルキャッシュ先。同じファイルの"
                              f"再ダウンロード (= 再課金) を防ぐ (default: {DEFAULT_CACHE_DIR})")
@@ -2163,18 +2210,32 @@ def main():
             # UI の②で選択されたファイル一覧をそのまま使う (検索・兄弟探索なし)
             with open(args.gcs_files, encoding="utf-8") as f:
                 uris = json.load(f)
-            sources = []
+            print(f"[info] --gcs-files 指定: {len(uris)} 件のメタデータ (サイズ等) を"
+                  "取得中...")
             buckets = {}
-            for uri in uris:
-                path = uri[len("gs://"):] if uri.startswith("gs://") else f"{args.bucket}/{uri}"
+
+            def lookup_blob(uri):
+                path = (uri[len("gs://"):] if uri.startswith("gs://")
+                        else f"{args.bucket}/{uri}")
                 bname, blob_name = path.split("/", 1)
                 bkt = buckets.setdefault(bname, client.bucket(bname))
-                blob = bkt.get_blob(blob_name)  # サイズ等のメタデータを取得
-                if blob is None:
-                    print(f"[warn] 見つかりません (スキップ): {uri}")
-                    continue
-                sources.append(GcsMcapSource(blob))
-            print(f"[info] --gcs-files 指定: {len(sources)} 件 (ファイル検索をスキップ)")
+                return uri, bkt.get_blob(blob_name)  # サイズ等のメタデータを取得
+
+            # メタデータ取得は 1 件ずつだと件数分の往復で数分かかるため並列にする
+            sources = []
+            n_seen = 0
+            t_tick = time.monotonic()
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                for uri, blob in pool.map(lookup_blob, uris):  # 元の順序を保つ
+                    n_seen += 1
+                    if blob is None:
+                        print(f"[warn] 見つかりません (スキップ): {uri}")
+                    else:
+                        sources.append(GcsMcapSource(blob))
+                    if time.monotonic() - t_tick >= 15:
+                        print(f"[info]   メタデータ取得 {n_seen}/{len(uris)} 件...")
+                        t_tick = time.monotonic()
+            print(f"[info] 対象 {len(sources)} 件 (ファイル検索をスキップ)")
         else:
             try:
                 sources = find_gcs_sources(
@@ -2235,10 +2296,12 @@ def main():
         write_csvs_split(per_topic, topic_config, args.outdir, prefix,
                          start_ns, end_ns, args.split_minutes,
                          merged=not args.no_merged,
-                         merged_grid=args.merged_grid, merged_hold=args.merged_hold)
+                         merged_grid=args.merged_grid, merged_hold=args.merged_hold,
+                         drop_t_ns=args.no_t_ns)
     else:
         write_csvs(per_topic, topic_config, args.outdir, base, merged=not args.no_merged,
-                   merged_grid=args.merged_grid, merged_hold=args.merged_hold)
+                   merged_grid=args.merged_grid, merged_hold=args.merged_hold,
+                   drop_t_ns=args.no_t_ns)
     if cache_dir:
         prune_cache(cache_dir, args.cache_max_gb)
     print_transfer_summary()

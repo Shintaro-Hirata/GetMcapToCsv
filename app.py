@@ -29,10 +29,15 @@ import pandas as pd
 import streamlit as st
 
 import get_mcap_to_csv as core  # find_gcs_sources, collect_topics, extract_rows, write_csvs, save_mcap_slice, download_raw_mcaps
+import vm_job  # start_job, load_job, tail_job, read_log, clear_job (VM 抽出のUI非依存実行)
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PRESET_FILE = os.path.join(APP_DIR, "mcap_presets.json")
 SCRIPTS_DIR = os.path.join(APP_DIR, "scripts")
+SETTINGS_DIR = os.path.join(APP_DIR, "ui_settings")  # 「この PC に保存」した設定 JSON の置き場
+# 検索・抽出のたびに全条件を自動保存するファイル。タブのスリープや再読み込みで
+# Streamlit のセッションが失われ画面が初期状態に戻っても、ここから復元できる
+AUTOSAVE_FILE = os.path.join(SETTINGS_DIR, "_autosave.json")
 
 # 選択肢ラベルの定数。設定 JSON にはラベル文字列ではなく bool / index で保存し、
 # 読み込み時にここへ引き当てるので、文言を変えても古い設定ファイルが壊れない。
@@ -109,17 +114,39 @@ def _vm_script_cmd(script_base, ps_args, sh_args):
 def run_script_streaming(cmd, log_area):
     """スクリプト (リスト) またはシェルコマンド (文字列) を実行し、出力を逐次
     log_area に流す。戻り値: (returncode, 全出力)。文字列はシェル経由で実行する
-    (Windows で gcloud.cmd を解決するため)。"""
+    (Windows で gcloud.cmd を解決するため)。
+
+    画面更新は 0.3 秒ごとに間引く。1 行ごとに更新すると、行数の多い実行で
+    WebSocket 転送とブラウザ描画が膨らみ、タブが重くなる/休止されやすくなるため。
+    """
     proc = subprocess.Popen(
         cmd, cwd=APP_DIR, shell=isinstance(cmd, str),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, encoding="utf-8", errors="replace")
     lines = []
+    last_ui = 0.0
     for line in iter(proc.stdout.readline, ""):
         lines.append(line.rstrip("\n"))
-        log_area.code("\n".join(lines[-500:]))
+        now = time.monotonic()
+        if now - last_ui >= 0.3:
+            log_area.code("\n".join(lines[-500:]))
+            last_ui = now
     proc.wait()
+    log_area.code("\n".join(lines[-500:]))
     return proc.returncode, "\n".join(lines)
+
+
+def run_vm_job(cmd, outdir, label, log_area):
+    """VM 抽出コマンドを UI から独立したプロセスとして実行し、終了まで追跡する。
+
+    Streamlit のセッションはタブのスリープ・再読み込み・PC スリープで失われ、
+    画面が初期状態に戻る。その場合でもこの方式ならジョブ本体は走り続け、
+    復帰後に「未回収の VM ジョブ」から再接続してログ・結果を回収できる。
+    戻り値: (returncode, 全ログ)。
+    """
+    vm_job.start_job(cmd, outdir, label, cwd=APP_DIR)
+    return vm_job.tail_job(
+        outdir, lambda text: log_area.code(text[-40000:] or "(起動中...)"))
 
 
 def gcloud_token_ok(adc=False):
@@ -218,7 +245,7 @@ _PERSISTED_KEYS = (
     "w_lookback", "w_metaw", "w_extw",
     "cache_enable", "cache_dir", "cache_max_gb",
     "w_outfmt", "w_outdir", "w_merged",
-    "w_merged_mode", "w_merged_grid", "w_merged_hold", "w_split_min",
+    "w_merged_mode", "w_merged_grid", "w_merged_hold", "w_split_min", "w_no_tns",
     "csv_route", "csvvm_model", "csvvm_auth",
 )
 for _k in list(ss.keys()):
@@ -249,6 +276,7 @@ ss.setdefault("w_merged_mode", MERGED_MODE_OPTIONS[0])
 ss.setdefault("w_merged_grid", "100ms")
 ss.setdefault("w_merged_hold", 5.0)
 ss.setdefault("w_split_min", 0.0)
+ss.setdefault("w_no_tns", False)   # t_ns 列を出力しない (GetDruidUser 取り込みには必須のため既定オフ)
 ss.setdefault("col_renames", {})   # {"トピック\n列名": 出力名} CSV 列名の変更
 ss.setdefault("rename_ver", 0)     # 列名変更表を作り直すためのカウンタ
 ss.setdefault("batch_rows", [])    # バッチ実行の行 [{車両ID, 開始日時, 終了日時}]
@@ -273,6 +301,36 @@ def load_presets():
     except Exception as e:
         st.warning(f"プリセットファイルの読み込みに失敗: {e}")
         return {}
+
+
+def list_saved_settings():
+    """ui_settings/ に保存済みの設定 JSON のパス一覧 (新しい順)。
+
+    "_" 始まりは自動保存などの内部ファイルのため一覧から除く。
+    """
+    try:
+        files = glob.glob(os.path.join(SETTINGS_DIR, "*.json"))
+    except OSError:
+        return []
+    files = [p for p in files if not os.path.basename(p).startswith("_")]
+    return sorted(files, key=os.path.getmtime, reverse=True)
+
+
+def settings_summary(data):
+    """設定 JSON の中身の 1 行要約 (適用前に中身を確認できるようにする)。"""
+    parts = []
+    if data.get("vehicle"):
+        parts.append(f"車両 {data['vehicle']}")
+    if data.get("date"):
+        parts.append(f"期間 {data.get('date', '?')} {data.get('time_start', '')} 〜 "
+                     f"{data.get('date_end', '?')} {data.get('time_end', '')}")
+    parts.append(f"トピック {len(data.get('topics') or [])} 件")
+    n_batch = len(data.get("batch_rows") or [])
+    if n_batch:
+        parts.append(f"バッチ {n_batch} 行")
+    if data.get("saved_at"):
+        parts.append(f"保存 {data['saved_at']}")
+    return " / ".join(parts)
 
 
 def parse_time_text(text):
@@ -388,6 +446,7 @@ def gather_settings():
             "merged_grid": g("w_merged_grid", "100ms"),
             "merged_hold": float(g("w_merged_hold", 5.0)),
             "split_minutes": float(g("w_split_min", 0.0)),
+            "drop_t_ns": bool(g("w_no_tns", False)),
             "route_vm": g("csv_route", CSV_ROUTE_OPTIONS[0]) == CSV_ROUTE_OPTIONS[0],
             "vm_model_b": str(g("csvvm_model", VM_MODEL_OPTIONS[0])).startswith("B"),
             "vm_auth": bool(g("csvvm_auth", True)),
@@ -395,34 +454,53 @@ def gather_settings():
     }
 
 
-def apply_settings(data):
+def autosave_settings():
+    """現在の全条件を自動保存する (検索・抽出・バッチの実行ボタンのたびに呼ぶ)。
+
+    タブのスリープ・再読み込み・PC スリープで Streamlit のセッションが失われて
+    画面が初期状態に戻っても、ここから条件を復元できるようにする。
+    """
+    try:
+        os.makedirs(SETTINGS_DIR, exist_ok=True)
+        with open(AUTOSAVE_FILE, "w", encoding="utf-8") as f:
+            json.dump(gather_settings(), f, ensure_ascii=False, indent=1)
+    except OSError:
+        pass  # 自動保存の失敗で本来の処理は止めない
+
+
+def apply_settings(data, keep_period=False):
     """設定 JSON をセッション状態へ反映する。
 
     この関数はページ上部 (①〜④のウィジェット生成前) で呼ばれる前提。同じラン内で
     後続のウィジェットが復元値で描画される。②のファイル選択と③のトピック選択は
     検索結果に依存するため pending_* に積み、結果が揃った時点で名前を突き合わせて
     反映する。知らないキー・壊れた値は黙って読み飛ばし、適用できる分だけ適用する。
+
+    keep_period=True のときは車両ID・取得日付・時刻をファイルから復元せず、①に
+    入力済みの値をそのまま使う (同じトピック構成で別の車両・別の日を抽出する用途)。
+    車両・日付に紐づく②のファイル選択も候補が変わって突き合わせられないため復元しない。
     """
     def put(key, value):
         if value is not None:
             ss[key] = value
 
     put("input_mode", INPUT_MODE_OPTIONS[0 if data.get("input_mode_gcs", True) else 1])
-    put("w_vehicle", data.get("vehicle"))
-    try:
-        if data.get("date"):
-            ss["w_date"] = datetime.date.fromisoformat(str(data["date"]))
-            # 終了日付を持たない古い設定ファイルは「開始と同日」として読む
-            ss["w_date_end"] = ss["w_date"]
-    except ValueError:
-        pass
-    try:
-        if data.get("date_end"):
-            ss["w_date_end"] = datetime.date.fromisoformat(str(data["date_end"]))
-    except ValueError:
-        pass
-    put("w_tstart", data.get("time_start"))
-    put("w_tend", data.get("time_end"))
+    if not keep_period:
+        put("w_vehicle", data.get("vehicle"))
+        try:
+            if data.get("date"):
+                ss["w_date"] = datetime.date.fromisoformat(str(data["date"]))
+                # 終了日付を持たない古い設定ファイルは「開始と同日」として読む
+                ss["w_date_end"] = ss["w_date"]
+        except ValueError:
+            pass
+        try:
+            if data.get("date_end"):
+                ss["w_date_end"] = datetime.date.fromisoformat(str(data["date_end"]))
+        except ValueError:
+            pass
+        put("w_tstart", data.get("time_start"))
+        put("w_tend", data.get("time_end"))
     if "include_image" in data:
         ss["w_img"] = bool(data["include_image"])
     if "include_sensor" in data:
@@ -474,6 +552,8 @@ def apply_settings(data):
             ss["w_split_min"] = max(0.0, float(out["split_minutes"]))
     except (TypeError, ValueError):
         pass
+    if "drop_t_ns" in out:
+        ss["w_no_tns"] = bool(out["drop_t_ns"])
     if "route_vm" in out:
         ss["csv_route"] = CSV_ROUTE_OPTIONS[0 if out["route_vm"] else 1]
     if "vm_model_b" in out:
@@ -508,7 +588,7 @@ def apply_settings(data):
             for r in data["batch_rows"] if isinstance(r, dict)]
         ss.batch_ver += 1  # バッチ表を作り直して読み込んだ行を反映
 
-    if data.get("file_selection"):
+    if data.get("file_selection") and not keep_period:
         ss.pending_file_selection = {str(k): bool(v)
                                      for k, v in data["file_selection"].items()}
     if isinstance(data.get("topics"), list):
@@ -519,29 +599,177 @@ def apply_settings(data):
         ss.topics_id += 1  # 取得済みのトピック表があれば作り直して選択を反映
 
 
-with st.expander("💾 設定の保存・読み込み（①〜④の条件・選択を JSON で保存/復元）"):
+with st.expander("💾 設定の保存・読み込み（①〜⑤の条件・選択を保存して使い回す）"):
     sv1, sv2 = st.columns([1, 2])
     with sv1:
+        st.markdown("**保存**")
+        save_name = st.text_input("設定名", key="settings_name",
+                                  help="例: BS提供_結合10ms。同じ名前で保存すると上書きします。")
+        if st.button("💾 この PC に保存", key="settings_save_local",
+                     disabled=not save_name.strip(),
+                     help="ui_settings フォルダに保存し、右の一覧からいつでも読み込めます。"):
+            safe = "".join(c for c in save_name.strip() if c not in '\\/:*?"<>|')
+            safe = safe or f"設定_{datetime.datetime.now():%Y%m%d_%H%M%S}"
+            os.makedirs(SETTINGS_DIR, exist_ok=True)
+            path = os.path.join(SETTINGS_DIR, f"{safe}.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(gather_settings(), f, ensure_ascii=False, indent=1)
+            st.success(f"保存しました: {os.path.relpath(path, APP_DIR)}")
         st.download_button(
-            "⬇ 現在の設定を保存",
+            "⬇ JSON ファイルとして保存（共有用）",
             data=json.dumps(gather_settings(), ensure_ascii=False, indent=1),
             file_name=f"mcap_ui_settings_{datetime.datetime.now():%Y%m%d_%H%M%S}.json",
             mime="application/json",
             help="①の検索条件、②のファイル選択、③のトピック・カラム選択、"
-                 "④の出力設定を JSON 1 ファイルに保存します。")
-        st.caption("UI を再起動しても、この JSON を読み込めば同じ条件を再現できます。")
+                 "④の出力設定、⑤のバッチ行を JSON 1 ファイルに保存します。"
+                 "他の人に条件を渡すときはこちら。")
+        st.caption("保存されるのは①の検索条件・②のファイル選択・③のトピック/カラム選択・"
+                   "列名変更・④の出力設定・⑤のバッチ行です。")
     with sv2:
-        up = st.file_uploader("設定 JSON を読み込み", type=["json"], key="settings_upload")
-        if up is not None and st.button("📥 この設定を適用", key="settings_apply"):
-            try:
-                data = json.loads(up.getvalue().decode("utf-8-sig"))
-                if data.get("_type") != SETTINGS_TYPE:
-                    st.warning("このツールの設定ファイルではないようです。読める範囲で適用します。")
-                apply_settings(data)
-                st.success("設定を適用しました。②のファイル選択と③のトピック選択は、"
-                           "「候補ファイルを検索」「トピック一覧を取得」のあとに自動で反映されます。")
-            except Exception as e:
-                st.error(f"設定ファイルを読み込めませんでした: {e}")
+        st.markdown("**読み込み**")
+        saved_files = list_saved_settings()
+        saved_names = [os.path.splitext(os.path.basename(p))[0] for p in saved_files]
+        NO_PICK = "(選択してください)"
+        pick_options = [NO_PICK] + saved_names
+        if ss.get("settings_pick") not in pick_options:  # 削除直後などの残存値ガード
+            ss["settings_pick"] = NO_PICK
+        pick = st.selectbox("この PC に保存した設定", pick_options,
+                            key="settings_pick",
+                            help="「この PC に保存」した設定の一覧 (新しい順)。")
+        up = st.file_uploader("または、設定 JSON ファイルを読み込み",
+                              type=["json"], key="settings_upload")
+
+        # 適用対象: アップロードがあればそれを、無ければ一覧の選択を使う
+        load_data = None
+        load_err = None
+        try:
+            if up is not None:
+                load_data = json.loads(up.getvalue().decode("utf-8-sig"))
+            elif pick != NO_PICK:
+                with open(os.path.join(SETTINGS_DIR, f"{pick}.json"),
+                          encoding="utf-8-sig") as f:
+                    load_data = json.load(f)
+        except Exception as e:
+            load_err = f"設定ファイルを読み込めませんでした: {e}"
+        if load_err:
+            st.error(load_err)
+        elif load_data is not None:
+            if load_data.get("_type") != SETTINGS_TYPE:
+                st.warning("このツールの設定ファイルではないようです。読める範囲で適用します。")
+            st.caption("📄 " + settings_summary(load_data))
+
+        keep_period = st.checkbox(
+            "📅 車両ID・取得日付・時刻は読み込まない（①に入力した値を使う）",
+            value=True, key="settings_keep_period",
+            help="オン: トピック・カラム・列名変更・出力設定などだけを復元し、"
+                 "車両ID・取得日付・時刻は今の①の入力のまま使います（同じトピック構成で"
+                 "別の車両・別の日・別の時間帯を抽出するとき向け。車両・日付に紐づく"
+                 "②のファイル選択も復元しません）。オフ: 保存時の車両ID・日付・時刻ごと"
+                 "そのまま復元します。")
+        auto_run = st.checkbox(
+            "⚡ 適用後に「候補ファイルを検索」「トピック一覧を取得」まで自動実行",
+            value=True, key="settings_auto_run",
+            help="適用ボタン 1 回で③のトピック選択が反映された状態まで進みます。"
+                 "あとは④の「抽出実行」を押すだけです（実行は課金を伴うため自動では"
+                 "行いません）。")
+        ap1, ap2 = st.columns([1, 1])
+        with ap1:
+            if st.button("📥 この設定を適用", key="settings_apply",
+                         type="primary", disabled=load_data is None):
+                apply_settings(load_data, keep_period=keep_period)
+                if auto_run:
+                    ss.auto_search = True  # 下の検索処理が同じランで拾って実行する
+                    st.success("設定を適用し、検索とトピック一覧の取得を自動実行します...")
+                else:
+                    st.success("設定を適用しました。②のファイル選択と③のトピック選択は、"
+                               "「候補ファイルを検索」「トピック一覧を取得」のあとに自動で反映されます。")
+        with ap2:
+            if pick != NO_PICK and up is None and st.button(
+                    "🗑 選択した保存済み設定を削除", key="settings_delete"):
+                try:
+                    os.remove(os.path.join(SETTINGS_DIR, f"{pick}.json"))
+                    st.rerun()
+                except OSError as e:
+                    st.error(f"削除できませんでした: {e}")
+
+# ==================================================================
+# セッション消失からの復帰
+# タブのスリープ/再読み込み/PC スリープで Streamlit のセッション (画面の状態)
+# が失われると、画面が初期状態に戻る。条件は自動保存から復元でき、VM 抽出
+# ジョブは別プロセスで走り続けているので、ここから再接続して回収する。
+# ==================================================================
+if (ss.sources is None and not ss.get("autosave_handled")
+        and os.path.exists(AUTOSAVE_FILE)):
+    _autosave = None
+    try:
+        with open(AUTOSAVE_FILE, encoding="utf-8") as f:
+            _autosave = json.load(f)
+    except (OSError, ValueError):
+        pass
+    if _autosave:
+        with st.container(border=True):
+            st.markdown("♻ **前回の条件の自動保存があります** — "
+                        + settings_summary(_autosave))
+            st.caption("タブの再読み込みや PC スリープで画面が初期状態に戻っても、"
+                       "最後に検索・抽出したときの条件をここから復元できます。")
+            rc1, rc2, _ = st.columns([2, 1, 3])
+            with rc1:
+                if st.button("♻ この条件を復元（検索〜トピック一覧まで自動実行）",
+                             key="autosave_restore", type="primary"):
+                    apply_settings(_autosave, keep_period=False)
+                    ss.auto_search = True
+                    ss.autosave_handled = True
+            with rc2:
+                if st.button("閉じる", key="autosave_dismiss"):
+                    ss.autosave_handled = True
+                    st.rerun()
+
+_job_outdir = ss.get("w_outdir", os.path.abspath("out"))
+_job = vm_job.load_job(_job_outdir)
+if _job and not ss.get("vm_job_handled"):
+    with st.container(border=True):
+        if not _job.get("finished"):
+            st.markdown("⏳ **未回収の VM 抽出ジョブがあります**"
+                        f"（開始: {_job.get('started_at', '?')}）")
+            st.caption("画面が初期状態に戻っても、抽出ジョブは別プロセスで動き続けて"
+                       "います（VM も動いたまま）。再接続するとログの続きを表示し、"
+                       "完了まで待って結果を回収します。")
+        else:
+            st.markdown("📦 **前回の VM 抽出ジョブは終了しています**"
+                        f"（exit {_job.get('exit_code')}、開始: {_job.get('started_at', '?')}）")
+            st.caption(f"出力フォルダを確認してください: {_job_outdir}　"
+                       "（ログは下のボタンで表示できます）")
+        jc1, jc2, _ = st.columns([2, 1, 2])
+        with jc1:
+            if st.button("📡 ジョブに再接続してログ・結果を回収",
+                         key="vm_job_attach", type="primary"):
+                with st.expander("VM 抽出ログ（再接続）", expanded=True):
+                    _area = st.empty()
+                rc_job, _ = vm_job.tail_job(
+                    _job_outdir,
+                    lambda t: _area.code(t[-40000:] or "(ログ待ち...)"))
+                ss.vm_job_handled = True
+                if rc_job == 0:
+                    names = []
+                    try:
+                        with open(os.path.join(_job_outdir, "_last_run.txt"),
+                                  encoding="utf-8-sig") as mf:
+                            names = [ln.strip() for ln in mf if ln.strip()]
+                    except OSError:
+                        pass
+                    vm_job.clear_job(_job_outdir)
+                    st.success(f"ジョブは正常に完了しました。CSV {len(names)} 件を "
+                               f"{_job_outdir} に取得済みです。")
+                    for n in names[:200]:
+                        st.write(f"- `{n}`")
+                else:
+                    st.error("ジョブは失敗して終了しています。上のログを確認してください"
+                             "（Spot 中断などは①〜④の条件のまま再実行すれば回復します）。")
+        with jc2:
+            if st.button("🗑 この表示を消す（記録を破棄）", key="vm_job_discard"):
+                vm_job.clear_job(_job_outdir)
+                ss.vm_job_handled = True
+                st.rerun()
 
 # ==================================================================
 # ① 検索条件
@@ -671,12 +899,19 @@ if time_ok and time_needed and range_ok:
                    "ことがあるため、②の合計サイズを確認してから進んでください。")
 
 _btn_label = "🔍 ① 候補ファイルを検索" if is_gcs else "📂 ① ローカル mcap を読み込み"
+# 設定の適用 (自動実行オン) から渡されるフラグ。同じランで検索まで進める
+auto_search = bool(ss.pop("auto_search", False))
+if auto_search and time_needed and (not time_ok or not range_ok):
+    st.warning("設定を適用しましたが、①の日付・時刻が不正なため自動検索は行いません。"
+               "①を直してから「候補ファイルを検索」を押してください。")
+    auto_search = False
 if st.button(_btn_label, type="primary",
-             disabled=(time_needed and (not time_ok or not range_ok))):
+             disabled=(time_needed and (not time_ok or not range_ok))) or auto_search:
     # 起動ターミナル側の生存確認ログ。「ボタンを押しても何も起きない」ときに、
     # クリックがサーバーへ届いているか (WebSocket 断か処理側の問題か) を切り分ける。
     print(f"[ui] 検索開始: vehicle={vehicle!r} "
           f"{start_dt:%Y-%m-%d %H:%M:%S} - {end_dt:%Y-%m-%d %H:%M:%S} (JST)", flush=True)
+    autosave_settings()  # セッションが失われても条件を復元できるようにする
     ss.sources = None
     ss.topics_info = None
     ss.result_files = None
@@ -708,6 +943,8 @@ if st.button(_btn_label, type="primary",
                 "base_prefix": vehicle.strip().upper(),  # 分割出力の区間別ファイル名用
                 "extract_workers": int(extract_workers) or None,
             }
+            if auto_search:
+                ss.auto_topics = True  # 続けて③のトピック一覧取得まで自動で行う
         except LookupError as e:
             st.error(f"見つかりませんでした: {e}")
             ss.search_log = ""
@@ -752,6 +989,8 @@ if st.button(_btn_label, type="primary",
                         "base_prefix": folder,  # 分割出力の区間別ファイル名用
                         "extract_workers": int(extract_workers) or None,
                     }
+                    if auto_search:
+                        ss.auto_topics = True  # 続けて③のトピック一覧取得まで自動で行う
 
 if ss.get("search_transfer"):
     g_b, c_b = ss.search_transfer
@@ -883,7 +1122,9 @@ if ss.sources:
     st.header("③ トピック選択")
     tcol1, tcol2, tcol3 = st.columns([1, 2, 1])
     with tcol1:
-        if st.button("📋 トピック一覧を取得"):
+        # 設定の適用 (自動実行オン) → 検索成功のあと、同じランでここまで自動で進む
+        auto_topics = bool(ss.pop("auto_topics", False))
+        if st.button("📋 トピック一覧を取得") or auto_topics:
             with st.spinner("トピック一覧を取得中..."):
                 info, log = run_captured(core.collect_topics, selected_sources)
             ss.topics_info = info
@@ -1088,8 +1329,9 @@ if ss.sources:
 
     # 分割出力: 長時間の抽出でも 1 ファイルが巨大にならないよう、書き出しを分数で刻む
     split_min = 0.0
+    drop_t_ns = False
     if out_format.startswith("CSV"):
-        spc1, _ = st.columns([1, 3])
+        spc1, spc2 = st.columns([1, 3])
         with spc1:
             split_min = float(st.number_input(
                 "⏳ 分割出力 (分, 0 = 分割なし)", min_value=0.0, step=10.0,
@@ -1098,6 +1340,14 @@ if ss.sources:
                      " 12:00-12:30, 12:30-13:00, ...)。mcap の読み込みは 1 回のままで、"
                      "書き出しだけを分割するので追加の課金・時間はほぼ無い。"
                      "各ファイルの t_sec はその区間の先頭からの経過秒になる。"))
+        with spc2:
+            st.write("")
+            drop_t_ns = st.checkbox(
+                "🧹 t_ns 列を出力しない（客先納品用）", key="w_no_tns",
+                help="時刻列のうち t_ns (epoch ナノ秒) を CSV から除きます"
+                     " (time_jst と t_sec は残ります)。"
+                     "⚠ GetDruidUser に取り込む CSV では t_ns が必須のため、"
+                     "その用途ではオフのままにしてください。")
 
     # --- CSV の抽出ルート (GCS のみ): この PC で直接 or GCP 内の VM 経由 ---
     # ここで決めた時間帯・トピック・カラムをそのまま VM に渡せるので、
@@ -1160,10 +1410,57 @@ if ss.sources:
             st.caption("※ VM は **②で選択したファイルだけ**を読みます（develop/sensor の"
                        "別も②の選択どおり。image は CSV に使わないため自動で除外）。"
                        "結合 CSV の有無・形式も上の設定に従います。")
+            # --- VM の課金点検と後始末 --------------------------------
+            # ネットワーク断などで抽出が中断すると自動削除が動かず、VM が
+            # 残って課金が続くことがある。残存をここで検知し、1 クリックで
+            # 削除できるようにする (VM 経由を開いた最初の 1 回は自動点検)。
+            if vm_route_ready and "vm_leftover" not in ss:
+                with st.spinner("VM が残っていないか確認中..."):
+                    ss.vm_leftover = vm_status(gcp_cfg)
             if st.button("🔍 課金状況を確認（VM が残っていないか）", key="csvvm_status"):
                 if ensure_gcloud_auth(st.empty(), need_adc=False):
                     with st.spinner("確認中..."):
-                        run_script_streaming(_vm_script_cmd("gcp_status", [], []), st.empty())
+                        _, status_out = run_script_streaming(
+                            _vm_script_cmd("gcp_status", [], []), st.empty())
+                    ss.vm_status_log = status_out
+                    ss.vm_leftover = vm_status(gcp_cfg)
+            if ss.get("vm_status_log"):
+                with st.expander("課金状況の確認結果", expanded=True):
+                    st.code(ss.vm_status_log)
+            leftover = ss.get("vm_leftover")
+            if leftover:
+                vm_name = gcp_cfg.get("GCP_VM", "")
+                if leftover == "RUNNING":
+                    st.warning(
+                        f"⚠ VM 「{vm_name}」が**起動したまま残っています**（状態: {leftover}）。"
+                        "いま抽出を実行中でなければ計算課金が続いています（前回の実行が"
+                        "ネットワーク断などで中断した場合に起こります）。下のボタンで削除できます。")
+                else:
+                    vm_model_b_now = str(ss.get("csvvm_model",
+                                                VM_MODEL_OPTIONS[0])).startswith("B")
+                    note = ("B 運用では実行のたびに自動で作り直されるので、削除して問題ありません。"
+                            if vm_model_b_now else
+                            "A 運用（使い回し）で意図して残している場合は削除不要です。")
+                    st.info(f"VM 「{vm_name}」が残っています（状態: {leftover}。停止中でも"
+                            f"ディスク代 月 ~¥3,000/200GB がかかります）。{note}")
+                if st.button("🗑 残っている VM を削除する（課金を止める）", key="vm_delete"):
+                    if ensure_gcloud_auth(st.empty(), need_adc=False):
+                        with st.expander("VM 削除ログ", expanded=True):
+                            rc, _ = run_script_streaming(
+                                f"gcloud compute instances delete {vm_name} "
+                                f"--zone {gcp_cfg.get('GCP_ZONE')} "
+                                f"--project {gcp_cfg.get('GCP_PROJECT')} --quiet",
+                                st.empty())
+                        if rc == 0:
+                            ss.vm_leftover = None
+                            ss.pop("vm_status_log", None)  # 削除前の結果は古いため破棄
+                            st.success("VM を削除しました（この用途での課金は止まりました）。"
+                                       "次回の実行時には自動で作り直されます。")
+                        else:
+                            st.error("VM の削除に失敗しました。上のログを確認してください。"
+                                     "gcloud の認証切れの場合は、もう一度ボタンを押してください。")
+            elif ss.get("vm_status_log"):
+                st.success("VM は残っていません（この用途での課金はありません）。")
 
     can_run = bool(selected_sources) and (
         out_format.startswith("mcap (元ファイル") or bool(selected_topics))
@@ -1244,10 +1541,13 @@ if ss.sources:
         if split_min:
             ps += ["-SplitMinutes", f"{split_min:g}"]
             sh += ["--split-minutes", f"{split_min:g}"]
+        if drop_t_ns:
+            ps.append("-NoTNs"); sh.append("--no-t-ns")
 
     if st.button("🚀 ④ 抽出実行", type="primary", disabled=not can_run):
         print(f"[ui] 抽出開始: {out_format} / ファイル {len(selected_sources)} 件 / "
               f"トピック {len(selected_topics)} 件", flush=True)
+        autosave_settings()  # セッションが失われても条件を復元できるようにする
         params = ss.search_params
         os.makedirs(outdir, exist_ok=True)
 
@@ -1318,11 +1618,16 @@ if ss.sources:
                 if not ok:
                     st.error("VM 作成に失敗しました。上の「① VM 作成ログ」を確認してください。")
             if ok:
-                st.info("② VM で抽出し、CSV を回収します...")
+                st.info("② VM で抽出し、CSV を回収します...（この間に画面が初期状態に"
+                        "戻ってしまっても、ジョブは動き続けます。ページ上部の"
+                        "「未回収の VM 抽出ジョブ」から再接続してください）")
                 with st.expander("② 抽出・CSV 回収ログ（クリックで開閉）", expanded=True):
                     fetch_log = st.empty()
-                rc, fetch_out = run_script_streaming(_vm_script_cmd("gcp_fetch", ps, sh), fetch_log)
+                rc, fetch_out = run_vm_job(
+                    _vm_script_cmd("gcp_fetch", ps, sh), outdir,
+                    f"{vehicle} {s_str} 〜 {e_str}", fetch_log)
                 if rc == 0:
+                    vm_job.clear_job(outdir)  # 回収済み。次回起動時の再接続表示を出さない
                     # gcp_fetch が書き出す「このランで生成した分」だけを表示する
                     # (出力フォルダに残る過去ランの CSV と混同しないため)
                     manifest = os.path.join(outdir, "_last_run.txt")
@@ -1377,6 +1682,7 @@ if ss.sources:
                             "2. **トピックの入っているファイルを②で外している**: sensor 由来の"
                             "トピックなら sensor ファイルを、develop 由来なら develop ファイルを"
                             "②で選択して再実行してください。")
+            ss.pop("vm_leftover", None)  # VM の有無が変わったため、次の描画で再点検する
             st.stop()
 
         prog = st.progress(0.0, text="準備中...")
@@ -1407,11 +1713,11 @@ if ss.sources:
                             params.get("base_prefix", params["base"]),
                             params["start_ns"], params["end_ns"], split_min,
                             merged=merged_csv, merged_grid=merged_grid_sec,
-                            merged_hold=hold)
+                            merged_hold=hold, drop_t_ns=drop_t_ns)
                     return core.write_csvs(per_topic, topic_config, outdir,
                                            params["base"], merged=merged_csv,
                                            merged_grid=merged_grid_sec,
-                                           merged_hold=hold)
+                                           merged_hold=hold, drop_t_ns=drop_t_ns)
                 files, log = run_captured(run)
             elif out_format.startswith("mcap (時間帯"):
                 out_path = os.path.join(outdir, f"{params['base']}_cropped.mcap")
@@ -1555,6 +1861,7 @@ if ss.sources:
             if st.button(f"🌙 バッチ実行 ({len(batch_jobs)} 件, {route_note})",
                          disabled=not batch_jobs, key="batch_run"):
                 print(f"[ui] バッチ開始: {len(batch_jobs)} 件", flush=True)
+                autosave_settings()  # セッションが失われても条件を復元できるようにする
                 if csv_route_vm and not ensure_gcloud_auth(
                         st.empty(), need_adc=st.session_state.get("csvvm_auth", True)):
                     st.stop()
@@ -1633,6 +1940,7 @@ if ss.sources:
                             with st.expander("VM 停止ログ", expanded=False):
                                 run_script_streaming(
                                     f"gcloud compute instances stop {vm_args}", st.empty())
+                        ss.pop("vm_leftover", None)  # VM の有無が変わったため、次の描画で再点検する
                 else:
                     core.STATS.reset()
                     hold = merged_hold_sec if merged_hold_sec is not None else 5.0
@@ -1661,12 +1969,13 @@ if ss.sources:
                                     return core.write_csvs_split(
                                         pt, topic_config, outdir, veh, s_ns, e_ns,
                                         split_min, merged=merged_csv,
-                                        merged_grid=merged_grid_sec, merged_hold=hold)
+                                        merged_grid=merged_grid_sec, merged_hold=hold,
+                                        drop_t_ns=drop_t_ns)
                                 return core.write_csvs(
                                     pt, topic_config, outdir,
                                     core.window_base(veh, s_ns, e_ns),
                                     merged=merged_csv, merged_grid=merged_grid_sec,
-                                    merged_hold=hold)
+                                    merged_hold=hold, drop_t_ns=drop_t_ns)
                             files_b, log2 = run_captured(run_one)
                             prog_b.progress(1.0, text=f"{label}: {len(files_b)} ファイル出力")
                             results.append((label, bool(files_b)))

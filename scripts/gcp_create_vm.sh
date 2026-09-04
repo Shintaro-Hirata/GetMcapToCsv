@@ -53,6 +53,13 @@ IAP_TAG="${IAP_TAG:-mcap-iap-ssh}"                # IAP SSH 許可の対象タ�
 # されうるが、その際は VM ごと自動削除 (--instance-termination-action=DELETE) され
 # 課金は残らない。失敗したら再実行するだけ。短時間ジョブのモデルBに向く。
 SPOT="${SPOT:-0}"
+# MAX_RUN_HOURS: 起動したまま N 時間たつと GCP 側で VM を自動削除する
+# (--max-run-duration。時間は直近の起動からの稼働時間で、停止すればリセット)。
+# PC のネットワーク断・クラッシュ等でスクリプト側の削除処理が動けなかった場合の保険で、
+# 課金の垂れ流しを GCP 側で止める。通常の抽出・バッチは数時間で終わる前提の既定 12。
+# 0 で無効。組織ポリシー等でこのフラグが使えない環境では自動でタイマー無しにフォール
+# バックする (その旨を表示)。
+MAX_RUN_HOURS="${MAX_RUN_HOURS:-12}"
 
 # enable-guest-attributes: gcloud が VM の SSH ホスト鍵を API から取得して plink に渡すため、
 # IP 再利用時のホスト鍵不一致プロンプトを避けられる。
@@ -60,6 +67,12 @@ METADATA="enable-guest-attributes=TRUE"
 net_args=()
 if [ "$SPOT" = "1" ]; then
   net_args+=(--provisioning-model=SPOT --instance-termination-action=DELETE)
+fi
+# 自動削除タイマー。--instance-termination-action は SPOT 側で付与済みなら重複させない
+limit_args=()
+if [ "$MAX_RUN_HOURS" != "0" ]; then
+  limit_args+=(--max-run-duration="${MAX_RUN_HOURS}h")
+  [ "$SPOT" = "1" ] || limit_args+=(--instance-termination-action=DELETE)
 fi
 if [ "$PRIVATE" = "1" ]; then
   METADATA="enable-oslogin=TRUE,enable-guest-attributes=TRUE"
@@ -77,6 +90,9 @@ echo "  名前         : $GCP_VM"
 echo "  マシン       : $MACHINE_TYPE / ブートディスク ${BOOT_DISK_GB}GB / $IMAGE_FAMILY"
 if [ "$SPOT" = "1" ]; then
   echo "  料金モデル   : Spot (約1/3。稀に途中終了→VM自動削除。再実行でリカバリ)"
+fi
+if [ "$MAX_RUN_HOURS" != "0" ]; then
+  echo "  自動削除     : 起動したまま ${MAX_RUN_HOURS} 時間で GCP 側が削除 (消し忘れの保険)"
 fi
 echo "  権限         : バケット読み取り (devstorage.read_only)"
 if [ "$PRIVATE" = "1" ]; then
@@ -115,17 +131,31 @@ if gcloud compute instances describe "$GCP_VM" --project "$GCP_PROJECT" --zone "
   exit 1
 fi
 
-gcloud compute instances create "$GCP_VM" \
-  --project="$GCP_PROJECT" \
-  --zone="$GCP_ZONE" \
-  --machine-type="$MACHINE_TYPE" \
-  --image-family="$IMAGE_FAMILY" \
-  --image-project="$IMAGE_PROJECT" \
-  --boot-disk-size="${BOOT_DISK_GB}GB" \
-  --boot-disk-type=pd-balanced \
-  --metadata="$METADATA" \
-  --scopes=https://www.googleapis.com/auth/devstorage.read_only \
-  "${net_args[@]}"
+create_vm() {
+  gcloud compute instances create "$GCP_VM" \
+    --project="$GCP_PROJECT" \
+    --zone="$GCP_ZONE" \
+    --machine-type="$MACHINE_TYPE" \
+    --image-family="$IMAGE_FAMILY" \
+    --image-project="$IMAGE_PROJECT" \
+    --boot-disk-size="${BOOT_DISK_GB}GB" \
+    --boot-disk-type=pd-balanced \
+    --metadata="$METADATA" \
+    --scopes=https://www.googleapis.com/auth/devstorage.read_only \
+    "${net_args[@]}" "$@"
+}
+
+if ! create_vm "${limit_args[@]}"; then
+  if [ ${#limit_args[@]} -gt 0 ]; then
+    # 古い gcloud や組織ポリシーで --max-run-duration が使えない環境向けの退避。
+    # タイマー無しでも従来どおり動く (削除はスクリプト側の後始末に任せる)
+    echo "[warn] 自動削除タイマー付きの作成に失敗しました。タイマー無しで再試行します"
+    echo "       (gcloud を更新するか、gcp.env に MAX_RUN_HOURS=0 でこの再試行を省けます)"
+    create_vm
+  else
+    exit 1
+  fi
+fi
 
 # Python 依存は run_on_gcp.sh が初回実行時に自前で入れる (自己完結) ため、
 # ここで SSH 経由の apt install はしない (ホスト鍵の影響を受ける手順を減らす)。

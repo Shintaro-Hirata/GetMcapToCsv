@@ -25,8 +25,12 @@ GetDruidUser に取り込んで BigQuery 欠損の穴埋め・統計比較に使
 - `docs/GCP_EXECUTION.md` — VM 運用の完全な手順書（コスト表・トラブルシュート込み）
 
 主な機能（実装済み。使い方は MANUAL.md）:
-- **設定の保存・読み込み**: ①〜④の全条件（検索・ファイル/トピック/カラム選択・列名変更・
-  バッチ行・出力設定）を JSON 1 ファイルで保存/復元
+- **設定の保存・読み込み**: ①〜⑤の全条件（検索・ファイル/トピック/カラム選択・列名変更・
+  バッチ行・出力設定）を JSON 1 ファイルで保存/復元。名前を付けて `ui_settings/` に
+  ローカル保存（gitignore 済み）でき、次回は一覧から選ぶだけ。読み込みは既定で
+  **車両ID・日付・時刻を復元せず①の入力を使う**（keep_period。同じトピック構成で
+  別の車両・別の日を取る用途）+ **適用後に検索〜トピック一覧取得まで自動実行**
+  （auto_run。抽出実行だけは課金があるため手動）
 - **開始・終了日付の分離**（日跨ぎ抽出）、**分割出力**（`--split-minutes`）、
   **結合 CSV の時間軸そろえ**（`--merged-grid`/`--merged-hold`、前値ホールド）
 - **列名変更**（topics JSON の `rename`。客先向け出力名）
@@ -35,6 +39,19 @@ GetDruidUser に取り込んで BigQuery 欠損の穴埋め・統計比較に使
 - **VM ライフサイクル自動化**: 実行時に VM の実在を確認し、無ければ作成・B なら終了時に
   必ず削除（維持費ゼロ保証）・A なら停止。gcloud ログイン期限切れは実行前検知して
   再ログインを自動起動（`ensure_gcloud_auth`）
+- **セッション消失への耐性**: 検索・抽出・バッチの実行時に全条件を
+  `ui_settings/_autosave.json` へ自動保存し、初期状態に戻った画面の上部から
+  ワンクリック復元（検索〜トピック一覧まで自動実行）。単発の VM 抽出は
+  `vm_job.py` + `scripts/run_detached.py` で **UI と独立したプロセス**として実行し
+  （ログ/PID/exit を `<outdir>/_vm_job/` に記録）、画面が初期状態に戻っても
+  「未回収の VM 抽出ジョブ」バナーから再接続して結果を回収できる
+  （バッチ実行のループ自体は従来どおりセッション内。条件は自動保存で守られる）
+- **残 VM の後始末**（ネットワーク断対策）: ④「課金状況を確認」で VM が残っていれば
+  **「残っている VM を削除する」ボタン**でその場で削除できる。VM 経由ルートを開いた
+  ときにも残存をセッション 1 回だけ自動点検して警告（`ss.vm_leftover`。実行後は pop して
+  再点検）。加えて VM 作成時に **自動削除タイマー**（`--max-run-duration`、既定
+  `MAX_RUN_HOURS=12`、稼働時間ベース・0 で無効・非対応環境はタイマー無しへ自動
+  フォールバック）を付け、削除処理が一切動けなくても課金が止まる
 - **高速化一式**: 抽出並列 vCPU-1（上限 32、ディスク空きで自動制限）、1GB 以上は
   ディスクを経由せずストリーミング読み、選択トピック 0 件ファイルのスキップ、
   develop と二重記録の sensor をサマリ判定で読む前にスキップ、検索の時刻メタデータ
@@ -94,6 +111,8 @@ GetDruidUser に取り込んで BigQuery 欠損の穴埋め・統計比較に使
 | sensor 込みで DL が 8MB/s に崩壊 | ネットワークではなく **e2 の永続ディスク書込上限 (~240MB/s)** に 31 並列が詰まっていた → 1GB 以上はディスクに落とさずストリーミング読み（ログの「DL x 秒 + 解析 y 秒」内訳で切り分け可能） |
 | eps002 の CSV が 2 倍の行数 | develop/sensor の二重記録。t_ns がズレるため完全一致の重複除去では防げない → ストリーム単位で行数の多い側だけ採用（時間帯が重ならない部分は残す）。さらに読む前のサマリ判定で二重記録側のファイル自体をスキップ |
 | data_editor の編集が 1 回巻き戻る（2 回入力しないと反映されない） | 編集結果を毎ランで表の入力データに書き戻していたため、widget の編集状態と入力が競合 → 入力データは世代 (batch_ver / rename_ver) ごとに固定し、編集結果は状態にだけ蓄積する |
+| 長時間の取得中に、ログも出さず画面が初期状態（起動直後）に戻る | Streamlit のセッションはブラウザとの WebSocket 接続ごとのメモリ保持のため、**タブのスリープ（Edge の省メモリ）・再読み込み・PC スリープ**で接続が切れると新しい空セッションになる（プロセスは生きているのでターミナルにエラーは出ない）→ 条件の自動保存 + ワンクリック復元、VM 抽出のプロセス分離 + 再接続バナーで実害をなくした。ログ描画も 0.3 秒間引きにしてタブ負荷を削減。ユーザー側の予防は Edge のスリープ除外に localhost を追加 |
+| VM 実行のログが「installed apex_json support: True」の後、数十分無音に見える | ① SSH 経由では Python の stdout がパイプになりブロックバッファリング（8KB 溜まるまで何も表示されない）→ run_on_gcp.sh で `PYTHONUNBUFFERED=1`。② そもそも無音のフェーズがあった（--gcs-files のメタデータ取得が逐次 = 数百件で数分、二重記録の事前判定のサマリ読み、読み込み後の集計・結合 CSV 生成）→ メタデータ取得を 16 並列化し、各フェーズに開始・進捗ログ（15 秒ごと）、ファイル完了行に (x/N)、完了イベントが無い間も 60 秒ごとの生存ログを追加 |
 
 ## 5. 進行中の案件: ブリヂストン (BS) 走行データ提供【最優先の継続作業】
 
@@ -103,6 +122,11 @@ JIRA: [VT26-1412](https://t2auto.atlassian.net/browse/VT26-1412)（親・提供�
 
 **決定済みのフォーマット**: バッチ実行 + 10 分割 + 結合 CSV「時間軸をそろえる (10ms)」+
 列名変更（客先向け日本語名）。設定はユーザーの設定 JSON に保存済み。
+**t_ns 列は不要と確定** → 今後の出力は④の「t_ns 列を出力しない」（CLI: `--no-t-ns`）を
+オンにする（設定 JSON にも保存される）。出力済みの CSV 約 100 本は
+`python drop_csv_column.py out` で一括除去できる（`--dry-run` で事前確認可）。
+⚠ どちらも BS 納品用のみ。**GetDruidUser に取り込む CSV は t_ns 必須**
+（src/services/csv_periods.py が t_ns 無しをエラーにする）ため既定はオフのまま。
 
 **このセッションで確定した重要知見（列名変更の監修結果）**:
 - EBC2 の速度・response3 の車速は **[m/s] ではなく [km/h]**（ツールは値変換しない）
@@ -117,6 +141,27 @@ JIRA: [VT26-1412](https://t2auto.atlassian.net/browse/VT26-1412)（親・提供�
   東=0 の rad。緯度経度ではない点を凡例に明記）。`main_mabx/location_data`
   （緯度経度 10Hz）は継続。`positioning_driver/inspvas` は位置としては見送り、
   **roll/pitch[deg] が欲しいか BS に確認して要るときだけ** debug.poslv_roll/pitch を採用
+
+**座標系・正負の凡例（fujimaki さん要望・Yatagarasu コード根拠で確定）**:
+- 車両座標系 (odometry local) = **x前/y左/z上の右手系**（EgoPose.idl、
+  lateral_g_monitor の v×ヨーレート整合で確認）。ヨーレート＋＝左旋回、
+  ロールレート＋＝右下がり、**ピッチレート＋＝前下がり**（FLU 右手系の帰結）
+- localization pose = 地図座標系 ENU（PointENU.idl）。実体は **UTM ゾーン 54N**
+  （localization_util.cpp: proj=utm zone=54, WGS84。「TTM = Taas Transverse Mercator」）。
+  つまり x=UTM easting（中央子午線 東経141°が x=500,000m）、y=UTM northing
+  （赤道から北への距離 m）。関東なら x≈40万・y≈390万 のオーダー。
+  **z は WGS-84 楕円体高**（標高ではない。厳密には楕円体高×UTMスケール係数≈0.9996〜）。
+  heading は東=0・反時計回り正（Pose.idl）。基準点は後軸中心。
+  座標差から距離を出す場合は UTM スケール係数分（~0.04%）の縮尺誤差がある点に注意
+- lateral_error ＋＝経路の左側、heading_error ＋＝経路方位より左向き
+  （mpc_controller_initial_state.cpp: 基準点座標系の y / SO2 log）
+- str_angle ＋＝左切り（ControlCommand.idl「Left direction: positive」、
+  bicycle.hpp「left is positive」。eps/response3 系は符号反転なしで control へ）
+- relative_speed_* ＝ 当該車輪速−前軸速度（odometry_data.hpp: wheel = front + relative）。
+  front_axle_speed / wheel_based_vehicle_speed は J1939 のため**常に 0 以上**（後退でも正）
+- poslv_roll ＋＝右下がり、**poslv_pitch ＋＝前上がり**（novatel_mapper.cpp の回転合成:
+  IMU 座標は右/前/上。odometry のピッチレートと正負が逆な点に注意）。
+  ※ mapper に回転順の TODO コメントがあるため、納品前に坂・カーブで符号の実測確認を推奨
 
 **残タスク**: ①単位を修正した列名で 1 往復分（8/17-18）を再出力（STEP2）
 ②AD Status 凡例シート・座標系注記の作成 ③信号の図示による妥当性確認（fujimaki さん依頼。
